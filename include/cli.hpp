@@ -21,33 +21,30 @@
 //  · Levenshtein "did you mean?" suggestions on unknown options
 //  · Bash / Fish shell completion generators
 //
-//  QUICK START
-//  ───────────
-//  #include "cli.hpp"
-//  namespace fs = std::filesystem;
+//  NEW FLUENT API (v2)
+//  ───────────────────
+//  cli::App app{"tool", "My blazing-fast tool", "1.0.0"};
 //
-//  int main(int argc, char** argv) {
-//      cli::App app("tool", "My blazing-fast tool");
-//      app.version("1.0.0").author("Yanujz Labs")
-//         .example("tool build --target release -j8");
+//  auto verbose = app.add_flag("--verbose").short_name("-v")
+//                    .help("Enable verbose output");
+//  auto jobs    = app.add<unsigned>("--jobs").short_name("-j")
+//                    .help("Parallel jobs").default_val(4u).range(1u, 256u);
+//  auto output  = app.add<fs::path>("--output").short_name("-o")
+//                    .help("Output directory").required().meta("DIR");
+//  auto level   = app.add<std::string>("--level").short_name("-l")
+//                    .help("Log level").default_val("info")  // ← no cast!
+//                    .choices({"debug","info","warn","error"});
 //
-//      auto verbose = app.flag("-v", "--verbose", "Verbose output");
-//      auto jobs    = app.option<unsigned>("-j", "--jobs",  "Parallel jobs")
-//                        .default_val(4u).range(1u, 256u);
-//      auto output  = app.option<fs::path>("-o", "--output", "Output path")
-//                        .required().meta("DIR");
-//      auto tags    = app.option<std::vector<std::string>>("--tag", "Tags");
+//  app.subcommand("build", "Compile sources")
+//     .on_execute([](cli::App& cmd) {
+//         auto target = cmd["--target"].as<std::string>();
+//         std::println("Building: {}", target);
+//     });
 //
-//      auto& build  = app.subcommand("build", "Compile sources");
-//      auto  target = build.option<std::string>("-t","--target","Profile")
-//                         .choices({"debug","release"}).default_val("debug");
+//  app.parse_or_exit(argc, argv);   // parses + fires on_execute callback
 //
-//      auto result = app.parse(argc, argv);
-//      if (!result) { app.print_error(result.error()); return 1; }
-//
-//      if (*verbose) { /* ... */ }
-//      std::println("jobs={} out={}", *jobs, output->string());
-//  }
+//  if (app.has_flag("--verbose")) { /* ... */ }
+//  auto n = app["--jobs"].as_or<int>(1);
 //
 //  REQUIREMENTS
 //  ────────────
@@ -487,23 +484,32 @@ class [[nodiscard]] Option {
 public:
     explicit Option(detail::OptionImpl<T>* p) noexcept : p_(p) {}
 
-    // ── Fluent builder  ───────────────────────────────────────────────────
-    //  Each method returns *this by reference (deducing-this so subclasses
-    //  are handled transparently — no CRTP needed).
+    // ── Fluent builder ────────────────────────────────────────────────────
 
-    /// Set a default value (implies the option is optional)
-    auto&& default_val(this auto&& self, T v)
-        { self.p_->default_ = std::move(v); return std::forward<decltype(self)>(self); }
+    /// Set a default value — accepts anything implicitly convertible to T.
+    /// e.g. default_val("info") works for Option<std::string> without a cast.
+    auto&& default_val(this auto&& self, std::convertible_to<T> auto&& v)
+        { self.p_->default_ = T(std::forward<decltype(v)>(v)); return std::forward<decltype(self)>(self); }
+
+    /// Register a short-form alias (e.g. "-o") for this option
+    auto&& short_name(this auto&& self, std::string_view s) {
+        self.p_->names.insert(self.p_->names.begin(), std::string(s));
+        return std::forward<decltype(self)>(self);
+    }
+
+    /// Set / override the help description
+    auto&& help(this auto&& self, std::string_view h)
+        { self.p_->help_text = std::string(h); return std::forward<decltype(self)>(self); }
 
     /// Mark the option as mandatory
     auto&& required(this auto&& self, bool r = true)
         { self.p_->required_ = r; return std::forward<decltype(self)>(self); }
 
-    /// Hide from help output (useful for internal/debug options)
+    /// Hide from help output
     auto&& hidden(this auto&& self, bool h = true)
         { self.p_->hidden_ = h; return std::forward<decltype(self)>(self); }
 
-    /// Fall back to an environment variable when the flag is absent
+    /// Fall back to an environment variable when the option is absent
     auto&& env(this auto&& self, std::string_view var)
         { self.p_->env_var = std::string(var); return std::forward<decltype(self)>(self); }
 
@@ -530,23 +536,15 @@ public:
 
     // ── Value access ──────────────────────────────────────────────────────
 
-    /// Direct access to the underlying optional — inspect or modify freely
     [[nodiscard]] std::optional<T>&       get()       noexcept { return p_->value; }
     [[nodiscard]] const std::optional<T>& get() const noexcept { return p_->value; }
-
-    /// Dereference — UB if the option was not set and has no default; check bool() first
     [[nodiscard]] const T&  operator*()  const { return *p_->value; }
     [[nodiscard]] const T*  operator->() const { return &*p_->value; }
-
-    /// True if the option has a value (was set or has a default that was applied)
     [[nodiscard]] explicit operator bool() const noexcept { return p_->value.has_value(); }
-
-    /// True only if the option was explicitly passed on the command line
     [[nodiscard]] bool is_set()   const noexcept { return p_->is_set_; }
-
-    /// Safely return the value or a fallback
-    [[nodiscard]] T    value_or(T fallback) const
-        { return p_->value.value_or(std::move(fallback)); }
+    [[nodiscard]] T    value()    const { return *p_->value; }  ///< assumes value present
+    [[nodiscard]] T    value_or(std::convertible_to<T> auto&& fallback) const
+        { return p_->value.value_or(T(std::forward<decltype(fallback)>(fallback))); }
 };
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -559,14 +557,22 @@ class [[nodiscard]] Flag {
 public:
     explicit Flag(detail::OptionImpl<bool>* p) noexcept : p_(p) {}
 
-    auto&& hidden(this auto&& self, bool h = true) { self.p_->hidden_ = h; return std::forward<decltype(self)>(self); }
-    auto&& env   (this auto&& self, std::string_view v)
+    /// Register a short-form alias (e.g. "-v")
+    auto&& short_name(this auto&& self, std::string_view s) {
+        self.p_->names.insert(self.p_->names.begin(), std::string(s));
+        return std::forward<decltype(self)>(self);
+    }
+    /// Set / override the help description
+    auto&& help(this auto&& self, std::string_view h)
+        { self.p_->help_text = std::string(h); return std::forward<decltype(self)>(self); }
+    auto&& hidden(this auto&& self, bool h = true)
+        { self.p_->hidden_ = h; return std::forward<decltype(self)>(self); }
+    auto&& env(this auto&& self, std::string_view v)
         { self.p_->env_var = std::string(v); return std::forward<decltype(self)>(self); }
 
-    /// True when the flag was passed on the command line
-    [[nodiscard]] bool operator*()              const noexcept { return p_->value.value_or(false); }
-    [[nodiscard]] explicit operator bool()      const noexcept { return p_->value.value_or(false); }
-    [[nodiscard]] bool is_set()                 const noexcept { return p_->is_set_; }
+    [[nodiscard]] bool operator*()         const noexcept { return p_->value.value_or(false); }
+    [[nodiscard]] explicit operator bool() const noexcept { return p_->value.value_or(false); }
+    [[nodiscard]] bool is_set()            const noexcept { return p_->is_set_; }
 };
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -580,11 +586,14 @@ class [[nodiscard]] Positional {
 public:
     explicit Positional(detail::PositionalImpl<T>* p) noexcept : p_(p) {}
 
-    auto&& default_val(this auto&& self, T v) {
-        self.p_->default_  = std::move(v);
+    auto&& default_val(this auto&& self, std::convertible_to<T> auto&& v) {
+        self.p_->default_  = T(std::forward<decltype(v)>(v));
         self.p_->required_ = false;
         return std::forward<decltype(self)>(self);
     }
+    /// Set / override the help description
+    auto&& help(this auto&& self, std::string_view h)
+        { self.p_->help_text = std::string(h); return std::forward<decltype(self)>(self); }
     auto&& required(this auto&& self, bool r = true)
         { self.p_->required_ = r; return std::forward<decltype(self)>(self); }
 
@@ -594,8 +603,9 @@ public:
     [[nodiscard]] const T*  operator->() const { return &*p_->value; }
     [[nodiscard]] explicit operator bool() const noexcept { return p_->value.has_value(); }
     [[nodiscard]] bool is_set()    const noexcept { return p_->is_set_; }
-    [[nodiscard]] T    value_or(T fallback) const
-        { return p_->value.value_or(std::move(fallback)); }
+    [[nodiscard]] T    value()     const { return *p_->value; }
+    [[nodiscard]] T    value_or(std::convertible_to<T> auto&& fallback) const
+        { return p_->value.value_or(T(std::forward<decltype(fallback)>(fallback))); }
 };
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -610,14 +620,58 @@ class App {
     std::vector<std::unique_ptr<App>>                       subcommands_;
     App*  parent_     = nullptr;
     App*  active_sub_ = nullptr;
+    std::function<void(App&)>                               callback_;
 
     App(const App&)            = delete;
     App& operator=(const App&) = delete;
 
 public:
+    // ── Constructors ──────────────────────────────────────────────────────
+
+    /// Two-arg: name + description (version set later via .version())
     explicit App(std::string name, std::string desc = {})
         : name_(std::move(name)), desc_(std::move(desc)) {}
+
+    /// Three-arg convenience: name, description, version inline
+    App(std::string name, std::string desc, std::string ver)
+        : name_(std::move(name)), desc_(std::move(desc)), version_(std::move(ver)) {}
+
     App(App&&) = default;
+
+    // ── Dynamic lookup proxy ──────────────────────────────────────────────
+
+    /// Zero-overhead proxy returned by operator[]. Provides type-safe access
+    /// without keeping handles to individual options.
+    struct Lookup {
+        detail::OptionBase* p_;
+        [[nodiscard]] explicit operator bool() const noexcept { return p_ && p_->is_set_; }
+        [[nodiscard]] bool is_set()            const noexcept { return p_ && p_->is_set_; }
+        [[nodiscard]] bool found()             const noexcept { return p_ != nullptr; }
+
+        /// Return the option's value; asserts that it is set.
+        template<typename T>
+        [[nodiscard]] T as() const {
+            auto* impl = dynamic_cast<detail::OptionImpl<T>*>(p_);
+            if (!impl || !impl->value) return T{}; // graceful
+            return *impl->value;
+        }
+
+        /// Return the option's value or @p fallback when not set / not found.
+        template<typename T>
+        [[nodiscard]] T as_or(T fallback) const {
+            auto* impl = dynamic_cast<detail::OptionImpl<T>*>(p_);
+            if (!impl || !impl->value) return fallback;
+            return *impl->value;
+        }
+    };
+
+    /// Look up any registered option by name (short or long).
+    /// Returns a Lookup proxy; check .found() before calling .as<T>().
+    [[nodiscard]] Lookup operator[](std::string_view name) const noexcept {
+        for (auto& o : options_)
+            if (o->matches(name)) return Lookup{o.get()};
+        return Lookup{nullptr};
+    }
 
     // ── App metadata builder ──────────────────────────────────────────────
 
@@ -628,7 +682,8 @@ public:
     auto&& example(this auto&& self, std::string ex)
         { self.examples_.push_back(std::move(ex)); return std::forward<decltype(self)>(self); }
 
-    // ── Option registration ───────────────────────────────────────────────
+    // ── Option registration ─────────────────────────────────────────────────
+    //  v1 (compat): positional-arg style, kept for backward compatibility.
 
     /// Register a typed option with optional short and long names
     template<typename T>
@@ -677,7 +732,44 @@ public:
         return Positional<T>(p);
     }
 
-    // ── Subcommand registration ───────────────────────────────────────────
+    // ── Option registration ─────────────────────────────────────────────────
+    //  v2 (preferred): start with the primary (long) name, chain the rest.
+
+    /// Create a typed option. Chain .short_name(), .help(), .default_val(), etc.
+    /// Example: auto jobs = app.add<int>("--jobs").short_name("-j").help("N").default_val(4);
+    template<typename T>
+    [[nodiscard]] Option<T> add(std::string_view long_name) {
+        auto impl = std::make_unique<detail::OptionImpl<T>>();
+        impl->names.emplace_back(long_name);
+        impl->meta = std::string(detail::type_meta<T>());
+        auto* p   = impl.get();
+        options_.push_back(std::move(impl));
+        return Option<T>(p);
+    }
+
+    /// Create a boolean flag. Chain .short_name(), .help(), etc.
+    /// Example: auto verbose = app.add_flag("--verbose").short_name("-v").help("...");
+    [[nodiscard]] Flag add_flag(std::string_view long_name) {
+        auto impl      = std::make_unique<detail::OptionImpl<bool>>();
+        impl->names.emplace_back(long_name);
+        impl->is_flag_ = true;
+        auto* p        = impl.get();
+        options_.push_back(std::move(impl));
+        return Flag(p);
+    }
+
+    /// Create a positional argument. Chain .help(), .default_val(), etc.
+    template<typename T>
+    [[nodiscard]] Positional<T> add_positional(std::string_view name) {
+        auto impl       = std::make_unique<detail::PositionalImpl<T>>();
+        impl->name      = std::string(name);
+        impl->variadic_ = detail::is_vec_v<T>;
+        auto* p         = impl.get();
+        positionals_.push_back(std::move(impl));
+        return Positional<T>(p);
+    }
+
+    // ── Subcommand registration ─────────────────────────────────────────────
 
     /// Create and return a reference to a nested subcommand App
     [[nodiscard]] App& subcommand(std::string name, std::string desc = {}) {
@@ -688,6 +780,13 @@ public:
         return *p;
     }
 
+    /// Register a callback to fire when this subcommand is selected.
+    /// Called automatically by parse_or_exit() after a successful parse.
+    App& on_execute(std::function<void(App&)> fn) {
+        callback_ = std::move(fn);
+        return *this;
+    }
+
     /// Returns the subcommand that was selected, or nullptr
     [[nodiscard]] App* active_subcommand() const noexcept { return active_sub_; }
 
@@ -695,16 +794,38 @@ public:
     [[nodiscard]] bool is_subcommand(std::string_view n) const noexcept
         { return active_sub_ && active_sub_->name_ == n; }
 
+    // ── Convenience queries ─────────────────────────────────────────────────
+
+    /// True if the named flag was explicitly passed on the command line.
+    [[nodiscard]] bool has_flag(std::string_view name) const noexcept
+        { return (*this)[name].is_set(); }
+
+    /// True if the named option has a value (set on CLI or via default).
+    [[nodiscard]] bool has_option(std::string_view name) const noexcept
+        { return (*this)[name].found() && static_cast<bool>((*this)[name]); }
+
     [[nodiscard]] const std::string& name()        const noexcept { return name_;    }
     [[nodiscard]] const std::string& description() const noexcept { return desc_;    }
     [[nodiscard]] const std::string& ver()         const noexcept { return version_; }
 
-    // ── Parse ─────────────────────────────────────────────────────────────
+    // ── Parse ───────────────────────────────────────────────────────────────
 
     /// Parse argc/argv.  argv[0] (program name) is automatically skipped.
     [[nodiscard]] ParseResult parse(int argc, char** argv) {
         std::span<char* const> args(argv + 1, static_cast<size_t>(argc > 0 ? argc - 1 : 0));
+
         return do_parse(args);
+    }
+
+    /// Parse and exit on failure. After a successful parse, fires the
+    /// active subcommand's on_execute callback (if registered), or the
+    /// root callback if no subcommand was selected.
+    void parse_or_exit(int argc, char** argv) {
+        auto r = parse(argc, argv);
+        if (!r) { print_error(r.error()); std::exit(1); }
+        // Dispatch: prefer the active subcommand's callback, then root's.
+        App* target = active_sub_ ? active_sub_ : this;
+        if (target->callback_) target->callback_(*target);
     }
 
     // ── Help ──────────────────────────────────────────────────────────────

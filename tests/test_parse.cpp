@@ -345,3 +345,131 @@ TEST_CASE("value_or: returns actual value when set") {
     REQUIRE(app.parse(a.argc(), a.argv()));
     CHECK(n.value_or(42) == 7);
 }
+
+// ── §13  v2 fluent add<T> builder ────────────────────────────────────────────
+
+TEST_CASE("add<T>: registers option, short_name works") {
+    cli::App app("t");
+    auto n = app.add<int>("--num").short_name("-n").help("A number").default_val(99);
+    Args a{"-n", "7"};
+    REQUIRE(app.parse(a.argc(), a.argv()));
+    CHECK(*n == 7);
+    CHECK(n.is_set());
+}
+
+TEST_CASE("add<T>: default_val implicit string conversion (no cast needed)") {
+    cli::App app("t");
+    auto s = app.add<std::string>("--level").default_val("info");
+    REQUIRE(app.parse(Args{}.argc(), Args{}.argv()));
+    CHECK(*s == "info");
+}
+
+TEST_CASE("add_flag: registers flag, short_name works") {
+    cli::App app("t");
+    auto f = app.add_flag("--verbose").short_name("-v").help("verbose");
+    Args a{"-v"};
+    REQUIRE(app.parse(a.argc(), a.argv()));
+    CHECK(*f);
+    CHECK(f.is_set());
+}
+
+TEST_CASE("add_flag: absent → false") {
+    cli::App app("t");
+    auto f = app.add_flag("--verbose").short_name("-v");
+    REQUIRE(app.parse(Args{}.argc(), Args{}.argv()));
+    CHECK(!*f);
+}
+
+TEST_CASE("add_positional: works with help chained") {
+    cli::App app("t");
+    auto p = app.add_positional<std::string>("src").help("source file");
+    Args a{"hello.txt"};
+    REQUIRE(app.parse(a.argc(), a.argv()));
+    CHECK(*p == "hello.txt");
+}
+
+// ── §14  App::operator[] Lookup proxy ────────────────────────────────────────
+
+TEST_CASE("Lookup: as<T> returns set value") {
+    cli::App app("t");
+    app.add<int>("--num").short_name("-n").required();
+    Args a{"--num", "42"};
+    REQUIRE(app.parse(a.argc(), a.argv()));
+    CHECK(app["--num"].as<int>() == 42);
+    CHECK(app["-n"].as<int>() == 42);  // short alias also works
+}
+
+TEST_CASE("Lookup: as_or returns fallback when not set") {
+    cli::App app("t");
+    app.add<int>("--num").default_val(0);
+    REQUIRE(app.parse(Args{}.argc(), Args{}.argv()));
+    CHECK(app["--num"].as_or<int>(99) == 0);  // has default, so set
+    CHECK(app["--missing"].as_or<int>(77) == 77);  // not found → fallback
+}
+
+TEST_CASE("Lookup: found() reflects registration") {
+    cli::App app("t");
+    app.add<int>("--num");
+    REQUIRE(app.parse(Args{}.argc(), Args{}.argv()));
+    CHECK(app["--num"].found());
+    CHECK(!app["--other"].found());
+}
+
+// ── §15  has_flag / has_option ────────────────────────────────────────────────
+
+TEST_CASE("has_flag: true when flag was explicitly set") {
+    cli::App app("t");
+    app.add_flag("--verbose").short_name("-v");
+    Args a{"-v"};
+    REQUIRE(app.parse(a.argc(), a.argv()));
+    CHECK(app.has_flag("--verbose"));
+    CHECK(app.has_flag("-v"));
+}
+
+TEST_CASE("has_flag: false when flag was not passed") {
+    cli::App app("t");
+    app.add_flag("--verbose");
+    REQUIRE(app.parse(Args{}.argc(), Args{}.argv()));
+    CHECK(!app.has_flag("--verbose"));
+}
+
+TEST_CASE("has_option: true when option has a value (default or explicit)") {
+    cli::App app("t");
+    app.add<int>("--num").default_val(5);
+    REQUIRE(app.parse(Args{}.argc(), Args{}.argv()));
+    CHECK(app.has_option("--num"));
+}
+
+// ── §16  3-arg App constructor ────────────────────────────────────────────────
+
+TEST_CASE("3-arg constructor sets version") {
+    cli::App app("t", "desc", "2.0.0");
+    CHECK(app.ver() == "2.0.0");
+    CHECK(app.name() == "t");
+    CHECK(app.description() == "desc");
+}
+
+// ── §17  on_execute callback ──────────────────────────────────────────────────
+
+TEST_CASE("on_execute: fires for selected subcommand") {
+    cli::App app("t");
+    auto& sub  = app.subcommand("build", "");
+    sub.add<std::string>("--target").default_val("debug");
+
+    bool fired = false;
+    std::string seen;
+    sub.on_execute([&fired, &seen](cli::App& cmd) {
+        fired = true;
+        seen  = cmd["--target"].as<std::string>();
+    });
+
+    Args a{"build", "--target", "release"};
+    REQUIRE(app.parse(a.argc(), a.argv()));
+    // Manually fire (parse_or_exit would also do this automatically)
+    if (auto* s = app.active_subcommand(); s && s->callback_)
+        s->callback_(*s);
+
+    REQUIRE(fired);
+    CHECK(seen == "release");
+}
+
