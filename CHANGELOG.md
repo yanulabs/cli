@@ -5,6 +5,45 @@ All notable changes to this project will be documented in this file.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.1.0] — 2026-03-31
+
+### Added
+- **Count options** (`add_count(name)`) — counts flag occurrences; `-vvv` or `-v -v -v` → 3
+- **`.transform(fn)`** — post-parse value transformation on `Option<T>` and `Positional<T>`
+- **`mutex_group({...})`** — declares mutually exclusive options; error if more than one is set
+- **`require_together({...})`** — declares co-required options; error if only some are set
+- **Subcommand aliases** (`.alias(name)`) — e.g. `subcommand("commit").alias("ci")`
+- **Negatable flags** (`.negatable()`) — auto-accepts `--no-FLAG` to set flag to false; shown as `--[no-]flag` in help
+- **Named option sections** (`.section(name)`) — groups options under sub-headers in help output
+- **Zsh completion** (`zsh_completion(ostream)`) — generates `#compdef`-style completion function
+- **`has_callback()` / `fire_callback()`** — public API to inspect and invoke subcommand callbacks
+- **`ParseError::Kind::MutuallyExclusive`** and **`ParseError::Kind::RequiresOption`** error kinds
+- Bash completion now includes `--no-*` entries for negatable flags and subcommand aliases
+
+### Fixed
+- `has_flag()` now correctly returns false for negatable flags set to false via `--no-FLAG`
+- `has_option()` now correctly returns true when an option has a default value applied
+
+## [1.1.0] — 2026-03-31
+
+### Added
+- **`Count` option type** (`add_count(name)`) — counts flag occurrences; `-vvv` or `-v -v -v` → 3
+- **`.transform(fn)`** — post-parse value transformation on `Option<T>` and `Positional<T>`
+- **`mutex_group({…})`** — declares mutually exclusive options; error if more than one is set
+- **`require_together({…})`** — declares co-required options; error if only some are set
+- **Subcommand aliases** (`.alias(name)`) — e.g. `subcommand("commit").alias("ci")`
+- **Negatable flags** (`.negatable()`) — auto-accepts `--no-FLAG` to set the flag to false; displayed as `--[no-]flag` in help
+- **Named option sections** (`.section(name)`) — groups options under sub-headers in the help OPTIONS block
+- **Zsh completion** (`zsh_completion(ostream)`) — generates `#compdef`-style completion function
+- **`has_callback()` / `fire_callback()`** — public API to inspect and invoke subcommand callbacks without accessing private members
+- **`ParseError::Kind::MutuallyExclusive`** and **`ParseError::Kind::RequiresOption`** error kinds with named constructors
+- `OptionBase::has_value()` virtual method; `Lookup::operator bool()` now reflects presence of a value (from CLI or default) rather than explicit-set state
+- Bash completion now includes `--no-*` entries for negatable flags and subcommand aliases
+- `completions` example updated with Zsh support
+
+### Fixed
+- `has_option(name)` now correctly returns `true` when the option has a default value, matching its documented behavior
+
 ## [1.0.0] — 2024-01-01
 
 ### Added

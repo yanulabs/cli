@@ -24,7 +24,14 @@
 | **Subcommands** | Recursive, each with their own option set |
 | **Rich help** | ANSI-colored, auto-aligned, section-structured |
 | **Suggestions** | Levenshtein "did you mean?" on unknown options |
-| **Completions** | Bash and Fish generators |
+| **Completions** | Bash, Fish, and Zsh generators |
+| **Count options** | `add_count("--verbose")` counts `-v -v -v` occurrences |
+| **Transforms** | `.transform(fn)` applies a post-parse value transformation |
+| **Mutex groups** | `mutex_group({...})` — at most one option in the set may be used |
+| **Require-together** | `require_together({...})` — all-or-nothing option sets |
+| **Subcommand aliases** | `.alias("ci")` — alternative names for subcommands |
+| **Negatable flags** | `.negatable()` — `--[no-]flag` shown in help, `--no-flag` sets false |
+| **Named sections** | `.section("Group")` — groups options under sub-headers in help |
 
 ---
 
@@ -106,36 +113,42 @@ cli::App app("name", "description");
 app.version("1.0.0").author("Name").example("name --flag");
 
 // Options
-Option<T>    app.option<T>("-s", "--long", "help");   // short + long
-Option<T>    app.option<T>("--long", "help");          // long only
-
-// Flags
-Flag         app.flag("-v", "--verbose", "help");
-
-// Positionals
-Positional<T> app.positional<T>("name", "help");       // T=vector for variadic
+Option<T>    app.add<T>("--long").short_name("-s").help("...").default_val(v);
+Flag         app.add_flag("--verbose").short_name("-v").help("...");
+Count        app.add_count("--verbose").short_name("-v").help("...");
+Positional<T> app.add_positional<T>("name").help("...");
 
 // Subcommands
-App&          app.subcommand("name", "description");
+App&          app.subcommand("name", "desc").alias("n");
+
+// Constraints
+App&          app.mutex_group({"--verbose", "--quiet"});
+App&          app.require_together({"--output", "--format"});
 
 // Parse
 ParseResult   app.parse(argc, argv);   // std::expected<void, ParseError>
+void          app.parse_or_exit(argc, argv);
 
 // Introspection
 App*          app.active_subcommand();
 bool          app.is_subcommand("name");
+bool          app.has_flag("--flag");
+bool          app.has_option("--opt");
 
 // Output
 void          app.print_help();
 void          app.print_error(const ParseError&);
 void          app.bash_completion(ostream&);
 void          app.fish_completion(ostream&);
+void          app.zsh_completion(ostream&);
 ```
 
 ### `Option<T>` builder chain
 
 ```cpp
-auto opt = app.option<T>("-x", "--flag", "help")
+auto opt = app.add<T>("--flag")
+              .short_name("-x")
+              .help("description")
               .default_val(value)     // implies optional
               .required()             // must be provided
               .hidden()               // exclude from help
@@ -143,7 +156,9 @@ auto opt = app.option<T>("-x", "--flag", "help")
               .meta("PLACEHOLDER")    // override <META> in help
               .range(lo, hi)          // inclusive bounds
               .choices({a, b, c})     // allowed values
-              .validate(fn, "desc");  // custom predicate
+              .validate(fn, "desc")   // custom predicate
+              .transform(fn)          // post-parse value transform
+              .section("Group Name"); // help section header
 ```
 
 ### Value access
@@ -165,7 +180,84 @@ result.error().message;  // human-readable string
 ```
 
 **Kinds:** `UnknownOption`, `MissingValue`, `InvalidValue`, `MissingRequired`,
-`TooManyPositionals`, `ValidationFailed`, `OutOfRange`, `BadChoice`
+`TooManyPositionals`, `ValidationFailed`, `OutOfRange`, `BadChoice`,
+`MutuallyExclusive`, `RequiresOption`
+
+---
+
+## Advanced Features
+
+### Count options
+
+Count how many times a flag appears (e.g. `-v`, `-vv`, `-vvv`):
+
+```cpp
+auto verbosity = app.add_count("--verbose").short_name("-v").help("Verbosity level");
+app.parse_or_exit(argc, argv);
+std::println("Verbosity: {}", *verbosity);  // 0, 1, 2, 3, ...
+```
+
+### Post-parse transforms
+
+Apply a function to a parsed value after all constraints pass:
+
+```cpp
+auto name = app.add<std::string>("--name").required()
+               .transform([](std::string s) {
+                   std::ranges::transform(s, s.begin(), ::toupper);
+                   return s;
+               });
+// *name is now uppercase regardless of input
+```
+
+### Mutually exclusive options
+
+```cpp
+app.add_flag("--verbose").short_name("-v");
+app.add_flag("--quiet").short_name("-q");
+app.mutex_group({"--verbose", "--quiet"});
+// Error if both -v and -q are passed
+```
+
+### Required-together options
+
+```cpp
+app.add<std::string>("--output").required();
+app.add<std::string>("--format").required();
+app.require_together({"--output", "--format"});
+// If either is set, both must be set
+```
+
+### Subcommand aliases
+
+```cpp
+auto& commit = app.subcommand("commit", "Record changes").alias("ci");
+// Both "commit" and "ci" dispatch to the same subcommand
+```
+
+### Negatable flags
+
+```cpp
+auto color = app.add_flag("--color").negatable().default_val(true);
+// Accepts --color (true) and --no-color (false)
+// Help shows: --[no-]color
+```
+
+### Named option sections
+
+```cpp
+app.add<std::string>("--host").section("Connection Options");
+app.add<unsigned>("--port").section("Connection Options");
+app.add_flag("--verbose").section("Output Options");
+// Help groups options under section headers
+```
+
+### Zsh completion
+
+```cpp
+app.zsh_completion(std::cout);  // writes #compdef-style function
+// Usage: eval "$(mytool --shell zsh)"
+```
 
 ---
 

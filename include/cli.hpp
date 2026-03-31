@@ -7,19 +7,34 @@
 //  ────────
 //  · Single-header, zero dependencies, cross-platform
 //  · std::expected<void, ParseError> — composable, propagating errors
-//  · Type-safe Option<T>, Flag, Positional<T> handles
+//  · Type-safe Option<T>, Flag, Count, Positional<T> handles
 //  · Fluent builder API via C++23 deducing-this (no CRTP boilerplate)
 //  · Types out-of-the-box: bool · integrals · floats · string · path · vector
 //  · Constraints: .range() · .choices() · .validate(fn, desc)
+//  · Mutually exclusive groups:  mutex_group({"--verbose","--quiet"})
+//  · Required-together groups:   require_together({"--output","--format"})
 //  · Per-option env-var fallback via .env("VAR")
+//  · Post-parse value transforms via .transform(fn)
 //  · Short-flag grouping   -vxf  ≡  -v -x -f
+//  · Count options:        -vvv  ≡  -v -v -v  (increments per occurrence)
 //  · Inline short value    -n42  ≡  -n 42
 //  · Inline long value   --out=file  ≡  --out file
 //  · End-of-options marker  --
 //  · Subcommands with independent option sets and recursive help
+//  · Subcommand aliases: subcommand("commit").alias("ci")
+//  · Negatable flags: add_flag("--color").negatable()  →  --[no-]color
+//  · Named option sections in help: .section("Connection Options")
 //  · Auto-aligned, ANSI-colored, section-structured help output
 //  · Levenshtein "did you mean?" suggestions on unknown options
-//  · Bash / Fish shell completion generators
+//  · Bash / Fish / Zsh shell completion generators
+//  · Count options:  add_count("--verbose")  counts -v -v -v occurrences
+//  · Mutually exclusive groups: mutex_group({"--verbose","--quiet"})
+//  · Required-together groups: require_together({"--output","--format"})
+//  · Subcommand aliases: subcommand("commit").alias("ci")
+//  · Negatable flags: add_flag("--color").negatable()  →  --[no-]color
+//  · Post-parse transforms: .transform([](auto s){ return upper(s); })
+//  · Named option sections: .section("Connection Options")
+//  · Zsh shell completion generator
 //
 //  NEW FLUENT API (v2)
 //  ───────────────────
@@ -96,6 +111,8 @@ struct ParseError {
         ValidationFailed,
         OutOfRange,
         BadChoice,
+        MutuallyExclusive,
+        RequiresOption,
     };
 
     Kind        kind;
@@ -144,6 +161,14 @@ struct ParseError {
     static ParseError too_many(std::string_view arg) {
         return { Kind::TooManyPositionals,
                  std::format("unexpected argument '{}'", arg) };
+    }
+    static ParseError mutually_exclusive(std::string_view a, std::string_view b) {
+        return { Kind::MutuallyExclusive,
+                 std::format("'{}' and '{}' are mutually exclusive", a, b) };
+    }
+    static ParseError requires_option(std::string_view opt, std::string_view req) {
+        return { Kind::RequiresOption,
+                 std::format("'{}' requires '{}' to also be provided", opt, req) };
     }
 };
 
@@ -312,8 +337,12 @@ struct OptionBase {
     bool                     is_flag_   = false;
     bool                     is_set_    = false;
     bool                     hidden_    = false;
+    std::string              section_;    // optional help-group name
+    bool                     negatable_ = false; // accept --no-FLAG to set false
 
     virtual ~OptionBase()              = default;
+    virtual void        finalize_value()                                    {}
+    virtual bool        has_value()    const                              = 0;
     virtual ParseResult parse(std::string_view val, std::string_view opt_name) = 0;
     virtual bool        has_default()  const = 0;
     virtual void        apply_default()      = 0;
@@ -354,6 +383,11 @@ struct OptionImpl final : OptionBase {
     std::optional<std::vector<E>> choices_;
     std::function<bool(const T&)> validator_;
     std::string                   validator_desc;
+    std::function<T(T)>           transform_;
+
+    void finalize_value() override {
+        if (transform_ && value) value = transform_(*value);
+    }
 
     ParseResult parse(std::string_view sv, std::string_view opt) override {
         if constexpr (is_vec_v<T>) {
@@ -384,6 +418,7 @@ struct OptionImpl final : OptionBase {
     }
 
     bool        has_default()  const override { return default_.has_value(); }
+    bool        has_value()    const override { return value.has_value(); }
     void        apply_default()       override { if (default_) value = *default_; }
     bool        is_multi()     const override { return is_vec_v<T>; }
 
@@ -421,6 +456,7 @@ struct PositionalBase {
     bool        variadic_ = false;   // true when T is vector or user sets it
 
     virtual ~PositionalBase()                  = default;
+    virtual void        finalize_value()            {}
     virtual ParseResult parse(std::string_view v) = 0;
     virtual bool        has_default()  const      = 0;
     virtual void        apply_default()            = 0;
@@ -431,8 +467,13 @@ template<typename T>
 struct PositionalImpl final : PositionalBase {
     using E = elem_of_t<T>;
 
-    std::optional<T> value;
-    std::optional<T> default_;
+    std::optional<T>    value;
+    std::optional<T>    default_;
+    std::function<T(T)> transform_;
+
+    void finalize_value() override {
+        if (transform_ && value) value = transform_(*value);
+    }
 
     ParseResult parse(std::string_view sv) override {
         if constexpr (is_vec_v<T>) {
@@ -465,6 +506,24 @@ struct PositionalImpl final : PositionalBase {
             return to_display(*default_);
         }
     }
+};
+
+// ── CountImpl — counts occurrences of a flag (-v -v -v = 3, or -vvv = 3) ───
+
+struct CountImpl final : OptionBase {
+    unsigned count_ = 0;
+
+    ParseResult parse(std::string_view, std::string_view) override {
+        ++count_;
+        is_set_ = true;
+        return {};
+    }
+    bool        has_default()  const override { return false; }
+    bool        has_value()    const override { return count_ > 0; }
+    void        apply_default()       override {}
+    std::string default_str()  const override { return {}; }
+    std::string choices_str()  const override { return {}; }
+    bool        is_multi()     const override { return false; }
 };
 
 } // namespace detail
@@ -534,6 +593,16 @@ public:
         return std::forward<decltype(self)>(self);
     }
 
+    /// Apply a transformation to the parsed value (called after all constraints)
+    auto&& transform(this auto&& self, std::function<T(T)> fn) {
+        self.p_->transform_ = std::move(fn);
+        return std::forward<decltype(self)>(self);
+    }
+
+    /// Assign this option to a named section in the help output
+    auto&& section(this auto&& self, std::string_view s)
+        { self.p_->section_ = std::string(s); return std::forward<decltype(self)>(self); }
+
     // ── Value access ──────────────────────────────────────────────────────
 
     [[nodiscard]] std::optional<T>&       get()       noexcept { return p_->value; }
@@ -570,9 +639,45 @@ public:
     auto&& env(this auto&& self, std::string_view v)
         { self.p_->env_var = std::string(v); return std::forward<decltype(self)>(self); }
 
+    /// Assign this flag to a named section in the help output
+    auto&& section(this auto&& self, std::string_view s)
+        { self.p_->section_ = std::string(s); return std::forward<decltype(self)>(self); }
+
+    /// Also accept --no-FLAG on the command line (sets the flag to false)
+    auto&& negatable(this auto&& self, bool n = true)
+        { self.p_->negatable_ = n; return std::forward<decltype(self)>(self); }
+
     [[nodiscard]] bool operator*()         const noexcept { return p_->value.value_or(false); }
     [[nodiscard]] explicit operator bool() const noexcept { return p_->value.value_or(false); }
     [[nodiscard]] bool is_set()            const noexcept { return p_->is_set_; }
+};
+
+// ────────────────────────────────────────────────────────────────────────────
+// §7.5  Count — counts flag occurrences (-v -v -v = 3, or -vvv = 3)
+// ────────────────────────────────────────────────────────────────────────────
+
+class [[nodiscard]] Count {
+    detail::CountImpl* p_;
+    friend class App;
+public:
+    explicit Count(detail::CountImpl* p) noexcept : p_(p) {}
+
+    auto&& short_name(this auto&& self, std::string_view s) {
+        self.p_->names.insert(self.p_->names.begin(), std::string(s));
+        return std::forward<decltype(self)>(self);
+    }
+    auto&& help(this auto&& self, std::string_view h)
+        { self.p_->help_text = std::string(h); return std::forward<decltype(self)>(self); }
+    auto&& hidden(this auto&& self, bool h = true)
+        { self.p_->hidden_ = h; return std::forward<decltype(self)>(self); }
+    auto&& section(this auto&& self, std::string_view s)
+        { self.p_->section_ = std::string(s); return std::forward<decltype(self)>(self); }
+
+    [[nodiscard]] unsigned     operator*()            const noexcept { return p_->count_; }
+    [[nodiscard]] explicit operator bool()            const noexcept { return p_->count_ > 0; }
+    [[nodiscard]] bool         is_set()               const noexcept { return p_->is_set_; }
+    [[nodiscard]] unsigned     value_or(unsigned fallback) const noexcept
+        { return p_->is_set_ ? p_->count_ : fallback; }
 };
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -596,6 +701,12 @@ public:
         { self.p_->help_text = std::string(h); return std::forward<decltype(self)>(self); }
     auto&& required(this auto&& self, bool r = true)
         { self.p_->required_ = r; return std::forward<decltype(self)>(self); }
+
+    /// Apply a transformation to the parsed positional value
+    auto&& transform(this auto&& self, std::function<T(T)> fn) {
+        self.p_->transform_ = std::move(fn);
+        return std::forward<decltype(self)>(self);
+    }
 
     [[nodiscard]] std::optional<T>&       get()       noexcept { return p_->value; }
     [[nodiscard]] const std::optional<T>& get() const noexcept { return p_->value; }
@@ -621,6 +732,9 @@ class App {
     App*  parent_     = nullptr;
     App*  active_sub_ = nullptr;
     std::function<void(App&)>                               callback_;
+    std::vector<std::string>               aliases_;
+    std::vector<std::vector<std::string>>  mutex_groups_;
+    std::vector<std::vector<std::string>>  require_groups_;
 
     App(const App&)            = delete;
     App& operator=(const App&) = delete;
@@ -644,7 +758,7 @@ public:
     /// without keeping handles to individual options.
     struct Lookup {
         detail::OptionBase* p_;
-        [[nodiscard]] explicit operator bool() const noexcept { return p_ && p_->is_set_; }
+        [[nodiscard]] explicit operator bool() const noexcept { return p_ && p_->has_value(); }
         [[nodiscard]] bool is_set()            const noexcept { return p_ && p_->is_set_; }
         [[nodiscard]] bool found()             const noexcept { return p_ != nullptr; }
 
@@ -769,6 +883,35 @@ public:
         return Positional<T>(p);
     }
 
+    /// Create a count option. Each occurrence increments by 1. Chain .short_name(), .help(), etc.
+    /// Example: auto verbosity = app.add_count("--verbose").short_name("-v").help("verbosity level");
+    [[nodiscard]] Count add_count(std::string_view long_name) {
+        auto impl      = std::make_unique<detail::CountImpl>();
+        impl->names.emplace_back(long_name);
+        impl->is_flag_ = true;
+        auto* p        = impl.get();
+        options_.push_back(std::move(impl));
+        return Count(p);
+    }
+
+    /// Declare a set of mutually exclusive options — at most one may be set.
+    App& mutex_group(std::initializer_list<std::string_view> names) {
+        std::vector<std::string> g;
+        g.reserve(names.size());
+        for (auto n : names) g.emplace_back(n);
+        mutex_groups_.push_back(std::move(g));
+        return *this;
+    }
+
+    /// Declare options that must all be provided together — if any is set, all must be.
+    App& require_together(std::initializer_list<std::string_view> names) {
+        std::vector<std::string> g;
+        g.reserve(names.size());
+        for (auto n : names) g.emplace_back(n);
+        require_groups_.push_back(std::move(g));
+        return *this;
+    }
+
     // ── Subcommand registration ─────────────────────────────────────────────
 
     /// Create and return a reference to a nested subcommand App
@@ -780,12 +923,24 @@ public:
         return *p;
     }
 
+    /// Add an alias for this subcommand (e.g., "ci" for "commit")
+    App& alias(std::string name) {
+        aliases_.push_back(std::move(name));
+        return *this;
+    }
+
     /// Register a callback to fire when this subcommand is selected.
     /// Called automatically by parse_or_exit() after a successful parse.
     App& on_execute(std::function<void(App&)> fn) {
         callback_ = std::move(fn);
         return *this;
     }
+
+    /// Returns true if an on_execute callback is registered.
+    [[nodiscard]] bool has_callback() const noexcept { return callback_ != nullptr; }
+
+    /// Explicitly invoke the on_execute callback for this app node.
+    void fire_callback() { if (callback_) callback_(*this); }
 
     /// Returns the subcommand that was selected, or nullptr
     [[nodiscard]] App* active_subcommand() const noexcept { return active_sub_; }
@@ -796,13 +951,19 @@ public:
 
     // ── Convenience queries ─────────────────────────────────────────────────
 
-    /// True if the named flag was explicitly passed on the command line.
-    [[nodiscard]] bool has_flag(std::string_view name) const noexcept
-        { return (*this)[name].is_set(); }
+    /// True if the named flag is currently active (true). For negatable flags,
+    /// returns false when the flag was set to false via --no-FLAG.
+    [[nodiscard]] bool has_flag(std::string_view name) const noexcept {
+        auto l = (*this)[name];
+        return l.found() && l.as_or<bool>(false);
+    }
 
     /// True if the named option has a value (set on CLI or via default).
-    [[nodiscard]] bool has_option(std::string_view name) const noexcept
-        { return (*this)[name].found() && static_cast<bool>((*this)[name]); }
+    [[nodiscard]] bool has_option(std::string_view name) const noexcept {
+        auto l = (*this)[name];
+        if (!l.found()) return false;
+        return l.is_set() || l.p_->has_default();
+    }
 
     [[nodiscard]] const std::string& name()        const noexcept { return name_;    }
     [[nodiscard]] const std::string& description() const noexcept { return desc_;    }
@@ -887,9 +1048,14 @@ public:
         if (!subcommands_.empty()) {
             std::println("{}COMMANDS{}", X::byel(), X::rst());
             size_t col = 4;
-            for (auto& s : subcommands_) col = std::max(col, s->name_.size() + 4);
             for (auto& s : subcommands_) {
-                std::string lhs = std::format("  {}", s->name_);
+                size_t w = s->name_.size();
+                for (auto& a : s->aliases_) w += 2 + a.size();
+                col = std::max(col, w + 4);
+            }
+            for (auto& s : subcommands_) {
+                std::string lhs = "  " + s->name_;
+                for (auto& a : s->aliases_) lhs += ", " + a;
                 std::print("{}{:<{}}{}", X::bcyn(), lhs, col, X::rst());
                 std::println("{}", s->desc_);
             }
@@ -927,11 +1093,19 @@ public:
                "    local cur prev opts subs\n"
                "    cur=\"${COMP_WORDS[COMP_CWORD]}\"\n"
                "    opts=\"";
-        for (auto& opt : options_)
+        for (auto& opt : options_) {
             for (auto& n : opt->names) out << n << " ";
+            if (opt->negatable_) {
+                auto ln = std::string(opt->long_name());
+                if (ln.starts_with("--")) out << "--no-" << ln.substr(2) << " ";
+            }
+        }
         out << "--help --version\"\n"
                "    subs=\"";
-        for (auto& s : subcommands_) out << s->name_ << " ";
+        for (auto& s : subcommands_) {
+            out << s->name_ << " ";
+            for (auto& a : s->aliases_) out << a << " ";
+        }
         out << "\"\n"
                "    COMPREPLY=($(compgen -W \"${opts} ${subs}\" -- \"${cur}\"))\n"
                "}\n"
@@ -959,6 +1133,65 @@ public:
         out << "complete -c " << name_ << " -s h -l help    -f -d 'Print help'\n";
         if (!version_.empty())
             out << "complete -c " << name_ << " -s V -l version -f -d 'Print version'\n";
+    }
+
+    void zsh_completion(std::ostream& out = std::cout) const {
+        auto fn = name_;
+        for (auto& c : fn) if (!std::isalnum((unsigned char)c)) c = '_';
+
+        out << "#compdef " << name_ << "\n\n";
+        out << "_" << fn << "() {\n";
+
+        if (!subcommands_.empty()) {
+            out << "    local context state state_descr line\n";
+            out << "    typeset -A opt_args\n\n";
+        }
+
+        out << "    local -a args\n";
+        out << "    args=(\n";
+        for (auto& opt : options_) {
+            if (opt->hidden_) continue;
+            auto sn = opt->short_name();
+            auto ln = opt->long_name();
+            out << "        ";
+            if (!sn.empty() && !ln.empty())
+                out << "'(" << sn << " " << ln << ")'{" << sn << "," << ln << "}";
+            else if (!ln.empty())
+                out << "'" << ln << "'";
+            else if (!sn.empty())
+                out << "'" << sn << "'";
+            if (!opt->is_flag_)
+                out << "=[" << (!opt->meta.empty() ? opt->meta : "value") << "]";
+            if (!opt->help_text.empty())
+                out << "'[" << opt->help_text << "]'";
+            else
+                out << "''";
+            out << "\n";
+        }
+        out << "        '(-h --help)'{-h,--help}'[Print help]'\n";
+        if (!version_.empty())
+            out << "        '(-V --version)'{-V,--version}'[Print version]'\n";
+        out << "    )\n\n";
+
+        if (!subcommands_.empty()) {
+            out << "    local -a subcmds\n";
+            out << "    subcmds=(\n";
+            for (auto& s : subcommands_) {
+                out << "        '" << s->name_ << ":" << s->desc_ << "'\n";
+                for (auto& a : s->aliases_)
+                    out << "        '" << a << ":" << s->desc_ << " (alias)'\n";
+            }
+            out << "    )\n\n";
+            out << "    _arguments -C $args[@] ':command:->command'\n";
+            out << "    case $state in\n";
+            out << "        command) _describe 'commands' subcmds ;;\n";
+            out << "    esac\n";
+        } else {
+            out << "    _arguments $args[@]\n";
+        }
+
+        out << "}\n\n";
+        out << "_" << fn << "\n";
     }
 
 private:
@@ -989,7 +1222,9 @@ private:
             // ── Subcommand dispatch (non-option tokens before any '--')
             if (!end_opts && !arg.starts_with('-') && !subcommands_.empty()) {
                 for (auto& sub : subcommands_) {
-                    if (sub->name_ == arg) {
+                    bool name_match = (sub->name_ == arg) ||
+                        std::ranges::any_of(sub->aliases_, [&](const auto& a){ return a == arg; });
+                    if (name_match) {
                         active_sub_ = sub.get();
                         // Validate parent's own requirements before descending
                         if (auto r = finalize(); !r) return r;
@@ -1018,6 +1253,16 @@ private:
                 const auto inlval  = (eq != std::string_view::npos) ? arg.substr(eq + 1)
                                                                      : std::string_view{};
                 const bool has_eq  = (eq != std::string_view::npos);
+
+                // Handle --no-FLAG for negatable flags
+                if (!has_eq && name.starts_with("--no-")) {
+                    auto positive_name = std::string("--") + std::string(name.substr(5));
+                    auto* nopt = find_opt(positive_name);
+                    if (nopt && nopt->is_flag_ && nopt->negatable_) {
+                        if (auto r = nopt->parse("false", name); !r) return r;
+                        continue;
+                    }
+                }
 
                 auto* opt = find_opt(name);
                 if (!opt) return std::unexpected(ParseError::unknown(name, suggest(name)));
@@ -1078,6 +1323,42 @@ private:
             if (pos->required_ && !pos->is_set_)
                 return std::unexpected(ParseError::missing_positional(pos->name));
         }
+
+        // ── Mutex group constraints
+        for (auto& group : mutex_groups_) {
+            std::string first_set;
+            for (auto& n : group) {
+                auto* opt = find_opt(n);
+                if (opt && opt->is_set_) {
+                    if (!first_set.empty())
+                        return std::unexpected(ParseError::mutually_exclusive(first_set, n));
+                    first_set = n;
+                }
+            }
+        }
+
+        // ── Require-together constraints
+        for (auto& group : require_groups_) {
+            std::string any_set;
+            for (auto& n : group) {
+                auto* opt = find_opt(n);
+                if (opt && opt->is_set_) { any_set = n; break; }
+            }
+            if (!any_set.empty()) {
+                for (auto& n : group) {
+                    auto* opt = find_opt(n);
+                    if (!opt || !opt->is_set_)
+                        return std::unexpected(ParseError::requires_option(any_set, n));
+                }
+            }
+        }
+
+        // ── Post-parse transforms
+        for (auto& opt : options_)
+            opt->finalize_value();
+        for (auto& pos : positionals_)
+            pos->finalize_value();
+
         return {};
     }
 
@@ -1123,53 +1404,83 @@ private:
     void render_option_list() const {
         using X = detail::C;
 
-        // Measure the widest left-hand column to align all descriptions
+        // ── Collect section ordering (preserve first-appearance order)
+        std::vector<std::string> section_order;
+        for (auto& o : options_) {
+            if (o->hidden_) continue;
+            if (!std::ranges::contains(section_order, o->section_))
+                section_order.push_back(o->section_);
+        }
+        if (!std::ranges::contains(section_order, std::string{}))
+            section_order.push_back({});
+
+        const bool has_named = std::ranges::any_of(section_order,
+            [](const auto& s){ return !s.empty(); });
+
+        // ── Measure widest left-hand column
         size_t col = 0;
         auto measure = [&](std::string_view sn, std::string_view ln,
-                           std::string_view meta, bool is_flag) {
+                           std::string_view meta, bool is_flag, bool neg) {
             size_t w = 2;
             if (!sn.empty()) w += sn.size();
             if (!sn.empty() && !ln.empty()) w += 2;
-            if (!ln.empty()) w += ln.size();
-            if (!is_flag && !meta.empty()) w += 2 + meta.size() + 1; // " <META>"
+            if (!ln.empty()) {
+                if (neg && ln.starts_with("--"))
+                    w += 7 + (ln.size() - 2); // "--[no-]" + flagname
+                else
+                    w += ln.size();
+            }
+            if (!is_flag && !meta.empty()) w += 2 + meta.size() + 1;
             col = std::max(col, w);
         };
         for (auto& o : options_)
-            if (!o->hidden_) measure(o->short_name(), o->long_name(), o->meta, o->is_flag_);
-        measure("-h", "--help",    "",      true);
-        measure("-V", "--version", "",      true);
+            if (!o->hidden_)
+                measure(o->short_name(), o->long_name(), o->meta, o->is_flag_, o->negatable_);
+        measure("-h", "--help",    {}, true, false);
+        measure("-V", "--version", {}, true, false);
         col = std::max(col + 2, size_t(30));
 
-        // Print one row
+        // ── Print one row
         auto row = [&](std::string_view sn, std::string_view ln, std::string_view meta,
-                       bool is_flag, std::string_view help, bool req,
+                       bool is_flag, bool neg, std::string_view help, bool req,
                        std::string_view def, std::string_view choices_s,
                        std::string_view env_v) {
             std::string lhs = "  ";
             if (!sn.empty()) lhs += sn;
             if (!sn.empty() && !ln.empty()) lhs += ", ";
-            if (!ln.empty()) lhs += ln;
+            if (!ln.empty()) {
+                if (neg && ln.starts_with("--"))
+                    lhs += "--[no-]" + std::string(ln.substr(2));
+                else
+                    lhs += ln;
+            }
             if (!is_flag && !meta.empty())
                 lhs += std::format(" <{}>", meta);
             std::print("{}{:<{}}{}", X::bcyn(), lhs, col, X::rst());
             std::print("{}", help);
-            if (req)              std::print("  {}[required]{}", X::bred(), X::rst());
-            if (!def.empty())     std::print("  {}[default: {}]{}", X::dim(), def, X::rst());
+            if (req)               std::print("  {}[required]{}", X::bred(), X::rst());
+            if (!def.empty())      std::print("  {}[default: {}]{}", X::dim(), def, X::rst());
             if (!choices_s.empty()) std::print("  {}[{}]{}", X::dim(), choices_s, X::rst());
-            if (!env_v.empty())   std::print("  {}[env: {}]{}", X::dim(), env_v, X::rst());
+            if (!env_v.empty())    std::print("  {}[env: {}]{}", X::dim(), env_v, X::rst());
             std::println();
         };
 
-        for (auto& o : options_) {
-            if (o->hidden_) continue;
-            row(o->short_name(), o->long_name(), o->meta,
-                o->is_flag_, o->help_text, o->required_,
-                o->default_str(), o->choices_str(), o->env_var);
+        // ── Render by section
+        for (const auto& sec : section_order) {
+            if (has_named && !sec.empty())
+                std::println("{}  {}{}:", X::bld(), sec, X::rst());
+            for (auto& o : options_) {
+                if (o->hidden_ || o->section_ != sec) continue;
+                row(o->short_name(), o->long_name(), o->meta,
+                    o->is_flag_, o->negatable_, o->help_text, o->required_,
+                    o->default_str(), o->choices_str(), o->env_var);
+            }
+            if (sec.empty()) {
+                row("-h", "--help",    {}, true, false, "Print help and exit",    false, {}, {}, {});
+                if (!version_.empty())
+                    row("-V", "--version", {}, true, false, "Print version and exit", false, {}, {}, {});
+            }
         }
-        // Built-ins — always shown at the bottom
-        row("-h", "--help",    "", true, "Print help and exit",    false, {}, {}, {});
-        if (!version_.empty())
-            row("-V", "--version", "", true, "Print version and exit", false, {}, {}, {});
     }
 };
 

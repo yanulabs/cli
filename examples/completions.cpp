@@ -1,35 +1,30 @@
 // ─────────────────────────────────────────────────────────────────────────────
-// examples/completions.cpp — shell completion generator demo
+// examples/completions.cpp — shell completion generator
 // ─────────────────────────────────────────────────────────────────────────────
 #include <cli.hpp>
 #include <print>
 
 int main(int argc, char** argv) {
-    cli::App app("mytool", "Demo tool");
-    app.version("1.0.0");
+    cli::App selector{"completions", "Generate shell completion scripts"};
+    auto shell = selector.add<std::string>("--shell")
+                         .short_name("-s")
+                         .help("Target shell")
+                         .required()
+                         .choices({"bash", "fish", "zsh"});
+    selector.parse_or_exit(argc, argv);
 
-    app.flag("-v", "--verbose", "Verbose output");
-    app.option<unsigned>("-j", "--jobs", "Parallel jobs").default_val(4u);
-    app.option<std::string>("-o", "--output", "Output path").required().meta("PATH");
-    app.option<std::string>("-l", "--level", "Log level")
-       .choices({"debug", "info", "warn", "error"});
+    // Build the "real" app whose completions we generate
+    cli::App app{"mytool", "A demo tool", "1.0.0"};
+    app.add_flag("--verbose").short_name("-v").help("Verbose output");
+    app.add<std::string>("--output").short_name("-o").help("Output path").meta("PATH");
+    app.add<std::string>("--level").short_name("-l")
+       .help("Log level").choices({"debug","info","warn","error"});
+    app.subcommand("build", "Compile sources").alias("b");
+    app.subcommand("test",  "Run tests").alias("t");
 
-    auto& sub = app.subcommand("build", "Compile sources");
-    sub.option<std::string>("-t", "--target", "Profile")
-       .choices({"debug", "release"});
-
-    // ── shell selector ───────────────────────────────────────────────────────
-    cli::App ctl("completion-gen", "Generate shell completions");
-    auto shell = ctl.option<std::string>("--shell", "Shell type (bash|fish)")
-                    .choices({"bash", "fish"}).default_val(std::string("bash"));
-
-    auto r = ctl.parse(argc, argv);
-    if (!r) { ctl.print_error(r.error()); return 1; }
-
-    if (*shell == "fish")
-        app.fish_completion(std::cout);
-    else
-        app.bash_completion(std::cout);
+    if (*shell == "bash")      app.bash_completion();
+    else if (*shell == "fish") app.fish_completion();
+    else                       app.zsh_completion();
 
     return 0;
 }

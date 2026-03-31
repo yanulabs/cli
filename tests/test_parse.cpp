@@ -466,10 +466,192 @@ TEST_CASE("on_execute: fires for selected subcommand") {
     Args a{"build", "--target", "release"};
     REQUIRE(app.parse(a.argc(), a.argv()));
     // Manually fire (parse_or_exit would also do this automatically)
-    if (auto* s = app.active_subcommand(); s && s->callback_)
-        s->callback_(*s);
+    if (auto* s = app.active_subcommand(); s && s->has_callback())
+        s->fire_callback();
 
     REQUIRE(fired);
     CHECK(seen == "release");
+}
+
+// ── §18  Count option ─────────────────────────────────────────────────────────
+
+TEST_CASE("Count: absent → 0") {
+    cli::App app("t");
+    auto v = app.add_count("--verbose").short_name("-v");
+    REQUIRE(app.parse(Args{}.argc(), Args{}.argv()));
+    CHECK(*v == 0u);
+    CHECK(!v.is_set());
+}
+
+TEST_CASE("Count: single -v → 1") {
+    cli::App app("t");
+    auto v = app.add_count("--verbose").short_name("-v");
+    Args a{"-v"};
+    REQUIRE(app.parse(a.argc(), a.argv()));
+    CHECK(*v == 1u);
+    CHECK(v.is_set());
+}
+
+TEST_CASE("Count: three separate -v → 3") {
+    cli::App app("t");
+    auto v = app.add_count("--verbose").short_name("-v");
+    Args a{"-v", "-v", "-v"};
+    REQUIRE(app.parse(a.argc(), a.argv()));
+    CHECK(*v == 3u);
+}
+
+TEST_CASE("Count: grouped -vvv → 3") {
+    cli::App app("t");
+    auto v = app.add_count("--verbose").short_name("-v");
+    Args a{"-vvv"};
+    REQUIRE(app.parse(a.argc(), a.argv()));
+    CHECK(*v == 3u);
+}
+
+TEST_CASE("Count: value_or returns fallback when absent") {
+    cli::App app("t");
+    auto v = app.add_count("--verbose").short_name("-v");
+    REQUIRE(app.parse(Args{}.argc(), Args{}.argv()));
+    CHECK(v.value_or(7u) == 7u);
+}
+
+// ── §19  Transform ────────────────────────────────────────────────────────────
+
+TEST_CASE("Transform: applied to parsed string value") {
+    cli::App app("t");
+    auto s = app.add<std::string>("--name").required()
+                .transform([](std::string v) {
+                    std::ranges::transform(v, v.begin(),
+                        [](unsigned char c){ return (char)std::toupper(c); });
+                    return v;
+                });
+    Args a{"--name", "hello"};
+    REQUIRE(app.parse(a.argc(), a.argv()));
+    CHECK(*s == "HELLO");
+}
+
+TEST_CASE("Transform: applied to default value") {
+    cli::App app("t");
+    auto s = app.add<std::string>("--name").default_val("world")
+                .transform([](std::string v) { return "~" + v + "~"; });
+    REQUIRE(app.parse(Args{}.argc(), Args{}.argv()));
+    CHECK(*s == "~world~");
+}
+
+TEST_CASE("Transform: applied to int value") {
+    cli::App app("t");
+    auto n = app.add<int>("--num").required()
+                .transform([](int v){ return v * 2; });
+    Args a{"--num", "21"};
+    REQUIRE(app.parse(a.argc(), a.argv()));
+    CHECK(*n == 42);
+}
+
+// ── §20  Mutex group ──────────────────────────────────────────────────────────
+
+TEST_CASE("Mutex group: only one set → ok") {
+    cli::App app("t");
+    app.add_flag("--verbose").short_name("-v");
+    app.add_flag("--quiet").short_name("-q");
+    app.mutex_group({"--verbose", "--quiet"});
+    Args a{"-v"};
+    REQUIRE(app.parse(a.argc(), a.argv()));
+}
+
+TEST_CASE("Mutex group: both set → error") {
+    cli::App app("t");
+    app.add_flag("--verbose").short_name("-v");
+    app.add_flag("--quiet").short_name("-q");
+    app.mutex_group({"--verbose", "--quiet"});
+    Args a{"-v", "-q"};
+    auto r = app.parse(a.argc(), a.argv());
+    REQUIRE(!r);
+    CHECK(r.error().kind == cli::ParseError::Kind::MutuallyExclusive);
+}
+
+TEST_CASE("Mutex group: neither set → ok") {
+    cli::App app("t");
+    app.add_flag("--verbose");
+    app.add_flag("--quiet");
+    app.mutex_group({"--verbose", "--quiet"});
+    REQUIRE(app.parse(Args{}.argc(), Args{}.argv()));
+}
+
+// ── §21  Require-together ─────────────────────────────────────────────────────
+
+TEST_CASE("Require-together: all set → ok") {
+    cli::App app("t");
+    app.add<std::string>("--output").required();
+    app.add<std::string>("--format").required();
+    app.require_together({"--output", "--format"});
+    Args a{"--output", "out.bin", "--format", "json"};
+    REQUIRE(app.parse(a.argc(), a.argv()));
+}
+
+TEST_CASE("Require-together: none set → ok") {
+    cli::App app("t");
+    app.add<std::string>("--output");
+    app.add<std::string>("--format");
+    app.require_together({"--output", "--format"});
+    REQUIRE(app.parse(Args{}.argc(), Args{}.argv()));
+}
+
+TEST_CASE("Require-together: partial set → error") {
+    cli::App app("t");
+    app.add<std::string>("--output").required();
+    app.add<std::string>("--format");
+    app.require_together({"--output", "--format"});
+    Args a{"--output", "out.bin"};
+    auto r = app.parse(a.argc(), a.argv());
+    REQUIRE(!r);
+    CHECK(r.error().kind == cli::ParseError::Kind::RequiresOption);
+}
+
+// ── §22  Subcommand alias ─────────────────────────────────────────────────────
+
+TEST_CASE("Subcommand alias: short form dispatched correctly") {
+    cli::App app("t");
+    auto& build = app.subcommand("build", "Compile").alias("b");
+    auto target = build.add<std::string>("--target").default_val("debug");
+    Args a{"b", "--target", "release"};
+    REQUIRE(app.parse(a.argc(), a.argv()));
+    REQUIRE(app.active_subcommand());
+    CHECK(app.active_subcommand()->name() == "build");
+    CHECK(*target == "release");
+}
+
+TEST_CASE("Subcommand alias: canonical name still works") {
+    cli::App app("t");
+    app.subcommand("build", "").alias("b");
+    Args a{"build"};
+    REQUIRE(app.parse(a.argc(), a.argv()));
+    CHECK(app.active_subcommand()->name() == "build");
+}
+
+// ── §23  Negatable flag ───────────────────────────────────────────────────────
+
+TEST_CASE("Negatable flag: --no-FLAG sets false when flag is absent") {
+    cli::App app("t");
+    app.add_flag("--color").negatable();
+    Args a{"--no-color"};
+    REQUIRE(app.parse(a.argc(), a.argv()));
+    CHECK(!app.has_flag("--color"));
+}
+
+TEST_CASE("Negatable flag: --FLAG then --no-FLAG → false (last wins)") {
+    cli::App app("t");
+    auto f = app.add_flag("--color").negatable();
+    Args a{"--color", "--no-color"};
+    REQUIRE(app.parse(a.argc(), a.argv()));
+    CHECK(!*f);
+}
+
+TEST_CASE("Negatable flag: non-negatable --no-FLAG → unknown option error") {
+    cli::App app("t");
+    app.add_flag("--color");  // NOT negatable
+    Args a{"--no-color"};
+    auto r = app.parse(a.argc(), a.argv());
+    REQUIRE(!r);
+    CHECK(r.error().kind == cli::ParseError::Kind::UnknownOption);
 }
 
