@@ -348,7 +348,9 @@ struct OptionBase {
     virtual void        apply_default()      = 0;
     virtual std::string default_str()  const = 0;
     virtual std::string choices_str()  const = 0;
-    virtual bool        is_multi()     const = 0;
+    virtual bool        is_multi()          const = 0;
+    virtual bool        is_count_option()   const noexcept { return false; }
+    virtual void        reset() { is_set_ = false; }
 
     [[nodiscard]] bool matches(std::string_view t) const noexcept {
         return std::ranges::any_of(names, [t](const auto& n){ return n == t; });
@@ -387,6 +389,11 @@ struct OptionImpl final : OptionBase {
 
     void finalize_value() override {
         if (transform_ && value) value = transform_(*value);
+    }
+
+    void reset() override {
+        OptionBase::reset();
+        value.reset();
     }
 
     ParseResult parse(std::string_view sv, std::string_view opt) override {
@@ -461,6 +468,7 @@ struct PositionalBase {
     virtual bool        has_default()  const      = 0;
     virtual void        apply_default()            = 0;
     virtual std::string default_str()  const      = 0;
+    virtual void        reset() { is_set_ = false; }
 };
 
 template<typename T>
@@ -496,6 +504,7 @@ struct PositionalImpl final : PositionalBase {
 
     bool        has_default()  const override { return default_.has_value(); }
     void        apply_default()       override { if (default_) value = *default_; }
+    void        reset()               override { PositionalBase::reset(); value.reset(); }
     std::string default_str()  const override {
         if (!default_) return {};
         if constexpr (is_vec_v<T>) {
@@ -518,12 +527,14 @@ struct CountImpl final : OptionBase {
         is_set_ = true;
         return {};
     }
-    bool        has_default()  const override { return false; }
-    bool        has_value()    const override { return count_ > 0; }
-    void        apply_default()       override {}
-    std::string default_str()  const override { return {}; }
-    std::string choices_str()  const override { return {}; }
-    bool        is_multi()     const override { return false; }
+    bool        has_default()       const override { return false; }
+    bool        has_value()         const override { return count_ > 0; }
+    void        apply_default()           override {}
+    std::string default_str()       const override { return {}; }
+    std::string choices_str()       const override { return "count"; }
+    bool        is_multi()          const override { return false; }
+    bool        is_count_option()   const noexcept override { return true; }
+    void        reset()                   override { OptionBase::reset(); count_ = 0; }
 };
 
 } // namespace detail
@@ -765,6 +776,11 @@ public:
         /// Return the option's value; asserts that it is set.
         template<typename T>
         [[nodiscard]] T as() const {
+            // Count options queried as unsigned fall back to CountImpl
+            if constexpr (std::is_same_v<std::remove_cv_t<T>, unsigned>) {
+                if (auto* cnt = dynamic_cast<detail::CountImpl*>(p_))
+                    return static_cast<T>(cnt->count_);
+            }
             auto* impl = dynamic_cast<detail::OptionImpl<T>*>(p_);
             if (!impl || !impl->value) return T{}; // graceful
             return *impl->value;
@@ -773,9 +789,21 @@ public:
         /// Return the option's value or @p fallback when not set / not found.
         template<typename T>
         [[nodiscard]] T as_or(T fallback) const {
+            // Count options queried as unsigned fall back to CountImpl
+            if constexpr (std::is_same_v<std::remove_cv_t<T>, unsigned>) {
+                if (auto* cnt = dynamic_cast<detail::CountImpl*>(p_))
+                    return cnt->is_set_ ? static_cast<T>(cnt->count_) : fallback;
+            }
             auto* impl = dynamic_cast<detail::OptionImpl<T>*>(p_);
             if (!impl || !impl->value) return fallback;
             return *impl->value;
+        }
+
+        /// Return the count for a Count option (add_count). Returns 0 if not found or not a count.
+        [[nodiscard]] unsigned as_count() const noexcept {
+            if (auto* cnt = dynamic_cast<detail::CountImpl*>(p_))
+                return cnt->count_;
+            return 0u;
         }
     };
 
@@ -942,6 +970,15 @@ public:
     /// Explicitly invoke the on_execute callback for this app node.
     void fire_callback() { if (callback_) callback_(*this); }
 
+    /// Reset all parsed state so the App can be reused for another parse().
+    /// Clears all option/positional values and the active subcommand pointer.
+    void reset() {
+        for (auto& opt : options_)   opt->reset();
+        for (auto& pos : positionals_) pos->reset();
+        active_sub_ = nullptr;
+        for (auto& sub : subcommands_) sub->reset();
+    }
+
     /// Returns the subcommand that was selected, or nullptr
     [[nodiscard]] App* active_subcommand() const noexcept { return active_sub_; }
 
@@ -974,19 +1011,32 @@ public:
     /// Parse argc/argv.  argv[0] (program name) is automatically skipped.
     [[nodiscard]] ParseResult parse(int argc, char** argv) {
         std::span<char* const> args(argv + 1, static_cast<size_t>(argc > 0 ? argc - 1 : 0));
-
         return do_parse(args);
     }
 
+    /// Parse from a braced list of string tokens (no program name needed).
+    /// Ideal for testing: auto r = app.parse({"-j", "8", "--output", "/tmp"});
+    [[nodiscard]] ParseResult parse(std::initializer_list<std::string_view> args) {
+        std::vector<std::string> storage(args.begin(), args.end());
+        std::vector<char*> ptrs;
+        ptrs.reserve(storage.size() + 1);
+        ptrs.push_back(name_.data()); // placeholder argv[0]; skipped by parse()
+        for (auto& s : storage) ptrs.push_back(s.data());
+        return parse(static_cast<int>(ptrs.size()), ptrs.data());
+    }
+
     /// Parse and exit on failure. After a successful parse, fires the
-    /// active subcommand's on_execute callback (if registered), or the
-    /// root callback if no subcommand was selected.
+    /// deepest active subcommand's on_execute callback (if registered),
+    /// falling back to the root callback if none is registered on the sub.
     void parse_or_exit(int argc, char** argv) {
         auto r = parse(argc, argv);
         if (!r) { print_error(r.error()); std::exit(1); }
-        // Dispatch: prefer the active subcommand's callback, then root's.
-        App* target = active_sub_ ? active_sub_ : this;
-        if (target->callback_) target->callback_(*target);
+        // Walk to the deepest active subcommand
+        App* target = active_sub_;
+        while (target && target->active_sub_) target = target->active_sub_;
+        App* dispatch = target ? target : this;
+        if (dispatch->callback_) dispatch->callback_(*dispatch);
+        else if (dispatch != this && callback_) callback_(*this);
     }
 
     // ── Help ──────────────────────────────────────────────────────────────
@@ -1009,7 +1059,7 @@ public:
         // ── Usage ────────────────────────────────────────────────────────
         std::println("{}USAGE{}", X::byel(), X::rst());
         std::print("  {}", full);
-        if (!options_.empty() || true) std::print(" [OPTIONS]");
+        std::print(" [OPTIONS]");
         if (!subcommands_.empty())     std::print(" <COMMAND>");
         for (auto& pos : positionals_) {
                 if (pos->variadic_)
@@ -1113,6 +1163,15 @@ public:
     }
 
     void fish_completion(std::ostream& out = std::cout) const {
+        // Escape single quotes for fish shell completion strings
+        auto fish_esc = [](std::string_view s) {
+            std::string r;
+            r.reserve(s.size());
+            for (char c : s)
+                r += (c == '\'') ? "'\"'\"'" : std::string(1, c);
+            return r;
+        };
+
         for (auto& opt : options_) {
             if (opt->hidden_) continue;
             out << "complete -c " << name_;
@@ -1121,18 +1180,32 @@ public:
             if (!sn.empty()) out << " -s " << sn.substr(1);
             if (!ln.empty()) out << " -l " << ln.substr(2);
             if (opt->is_flag_) out << " -f";
-            if (!opt->choices_str().empty()) {
+            if (!opt->choices_str().empty() && !opt->is_count_option()) {
                 out << " -a '";
-                // Replace | with space for fish
                 for (char c : opt->choices_str())
                     out << (c == '|' ? ' ' : c);
                 out << "'";
             }
-            out << " -d '" << opt->help_text << "'\n";
+            if (!opt->help_text.empty())
+                out << " -d '" << fish_esc(opt->help_text) << "'";
+            out << "\n";
         }
         out << "complete -c " << name_ << " -s h -l help    -f -d 'Print help'\n";
         if (!version_.empty())
             out << "complete -c " << name_ << " -s V -l version -f -d 'Print version'\n";
+
+        // Subcommand completions
+        for (auto& s : subcommands_) {
+            out << "complete -c " << name_ << " -f -a '" << s->name_ << "'";
+            if (!s->desc_.empty()) out << " -d '" << fish_esc(s->desc_) << "'";
+            out << "\n";
+            for (auto& a : s->aliases_) {
+                out << "complete -c " << name_ << " -f -a '" << a << "'";
+                if (!s->desc_.empty())
+                    out << " -d '" << fish_esc(s->desc_) << " (→ " << s->name_ << ")'";
+                out << "\n";
+            }
+        }
     }
 
     void zsh_completion(std::ostream& out = std::cout) const {
@@ -1244,6 +1317,23 @@ private:
                     return std::unexpected(ParseError::too_many(arg));
                 }
                 continue;
+            }
+
+            // ── Negative numeric literals: -1, -3, -3.14, -42, etc.
+            // If the character after '-' is a digit and no registered short option
+            // matches -N, treat the whole token as a positional value.
+            if (arg.size() >= 2 && std::isdigit(static_cast<unsigned char>(arg[1]))) {
+                const auto sopt1 = std::string(1, '-') + arg[1];
+                if (!find_opt(sopt1)) {
+                    if (pos_idx < positionals_.size()) {
+                        auto& pos = positionals_[pos_idx];
+                        if (auto r = pos->parse(arg); !r) return r;
+                        if (!pos->variadic_) ++pos_idx;
+                    } else {
+                        return std::unexpected(ParseError::too_many(arg));
+                    }
+                    continue;
+                }
             }
 
             // ── Long option:  --name  or  --name=value
@@ -1383,6 +1473,15 @@ private:
                 const auto d = detail::edit_distance(tok, strip(n));
                 if (d < best_d && d <= 3) { best_d = d; best = n; }
             }
+            // Also suggest --no-X variants for negatable flags
+            if (o->negatable_) {
+                auto ln = o->long_name();
+                if (ln.starts_with("--")) {
+                    auto neg = std::string("--no-") + std::string(ln.substr(2));
+                    const auto d = detail::edit_distance(tok, strip(neg));
+                    if (d < best_d && d <= 3) { best_d = d; best = neg; }
+                }
+            }
         }
         return best;
     }
@@ -1466,9 +1565,12 @@ private:
         };
 
         // ── Render by section
-        for (const auto& sec : section_order) {
-            if (has_named && !sec.empty())
+        for (size_t si = 0; si < section_order.size(); ++si) {
+            const auto& sec = section_order[si];
+            if (has_named && !sec.empty()) {
+                if (si > 0) std::println(); // blank line between sections
                 std::println("{}  {}{}:", X::bld(), sec, X::rst());
+            }
             for (auto& o : options_) {
                 if (o->hidden_ || o->section_ != sec) continue;
                 row(o->short_name(), o->long_name(), o->meta,

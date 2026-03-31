@@ -5,26 +5,32 @@ All notable changes to this project will be documented in this file.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [1.1.0] — 2026-03-31
+## [1.2.0]
 
 ### Added
-- **Count options** (`add_count(name)`) — counts flag occurrences; `-vvv` or `-v -v -v` → 3
-- **`.transform(fn)`** — post-parse value transformation on `Option<T>` and `Positional<T>`
-- **`mutex_group({...})`** — declares mutually exclusive options; error if more than one is set
-- **`require_together({...})`** — declares co-required options; error if only some are set
-- **Subcommand aliases** (`.alias(name)`) — e.g. `subcommand("commit").alias("ci")`
-- **Negatable flags** (`.negatable()`) — auto-accepts `--no-FLAG` to set flag to false; shown as `--[no-]flag` in help
-- **Named option sections** (`.section(name)`) — groups options under sub-headers in help output
-- **Zsh completion** (`zsh_completion(ostream)`) — generates `#compdef`-style completion function
-- **`has_callback()` / `fire_callback()`** — public API to inspect and invoke subcommand callbacks
-- **`ParseError::Kind::MutuallyExclusive`** and **`ParseError::Kind::RequiresOption`** error kinds
-- Bash completion now includes `--no-*` entries for negatable flags and subcommand aliases
+- **`parse({...})` initializer-list overload** — parse without `argc`/`argv`; ideal for testing
+- **Negative number positionals** — tokens like `-1`, `-3.14`, `-42` are now correctly treated as positional values when no matching short option is registered
+- **`Lookup::as_count()`** — dedicated accessor for Count option values; `as<unsigned>()` also works transparently for Count options
+- **`App::reset()`** — clears all parsed state so an App can be safely reused across multiple `parse()` calls
+- **`[count]` annotation in help** — Count options show `[count]` in the choices column to signal they are repeatable
+- **Blank lines between named help sections** — visually separates option groups in the OPTIONS block
+- **Fish completion: subcommand completions** — `fish_completion()` now emits completions for all subcommands and their aliases
+- **Fish completion: single-quote escaping** — help text with apostrophes no longer breaks generated fish scripts
+- **Negatable suggestion** — `suggest()` now includes `--no-X` candidates so typos like `--no-colr` suggest `--no-color`
+- **`parse_or_exit()` nested subcommand dispatch** — fires the callback of the deepest active subcommand rather than stopping at the first level
+- **`OptionBase::reset()` / `PositionalBase::reset()` virtual methods** — enables clean reuse via `App::reset()`
 
 ### Fixed
-- `has_flag()` now correctly returns false for negatable flags set to false via `--no-FLAG`
-- `has_option()` now correctly returns true when an option has a default value applied
+- `Lookup::as<unsigned>()` for Count options now correctly returns the accumulated count instead of `0`
+- `Lookup::as_or<T>()` for Count options now returns the fallback when the option is absent
+- Fish completion no longer emits `[count]` as a choice list for Count options
 
-## [1.1.0] — 2026-03-31
+### Changed
+- `[OPTIONS]` is always shown in the USAGE line (previously behind a dead `|| true` guard)
+- README Quick Start updated to v2 API (`add_flag`, `add<T>`, etc.)
+- All nodiscard warnings in test suite resolved with explicit `(void)` casts
+
+## [1.1.0]
 
 ### Added
 - **`Count` option type** (`add_count(name)`) — counts flag occurrences; `-vvv` or `-v -v -v` → 3

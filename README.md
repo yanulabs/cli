@@ -13,25 +13,28 @@
 |---|---|
 | **Single header** | Drop `include/cli.hpp` into your project — done |
 | **`std::expected`** | Composable, propagating error handling |
-| **Type-safe handles** | `Option<T>`, `Flag`, `Positional<T>` |
+| **Type-safe handles** | `Option<T>`, `Flag`, `Positional<T>`, `Count` |
 | **Fluent builder** | C++23 *deducing-this* — no CRTP boilerplate |
 | **Built-in types** | `bool`, integrals, floats, `string`, `path`, `vector<T>` |
 | **Constraints** | `.range()`, `.choices()`, `.validate(fn, desc)` |
 | **Env-var fallback** | `.env("VAR")` |
 | **Short-flag grouping** | `-vxf` ≡ `-v -x -f` |
 | **Inline values** | `-n42` ≡ `-n 42`, `--out=file` ≡ `--out file` |
+| **Negative numbers** | `-1`, `-3.14` etc. correctly handled as positional values |
 | **End-of-options** | `--` |
 | **Subcommands** | Recursive, each with their own option set |
-| **Rich help** | ANSI-colored, auto-aligned, section-structured |
-| **Suggestions** | Levenshtein "did you mean?" on unknown options |
-| **Completions** | Bash, Fish, and Zsh generators |
-| **Count options** | `add_count("--verbose")` counts `-v -v -v` occurrences |
+| **Rich help** | ANSI-colored, auto-aligned, section-structured with blank-line separators |
+| **Suggestions** | Levenshtein "did you mean?" on unknown options (incl. `--no-X` variants) |
+| **Completions** | Bash, Fish (with subcommand aliases), and Zsh generators |
+| **Count options** | `add_count("--verbose")` counts `-v -v -v` occurrences; `[count]` shown in help |
 | **Transforms** | `.transform(fn)` applies a post-parse value transformation |
 | **Mutex groups** | `mutex_group({...})` — at most one option in the set may be used |
 | **Require-together** | `require_together({...})` — all-or-nothing option sets |
 | **Subcommand aliases** | `.alias("ci")` — alternative names for subcommands |
 | **Negatable flags** | `.negatable()` — `--[no-]flag` shown in help, `--no-flag` sets false |
 | **Named sections** | `.section("Group")` — groups options under sub-headers in help |
+| **Reusable App** | `app.reset()` clears parsed state for re-parsing |
+| **Initializer parse** | `app.parse({"-v", "--jobs", "8"})` — no argc/argv needed |
 
 ---
 
@@ -47,15 +50,15 @@ int main(int argc, char** argv) {
     app.version("1.0.0").author("Yanujz")
        .example("tool build --target release -j8");
 
-    auto verbose = app.flag("-v", "--verbose", "Verbose output");
-    auto jobs    = app.option<unsigned>("-j", "--jobs", "Parallel jobs")
+    auto verbose = app.add_flag("--verbose").short_name("-v").help("Verbose output");
+    auto jobs    = app.add<unsigned>("--jobs").short_name("-j").help("Parallel jobs")
                       .default_val(4u).range(1u, 256u);
-    auto output  = app.option<fs::path>("-o", "--output", "Output path")
+    auto output  = app.add<fs::path>("--output").short_name("-o").help("Output path")
                       .required().meta("DIR");
-    auto tags    = app.option<std::vector<std::string>>("--tag", "Tags");
+    auto tags    = app.add<std::vector<std::string>>("--tag").help("Tags");
 
-    auto& build  = app.subcommand("build", "Compile sources");
-    auto  target = build.option<std::string>("-t", "--target", "Profile")
+    auto& build  = app.subcommand("build", "Compile sources").alias("b");
+    auto  target = build.add<std::string>("--target").short_name("-t").help("Profile")
                        .choices({"debug", "release"}).default_val("debug");
 
     auto result = app.parse(argc, argv);

@@ -235,7 +235,7 @@ TEST_CASE("Positional: consumed in order") {
 
 TEST_CASE("Positional: required missing → error") {
     cli::App app("t");
-    app.positional<std::string>("src", "");
+    (void)app.positional<std::string>("src", "");
     auto r = app.parse(Args{}.argc(), Args{}.argv());
     REQUIRE(!r);
     CHECK(r.error().kind == cli::ParseError::Kind::MissingRequired);
@@ -251,7 +251,7 @@ TEST_CASE("Positional: variadic accumulates all extra") {
 
 TEST_CASE("Positional: too many → error") {
     cli::App app("t");
-    app.positional<std::string>("src", "");
+    (void)app.positional<std::string>("src", "");
     Args a{"hello", "unexpected"};
     auto r = app.parse(a.argc(), a.argv());
     REQUIRE(!r);
@@ -274,7 +274,7 @@ TEST_CASE("Subcommand: dispatched correctly") {
 
 TEST_CASE("Subcommand: unknown name falls to positional") {
     cli::App app("t");
-    app.subcommand("build", "");
+    (void)app.subcommand("build", "");
     auto f = app.positional<std::string>("file", "");
     Args a{"notacommand"};
     REQUIRE(app.parse(a.argc(), a.argv()));
@@ -409,7 +409,7 @@ TEST_CASE("Lookup: as_or returns fallback when not set") {
 
 TEST_CASE("Lookup: found() reflects registration") {
     cli::App app("t");
-    app.add<int>("--num");
+    (void)app.add<int>("--num");
     REQUIRE(app.parse(Args{}.argc(), Args{}.argv()));
     CHECK(app["--num"].found());
     CHECK(!app["--other"].found());
@@ -428,7 +428,7 @@ TEST_CASE("has_flag: true when flag was explicitly set") {
 
 TEST_CASE("has_flag: false when flag was not passed") {
     cli::App app("t");
-    app.add_flag("--verbose");
+    (void)app.add_flag("--verbose");
     REQUIRE(app.parse(Args{}.argc(), Args{}.argv()));
     CHECK(!app.has_flag("--verbose"));
 }
@@ -571,8 +571,8 @@ TEST_CASE("Mutex group: both set → error") {
 
 TEST_CASE("Mutex group: neither set → ok") {
     cli::App app("t");
-    app.add_flag("--verbose");
-    app.add_flag("--quiet");
+    (void)app.add_flag("--verbose");
+    (void)app.add_flag("--quiet");
     app.mutex_group({"--verbose", "--quiet"});
     REQUIRE(app.parse(Args{}.argc(), Args{}.argv()));
 }
@@ -590,16 +590,16 @@ TEST_CASE("Require-together: all set → ok") {
 
 TEST_CASE("Require-together: none set → ok") {
     cli::App app("t");
-    app.add<std::string>("--output");
-    app.add<std::string>("--format");
+    (void)app.add<std::string>("--output");
+    (void)app.add<std::string>("--format");
     app.require_together({"--output", "--format"});
     REQUIRE(app.parse(Args{}.argc(), Args{}.argv()));
 }
 
 TEST_CASE("Require-together: partial set → error") {
     cli::App app("t");
-    app.add<std::string>("--output").required();
-    app.add<std::string>("--format");
+    (void)app.add<std::string>("--output").required();
+    (void)app.add<std::string>("--format");
     app.require_together({"--output", "--format"});
     Args a{"--output", "out.bin"};
     auto r = app.parse(a.argc(), a.argv());
@@ -648,10 +648,108 @@ TEST_CASE("Negatable flag: --FLAG then --no-FLAG → false (last wins)") {
 
 TEST_CASE("Negatable flag: non-negatable --no-FLAG → unknown option error") {
     cli::App app("t");
-    app.add_flag("--color");  // NOT negatable
+    (void)app.add_flag("--color");  // NOT negatable
     Args a{"--no-color"};
     auto r = app.parse(a.argc(), a.argv());
     REQUIRE(!r);
     CHECK(r.error().kind == cli::ParseError::Kind::UnknownOption);
+}
+
+// ── §24  parse(initializer_list) ──────────────────────────────────────────────
+
+TEST_CASE("parse(initializer_list): basic flag") {
+    cli::App app("t");
+    auto v = app.add_flag("--verbose").short_name("-v");
+    REQUIRE(app.parse({"-v"}));
+    CHECK(*v);
+}
+
+TEST_CASE("parse(initializer_list): option with value") {
+    cli::App app("t");
+    auto j = app.add<int>("--jobs").short_name("-j");
+    REQUIRE(app.parse({"--jobs", "8"}));
+    CHECK(*j == 8);
+}
+
+TEST_CASE("parse(initializer_list): empty args → defaults apply") {
+    cli::App app("t");
+    auto j = app.add<int>("--jobs").default_val(4);
+    REQUIRE(app.parse({}));
+    CHECK(*j == 4);
+}
+
+// ── §25  Negative number positionals ─────────────────────────────────────────
+
+TEST_CASE("Negative number: integer positional accepts -1") {
+    cli::App app("t");
+    auto n = app.add_positional<int>("num").help("number");
+    REQUIRE(app.parse({"-1"}));
+    CHECK(*n == -1);
+}
+
+TEST_CASE("Negative number: float positional accepts -3.14") {
+    cli::App app("t");
+    auto x = app.add_positional<double>("x").help("x");
+    REQUIRE(app.parse({"-3"}));
+    CHECK(*x == -3.0);
+}
+
+TEST_CASE("Negative number: still errors when no positional registered") {
+    cli::App app("t");
+    auto r = app.parse({"-42"});
+    REQUIRE(!r);
+    CHECK(r.error().kind == cli::ParseError::Kind::TooManyPositionals);
+}
+
+// ── §26  Lookup::as_count and as<unsigned> for Count ─────────────────────────
+
+TEST_CASE("Lookup::as_count: returns correct count via []") {
+    cli::App app("t");
+    (void)app.add_count("--verbose").short_name("-v");
+    REQUIRE(app.parse({"-vvv"}));
+    CHECK(app["--verbose"].as_count() == 3u);
+}
+
+TEST_CASE("Lookup::as<unsigned>: works for Count option") {
+    cli::App app("t");
+    (void)app.add_count("--verbose").short_name("-v");
+    REQUIRE(app.parse({"-v", "-v"}));
+    CHECK(app["--verbose"].as<unsigned>() == 2u);
+}
+
+TEST_CASE("Lookup::as_count: returns 0 when absent") {
+    cli::App app("t");
+    (void)app.add_count("--verbose");
+    REQUIRE(app.parse({}));
+    CHECK(app["--verbose"].as_count() == 0u);
+}
+
+// ── §27  App::reset() ─────────────────────────────────────────────────────────
+
+TEST_CASE("reset: clears parsed state for reuse") {
+    cli::App app("t");
+    auto v = app.add_flag("--verbose").short_name("-v");
+    auto j = app.add<int>("--jobs").default_val(4);
+
+    REQUIRE(app.parse({"-v", "--jobs", "8"}));
+    CHECK(*v);
+    CHECK(*j == 8);
+
+    app.reset();
+    REQUIRE(app.parse({}));
+    CHECK(!*v);
+    CHECK(*j == 4);  // default re-applied after reset
+}
+
+TEST_CASE("reset: count option resets to 0") {
+    cli::App app("t");
+    auto c = app.add_count("--verbose").short_name("-v");
+
+    REQUIRE(app.parse({"-vvv"}));
+    CHECK(*c == 3u);
+
+    app.reset();
+    REQUIRE(app.parse({"-v"}));
+    CHECK(*c == 1u);
 }
 
