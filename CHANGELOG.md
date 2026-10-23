@@ -5,6 +5,111 @@ All notable changes to this project will be documented in this file.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+- **Custom value types via ADL** — `cli_parse(std::string_view)` and
+  `cli_format(const T&)` in the type's namespace; a
+  `cli_parse(std::string_view, std::type_identity<T>)` overload is also
+  supported for templates and overload sets
+- **`help_text()`** — render help into a `std::string` for tests, logging, or
+  custom output; **`print_help(std::ostream&)`** writes to any stream
+- **Positional parity with options** — `.range()`, `.choices()`,
+  `.validate()`, `.transform()`, `.env()`, and `.delimiter()` now work on
+  positionals; vector positionals split delimited values
+- **`.delimiter(char)` for vector options** — `--tag=a,b,c`; also used when
+  splitting vector environment variables
+- **`.required()` on `Flag` and `Count`**
+- **Short inline values with `=`** — `-n=5` is accepted
+- **Explicit boolean values** — `--flag=false` and `--no-flag` both work
+- **Inherited versions** — subcommands use the root app's version, so
+  `tool sub --version` works
+- **Default validation** — defaults are checked against `range()`,
+  `choices()`, and custom validators
+- **Domain-scoped test suite** — 371 test cases across 17 doctest suites
+  (`api`, `completion`, `constraints`, `custom_types`, `environment`,
+  `errors`, `flags`, `groups`, `help`, `lifecycle`, `lookup`, `options`,
+  `positionals`, `robustness`, `subcommands`, `tokens`, `values`), each
+  registered as its own CTest entry and runnable via `--test-suite=NAME`
+- **Process-level `parse_or_exit()` tests** — separate driver verifies help,
+  version, error exit codes, nested help/version scoping, and callback
+  dispatch without terminating the unit-test process
+- **Adversarial robustness suite** — deterministic random token streams,
+  repeated-parse reset checks, very long unknown options, malformed `argv`,
+  48-level nested commands, and a 256-option flat schema
+- **libFuzzer harness** (`CLI_BUILD_FUZZERS=ON`) — NUL-separated argument
+  streams exercise options, positionals, counts, constraints, groups,
+  subcommands, help/version control flow, and reset determinism
+- **CI matrix** — GCC/Clang/macOS/Windows builds, ASan+UBSan, strict
+  warnings with `-fno-rtti`, a 100k-run fuzz smoke test, and an installed
+  `find_package` consumer build
+
+### Fixed
+- Custom-type support no longer fails to compile due to unqualified ADL
+  `cli_parse` / `cli_format` requires-expressions
+- Integer parsing now accepts signs and `0x` / `0b` prefixes, handles
+  `INT_MIN`, rejects negative values for unsigned types, and reports overflow
+- Float parsing accepts a leading `+`
+- Subcommand parse errors (including `--help` / `--version`) are returned
+  directly instead of being masked by parent finalization
+- Subcommands are only dispatched before the first positional token, removing
+  positional/subcommand ambiguity
+- An exact `--no-X` option now wins over interpreting `--no-X` as a negated
+  `--X` flag
+- Built-in `-h`/`--help` and `-V`/`--version` step aside per spelling when a
+  user option occupies that name
+- Help rendering: named and unnamed sections are separated correctly, string
+  defaults/choices are no longer quoted, and positional rows align
+- Completions: no duplicate built-ins, inherited versions, `--no-` variants,
+  valid zsh `:META:ACTION` specs and choice lists, and `-r` for fish options
+  that take values
+- `Lookup` no longer depends on RTTI (`-fno-rtti` builds work)
+- Option typo suggestions now compute Levenshtein distance correctly; the
+  previous one-row implementation under-counted edits and could pick the wrong
+  candidate or miss a valid one
+- Numeric parsing rejects leading/trailing whitespace consistently instead of
+  depending on the standard library's floating-point `from_chars`
+  implementation
+- Optional variadic positionals render as `[name...]` in both `USAGE` and
+  `ARGUMENTS`, vector defaults no longer render as `[default: [a, b]]`, and
+  vector constraint errors identify the offending element
+- Mutex groups now treat environment-provided values as explicit choices,
+  matching `require_together()` semantics; defaults still do not participate
+- `print_error()` writes through `std::cerr`, so callers can redirect or
+  capture diagnostics with `rdbuf()`
+- `parse_or_exit()` now falls back to the nearest ancestor command with a
+  callback, rather than skipping intermediate commands and jumping straight
+  to the root
+- `parse(argc, argv)` tolerates a null `argv` and null argument entries
+  instead of constructing an invalid span or `std::string_view`
+- Unknown-option suggestions skip candidates whose length differs by more
+  than the edit threshold, avoiding pathological work for huge tokens
+- Shell completion generation now produces valid function identifiers and
+  quotes unusual command/option names in Bash, Fish, and Zsh output
+- Defaults and fallbacks accept explicitly convertible arguments (for example
+  `std::string_view` for `std::string`/`std::filesystem::path`), vector
+  defaults accept initializer lists, and `nullptr_t` is rejected at compile
+  time instead of selecting a string overload
+- Range checks reject NaN and compare bounds with `<` only, so custom ordered
+  types need no `operator>` or `operator<=>`
+- Option and positional handles expose mutable `T&` / `T*` access after parsing
+- Vector defaults and choice lists join empty elements with their separators
+  (`[default: , two]`, `[|auto]`) instead of silently dropping them
+
+### Changed
+- `parse()` and `parse_or_exit()` accept `const char* const*`, so mutable,
+  const, and mixed `argv` arrays all work without overload ambiguity
+- Per-parse version lookup and subcommand lookup are cached/skipped when
+  unused, reducing hot-loop work without changing semantics
+- All `parse()` overloads reset prior state automatically
+- `App` is intentionally non-movable so parent links and
+  `ParseError::context` pointers stay stable
+- A lone `-` is treated as a normal positional token (stdin/stdout), while
+  `--` remains the end-of-options marker
+- The header no longer depends on `<print>`; `print_help()` and
+  `parse_or_exit()` use `std::cout`/`std::format`, broadening standard-library
+  compatibility
+
 ## [1.2.0]
 
 ### Added

@@ -16,24 +16,27 @@
 | **Type-safe handles** | `Option<T>`, `Flag`, `Positional<T>`, `Count` |
 | **Fluent builder** | C++23 *deducing-this* — no CRTP boilerplate |
 | **Built-in types** | `bool`, integrals, floats, `string`, `path`, `vector<T>` |
-| **Constraints** | `.range()`, `.choices()`, `.validate(fn, desc)` |
-| **Env-var fallback** | `.env("VAR")` |
+| **Custom types** | ADL `cli_parse()` / `cli_format()` hooks — no registration boilerplate |
+| **Constraints** | `.range()`, `.choices()`, `.validate(fn, desc)` on options *and* positionals |
+| **Env-var fallback** | `.env("VAR")` on options *and* positionals |
+| **Delimited values** | `.delimiter(',')` — `--items=a,b,c` for `vector<T>` |
 | **Short-flag grouping** | `-vxf` ≡ `-v -x -f` |
 | **Inline values** | `-n42` ≡ `-n 42`, `--out=file` ≡ `--out file` |
 | **Negative numbers** | `-1`, `-3.14` etc. correctly handled as positional values |
 | **End-of-options** | `--` |
-| **Subcommands** | Recursive, each with their own option set |
-| **Rich help** | ANSI-colored, auto-aligned, section-structured with blank-line separators |
+| **Subcommands** | Recursive, each with their own option set; inherited version |
+| **Rich help** | ANSI-colored, auto-aligned, section-structured; `help_text()` returns a string |
 | **Suggestions** | Levenshtein "did you mean?" on unknown options (incl. `--no-X` variants) |
 | **Completions** | Bash, Fish (with subcommand aliases), and Zsh generators |
 | **Count options** | `add_count("--verbose")` counts `-v -v -v` occurrences; `[count]` shown in help |
+| **Required flags/counts** | `.required()` works on options, flags, counts, and positionals |
 | **Transforms** | `.transform(fn)` applies a post-parse value transformation |
 | **Mutex groups** | `mutex_group({...})` — at most one option in the set may be used |
 | **Require-together** | `require_together({...})` — all-or-nothing option sets |
 | **Subcommand aliases** | `.alias("ci")` — alternative names for subcommands |
 | **Negatable flags** | `.negatable()` — `--[no-]flag` shown in help, `--no-flag` sets false |
 | **Named sections** | `.section("Group")` — groups options under sub-headers in help |
-| **Reusable App** | `app.reset()` clears parsed state for re-parsing |
+| **Reusable App** | `parse()` resets automatically; `app.reset()` is available explicitly |
 | **Initializer parse** | `app.parse({"-v", "--jobs", "8"})` — no argc/argv needed |
 
 ---
@@ -128,8 +131,9 @@ App&          app.subcommand("name", "desc").alias("n");
 App&          app.mutex_group({"--verbose", "--quiet"});
 App&          app.require_together({"--output", "--format"});
 
-// Parse
+// Parse (each overload resets prior state automatically)
 ParseResult   app.parse(argc, argv);   // std::expected<void, ParseError>
+ParseResult   app.parse({"args", "..."});
 void          app.parse_or_exit(argc, argv);
 
 // Introspection
@@ -139,7 +143,9 @@ bool          app.has_flag("--flag");
 bool          app.has_option("--opt");
 
 // Output
+std::string   app.help_text();          // render help without printing
 void          app.print_help();
+void          app.print_help(ostream&); // e.g. into a stringstream
 void          app.print_error(const ParseError&);
 void          app.bash_completion(ostream&);
 void          app.fish_completion(ostream&);
@@ -161,8 +167,12 @@ auto opt = app.add<T>("--flag")
               .choices({a, b, c})     // allowed values
               .validate(fn, "desc")   // custom predicate
               .transform(fn)          // post-parse value transform
+              .delimiter(',')         // split vector values (e.g. --tag=a,b,c)
               .section("Group Name"); // help section header
 ```
+
+Constraints and custom validators are also applied to values that come from
+defaults or environment variables, not only from the command line.
 
 ### Value access
 
@@ -182,7 +192,8 @@ result.error().kind;     // ParseError::Kind enum
 result.error().message;  // human-readable string
 ```
 
-**Kinds:** `UnknownOption`, `MissingValue`, `InvalidValue`, `MissingRequired`,
+**Kinds:** `HelpRequested`, `VersionRequested`, `UnknownOption`, `MissingValue`,
+`UnexpectedValue`, `InvalidValue`, `MissingRequired`, `MissingSubcommand`,
 `TooManyPositionals`, `ValidationFailed`, `OutOfRange`, `BadChoice`,
 `MutuallyExclusive`, `RequiresOption`
 
@@ -255,6 +266,66 @@ app.add_flag("--verbose").section("Output Options");
 // Help groups options under section headers
 ```
 
+### Custom value types (ADL)
+
+Any type with `cli_parse()` and `cli_format()` in its own namespace works
+directly with `add<T>()` and `add_positional<T>()`:
+
+```cpp
+namespace app {
+struct Level { int value; };
+
+inline std::expected<Level, std::string> cli_parse(std::string_view sv) {
+    if (sv == "low")  return Level{1};
+    if (sv == "high") return Level{3};
+    return std::unexpected("expected low or high");
+}
+inline std::string cli_format(const Level& l) {
+    return std::format("Level({})", l.value);
+}
+}
+
+auto level = app.add<app::Level>("--level").default_val(app::Level{1});
+```
+
+For templates or multiple overloads, use the type-identity form:
+
+```cpp
+inline std::expected<Point, std::string>
+cli_parse(std::string_view sv, std::type_identity<Point>);
+```
+
+`cli_format` is used in help output, defaults, and error messages.
+
+### Positional arguments
+
+Positionals support the same constraints and fallbacks as options:
+
+```cpp
+auto input = app.add_positional<std::string>("input")
+                .help("Input file")
+                .env("APP_INPUT")
+                .validate([](const std::string& s) { return !s.empty(); },
+                          "input must not be empty");
+
+auto values = app.add_positional<std::vector<int>>("values")
+                 .delimiter(',')     // one token: 1,2,3 → {1, 2, 3}
+                 .range(0, 100);
+```
+
+Positionals are required by default; `.default_val(v)` makes them optional.
+
+### Help and version behavior
+
+`--help` / `-h` and `--version` / `-V` are built in whenever no user option
+occupies the same spelling. Version strings are inherited by subcommands, so
+`tool sub --version` works even when only the root app defines a version.
+
+```cpp
+std::string text = app.help_text();  // capture instead of printing
+app.print_help(std::cerr);           // write to any ostream
+```
+
 ### Zsh completion
 
 ```cpp
@@ -269,8 +340,28 @@ app.zsh_completion(std::cout);  // writes #compdef-style function
 ```bash
 cmake -B build
 cmake --build build
+
+# Run everything (17 domain suites, aggregate run, process-level exit tests)
 ctest --test-dir build --output-on-failure
+
+# Inspect or run one domain
+./build/tests/test_parse --list-test-suites
+./build/tests/test_parse --test-suite=flags
+
+# Adversarial fuzzing (Clang + libFuzzer)
+cmake -S . -B build-fuzz -DCLI_BUILD_EXAMPLES=OFF -DCLI_BUILD_FUZZERS=ON
+cmake --build build-fuzz --target fuzz_parse
+./build-fuzz/tests/fuzz_parse -max_len=4096 -runs=100000
 ```
+
+Tests are split by domain (`flags`, `options`, `positionals`, `values`,
+`tokens`, `constraints`, `groups`, `environment`, `subcommands`, `errors`,
+`help`, `completion`, `lookup`, `lifecycle`, `custom_types`, `robustness`,
+`api`). Each domain is a doctest suite, so failures are attributable to one
+area and the whole suite can still be run at once. The fuzz target is opt-in
+and requires Clang with a libFuzzer runtime (Linux CI uses Clang 19);
+`CLI_FUZZER_SANITIZERS` controls the sanitizer set (default
+`address,undefined`).
 
 ---
 
@@ -282,7 +373,8 @@ ctest --test-dir build --output-on-failure
 | Clang | 17 |
 | MSVC | 19.35 (VS 2022 17.5) |
 
-Requires **C++23** (`std::expected`, `std::print`, *deducing-this*).
+Requires **C++23** (`std::expected`, `std::format`, *deducing-this*). The
+example programs additionally use `std::print`.
 
 ---
 
