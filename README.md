@@ -20,6 +20,14 @@
 | **Constraints** | `.range()`, `.choices()`, `.validate(fn, desc)` on options *and* positionals |
 | **Env-var fallback** | `.env("VAR")` on options *and* positionals |
 | **Delimited values** | `.delimiter(',')` — `--items=a,b,c` for `vector<T>` |
+| **Arity control** | `.nargs(2)`, `.nargs(1,3)`, `.nargs_at_least(1)` — one flag, many tokens |
+| **Config files** | `config_file()` + `config_option()` — INI sections, arrays, subcommands |
+| **Response files** | `response_files()` — `@args.txt` with quotes, comments, nesting |
+| **Option aliases** | `.alias("--colour")` adds extra spellings to any option/flag/count |
+| **Long-option abbreviation** | `allow_abbrev()` accepts unique prefixes such as `--verb` |
+| **Extra arguments** | `allow_extras()` + `remaining_args()` for wrapper/forwarding tools |
+| **Hidden commands** | `subcommand(...).hidden()` — dispatchable but absent from help/completion |
+| **Unknown-command hints** | Levenshtein suggestions for misspelled verbs, including aliases |
 | **Short-flag grouping** | `-vxf` ≡ `-v -x -f` |
 | **Inline values** | `-n42` ≡ `-n 42`, `--out=file` ≡ `--out file` |
 | **Negative numbers** | `-1`, `-3.14` etc. correctly handled as positional values |
@@ -33,11 +41,13 @@
 | **Transforms** | `.transform(fn)` applies a post-parse value transformation |
 | **Mutex groups** | `mutex_group({...})` — at most one option in the set may be used |
 | **Require-together** | `require_together({...})` — all-or-nothing option sets |
+| **Require-one-of** | `require_one_of({...})` — at least one option from the set |
 | **Subcommand aliases** | `.alias("ci")` — alternative names for subcommands |
 | **Negatable flags** | `.negatable()` — `--[no-]flag` shown in help, `--no-flag` sets false |
-| **Named sections** | `.section("Group")` — groups options under sub-headers in help |
+| **Named sections** | `.section("Group")` / `.group("Group")` — help sub-headers |
 | **Reusable App** | `parse()` resets automatically; `app.reset()` is available explicitly |
 | **Initializer parse** | `app.parse({"-v", "--jobs", "8"})` — no argc/argv needed |
+| **Vector parse** | `app.parse(std::vector<std::string>{...})` |
 
 ---
 
@@ -130,10 +140,20 @@ App&          app.subcommand("name", "desc").alias("n");
 // Constraints
 App&          app.mutex_group({"--verbose", "--quiet"});
 App&          app.require_together({"--output", "--format"});
+App&          app.require_one_of({"--json", "--yaml"});
+
+// Input sources & permissive parsing
+App&          app.config_file("tool.ini", /*required=*/false);
+App&          app.config_option("--config");
+App&          app.response_files();
+App&          app.allow_abbrev();
+App&          app.allow_extras();
+const auto&   app.remaining_args();
 
 // Parse (each overload resets prior state automatically)
 ParseResult   app.parse(argc, argv);   // std::expected<void, ParseError>
 ParseResult   app.parse({"args", "..."});
+ParseResult   app.parse(std::vector<std::string>{...});
 void          app.parse_or_exit(argc, argv);
 
 // Introspection
@@ -157,6 +177,7 @@ void          app.zsh_completion(ostream&);
 ```cpp
 auto opt = app.add<T>("--flag")
               .short_name("-x")
+              .alias("--alias")       // extra spelling
               .help("description")
               .default_val(value)     // implies optional
               .required()             // must be provided
@@ -168,7 +189,8 @@ auto opt = app.add<T>("--flag")
               .validate(fn, "desc")   // custom predicate
               .transform(fn)          // post-parse value transform
               .delimiter(',')         // split vector values (e.g. --tag=a,b,c)
-              .section("Group Name"); // help section header
+              .nargs(2)               // vector: consume exactly 2 tokens
+              .section("Group Name"); // help section header (alias: .group)
 ```
 
 Constraints and custom validators are also applied to values that come from
@@ -195,7 +217,8 @@ result.error().message;  // human-readable string
 **Kinds:** `HelpRequested`, `VersionRequested`, `UnknownOption`, `MissingValue`,
 `UnexpectedValue`, `InvalidValue`, `MissingRequired`, `MissingSubcommand`,
 `TooManyPositionals`, `ValidationFailed`, `OutOfRange`, `BadChoice`,
-`MutuallyExclusive`, `RequiresOption`
+`MutuallyExclusive`, `RequiresOption`, `UnknownCommand`, `ConfigError`,
+`AmbiguousOption`, `ResponseFileError`
 
 ---
 
@@ -265,6 +288,92 @@ app.add<unsigned>("--port").section("Connection Options");
 app.add_flag("--verbose").section("Output Options");
 // Help groups options under section headers
 ```
+
+### Variable arity options
+
+A `vector<T>` option normally consumes one token per occurrence. Use
+`.nargs()` when one occurrence should consume several tokens:
+
+```cpp
+auto files = app.add<std::vector<std::string>>("--file").nargs(2);
+// tool --file a.txt b.txt --file c.txt d.txt → four values
+
+auto tags = app.add<std::vector<std::string>>("--tag").nargs(1, 3);
+// stops before the next option once the minimum is met
+
+auto paths = app.add<std::vector<std::string>>("--path").nargs_at_least(1);
+// consumes until the next option-looking token
+```
+
+Exact arities consume dash-prefixed values as values; ranged and at-least
+arities stop at the next option so flags are not swallowed.
+
+### Config files
+
+```cpp
+app.config_file("tool.ini");       // optional default source
+app.config_option();               // adds --config <FILE>
+auto jobs = app.add<unsigned>("--jobs").default_val(4u);
+```
+
+```ini
+# tool.ini
+jobs = 8
+
+[build]
+target = release
+```
+
+Precedence is **command line > environment > config > default**. Sections map
+to command paths (`[remote.add]` for nested commands), values may be quoted,
+and array syntax `[a, b, "c,d"]` populates vector options and positionals.
+Missing optional files are ignored; `config_file(path, true)` makes them
+mandatory. Malformed files return `ParseError::Kind::ConfigError`.
+
+### Response files
+
+```cpp
+app.response_files();
+// tool @args.txt
+```
+
+Files are tokenised with shell-like quoting, support `#` comments and nested
+`@file` references (up to 8 levels), and produce
+`ParseError::Kind::ResponseFileError` on failure. `@@name` escapes a literal
+`@name` token.
+
+### Extra arguments for wrapper tools
+
+```cpp
+app.allow_extras();
+app.parse_or_exit(argc, argv);
+for (const auto& token : app.remaining_args()) { /* forward it */ }
+```
+
+Unknown options and surplus positionals are collected instead of rejected.
+The `--` marker itself is not included.
+
+### Abbreviations and aliases
+
+```cpp
+app.allow_abbrev();                                // --verb → --verbose
+auto color = app.add<std::string>("--color")
+                 .alias("--colour")
+                 .alias("-c");
+```
+
+Abbreviation is opt-in and only resolves unique long-option prefixes;
+ambiguous prefixes return `ParseError::Kind::AmbiguousOption`.
+
+### Require-one-of groups and hidden commands
+
+```cpp
+app.require_one_of({"--json", "--yaml"});          // at least one
+auto& debug = app.subcommand("debug", "Internal").hidden();
+```
+
+Hidden commands stay fully dispatchable but are omitted from help and all
+completion generators.
 
 ### Custom value types (ADL)
 
@@ -341,12 +450,18 @@ app.zsh_completion(std::cout);  // writes #compdef-style function
 cmake -B build
 cmake --build build
 
-# Run everything (17 domain suites, aggregate run, process-level exit tests)
+# Run everything (18 domain suites, aggregate run, process-level exit tests)
 ctest --test-dir build --output-on-failure
 
 # Inspect or run one domain
 ./build/tests/test_parse --list-test-suites
 ./build/tests/test_parse --test-suite=flags
+
+# Throughput microbenchmarks
+cmake -S . -B build-bench -DCMAKE_BUILD_TYPE=Release \
+      -DCLI_BUILD_TESTS=OFF -DCLI_BUILD_BENCHMARKS=ON
+cmake --build build-bench --target bench_parse
+./build-bench/bench/bench_parse 500000
 
 # Adversarial fuzzing (Clang + libFuzzer)
 cmake -S . -B build-fuzz -DCLI_BUILD_EXAMPLES=OFF -DCLI_BUILD_FUZZERS=ON
@@ -355,13 +470,30 @@ cmake --build build-fuzz --target fuzz_parse
 ```
 
 Tests are split by domain (`flags`, `options`, `positionals`, `values`,
-`tokens`, `constraints`, `groups`, `environment`, `subcommands`, `errors`,
-`help`, `completion`, `lookup`, `lifecycle`, `custom_types`, `robustness`,
-`api`). Each domain is a doctest suite, so failures are attributable to one
-area and the whole suite can still be run at once. The fuzz target is opt-in
-and requires Clang with a libFuzzer runtime (Linux CI uses Clang 19);
-`CLI_FUZZER_SANITIZERS` controls the sanitizer set (default
-`address,undefined`).
+`tokens`, `constraints`, `groups`, `environment`, `extensions`,
+`subcommands`, `errors`, `help`, `completion`, `lookup`, `lifecycle`,
+`custom_types`, `robustness`, `api`). Each domain is a doctest suite, so
+failures are attributable to one area and the whole suite can still be run at
+once. The fuzz target is opt-in and requires Clang with a libFuzzer runtime
+(Linux CI uses Clang 19); `CLI_FUZZER_SANITIZERS` controls the sanitizer set
+(default `address,undefined`).
+
+### Performance
+
+`bench_parse` measures end-to-end `parse()` throughput including automatic
+reset. On an Apple-silicon laptop (Release, Clang) the suite currently runs at:
+
+| Scenario | ns/parse | parses/sec |
+|---|---:|---:|
+| 8 short flags | ~107 | ~9.3 M |
+| 6 typed options (12 tokens) | ~236 | ~4.2 M |
+| mixed flags/options/vector/positional | ~214 | ~4.7 M |
+| subcommand + options (2 parses) | ~245 | ~4.1 M |
+
+Numbers vary by machine; run the benchmark target on your own hardware.
+Hot-path work is allocation-free for `parse(argc, argv)`, one-character short
+options use a direct 128-slot index instead of hashing, and formatting is
+confined to help/error paths.
 
 ---
 

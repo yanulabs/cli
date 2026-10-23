@@ -8,6 +8,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **Variable-arity options** — `.nargs(N)`, `.nargs(lo, hi)`, and
+  `.nargs_at_least(N)` let one vector-option occurrence consume several
+  tokens; exact arities keep dash-prefixed values, ranged arities stop at the
+  next option
+- **INI config files** — `config_file(path, required)` and `config_option()`
+  load root and `[command.path]` sections, quoted values, arrays, and
+  negatable flags; precedence is CLI > environment > config > default
+- **Response files** — `response_files()` expands `@file` with shell-like
+  quoting, comments, nested includes (8 levels), `@@` escaping, a 4 MiB size
+  cap, and dedicated `ResponseFileError` diagnostics
+- **Option aliases** — `.alias("--colour")` on options, flags, and counts
+- **Long-option abbreviation** — opt-in `allow_abbrev()` with unique-prefix
+  resolution and `AmbiguousOption` errors
+- **Extra-argument collection** — `allow_extras()` plus `remaining_args()`
+  for wrapper/forwarding tools; unknown options and surplus positionals are
+  preserved instead of failing
+- **Hidden subcommands** — `.hidden()` verbs remain dispatchable but are
+  excluded from help and Bash/Fish/Zsh completion output
+- **Unknown-command diagnostics** — misspelled commands return
+  `UnknownCommand` with Levenshtein suggestions, including aliases
+- **`require_one_of({...})`** — at-least-one-of option groups
+- **`.group()`** as a vocabulary alias for `.section()`
+- **`parse(std::vector<std::string>)`** convenience overload
+- **Throughput benchmark target** (`CLI_BUILD_BENCHMARKS=ON`) covering flags,
+  typed options, mixed schemas, and subcommands
+- **`config` example** demonstrating config files, response files, nargs, and
+  extras
 - **Custom value types via ADL** — `cli_parse(std::string_view)` and
   `cli_format(const T&)` in the type's namespace; a
   `cli_parse(std::string_view, std::type_identity<T>)` overload is also
@@ -26,11 +53,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `tool sub --version` works
 - **Default validation** — defaults are checked against `range()`,
   `choices()`, and custom validators
-- **Domain-scoped test suite** — 371 test cases across 17 doctest suites
+- **Domain-scoped test suite** — 416 test cases across 18 doctest suites
   (`api`, `completion`, `constraints`, `custom_types`, `environment`,
-  `errors`, `flags`, `groups`, `help`, `lifecycle`, `lookup`, `options`,
-  `positionals`, `robustness`, `subcommands`, `tokens`, `values`), each
-  registered as its own CTest entry and runnable via `--test-suite=NAME`
+  `errors`, `extensions`, `flags`, `groups`, `help`, `lifecycle`, `lookup`,
+  `options`, `positionals`, `robustness`, `subcommands`, `tokens`, `values`),
+  each registered as its own CTest entry and runnable via `--test-suite=NAME`
 - **Process-level `parse_or_exit()` tests** — separate driver verifies help,
   version, error exit codes, nested help/version scoping, and callback
   dispatch without terminating the unit-test process
@@ -97,6 +124,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (`[default: , two]`, `[|auto]`) instead of silently dropping them
 
 ### Changed
+- `parse(argc, argv)` no longer copies the token list into a temporary vector;
+  subcommand recursion parses the original pointer span
+- One-character short options are resolved through a direct 128-slot ASCII
+  index, bypassing the hash map on the token hot path
+- An unknown bare word now reports `UnknownCommand` (with suggestions) instead
+  of `TooManyPositionals` when no positional slot consumed it; genuine surplus
+  positionals still report `TooManyPositionals`
 - `parse()` and `parse_or_exit()` accept `const char* const*`, so mutable,
   const, and mixed `argv` arrays all work without overload ambiguity
 - Per-parse version lookup and subcommand lookup are cached/skipped when
