@@ -12,6 +12,7 @@ project(
 option(CLI_BUILD_EXAMPLES "Build example programs"   ON)
 option(CLI_BUILD_TESTS    "Build the test suite"     ON)
 option(CLI_BUILD_FUZZERS  "Build libFuzzer targets"  OFF)
+option(CLI_BUILD_BENCHMARKS "Build throughput benchmarks" OFF)
 set(CLI_FUZZER_SANITIZERS "address,undefined" CACHE STRING
     "Comma-separated sanitizers combined with the libFuzzer runtime")
 option(CLI_INSTALL        "Generate install targets" ON)
@@ -40,6 +41,11 @@ endif()
 if(CLI_BUILD_TESTS)
     enable_testing()
     add_subdirectory(tests)
+endif()
+
+# ── Benchmarks ────────────────────────────────────────────────────────────────
+if(CLI_BUILD_BENCHMARKS)
+    add_subdirectory(bench)
 endif()
 
 # ── Install / package config ──────────────────────────────────────────────────
