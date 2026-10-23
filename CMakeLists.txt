@@ -11,7 +11,14 @@ project(
 # ── Options ──────────────────────────────────────────────────────────────────
 option(CLI_BUILD_EXAMPLES "Build example programs"   ON)
 option(CLI_BUILD_TESTS    "Build the test suite"     ON)
+option(CLI_BUILD_FUZZERS  "Build libFuzzer targets"  OFF)
+set(CLI_FUZZER_SANITIZERS "address,undefined" CACHE STRING
+    "Comma-separated sanitizers combined with the libFuzzer runtime")
 option(CLI_INSTALL        "Generate install targets" ON)
+
+if(CLI_BUILD_FUZZERS AND NOT CLI_BUILD_TESTS)
+    message(FATAL_ERROR "CLI_BUILD_FUZZERS requires CLI_BUILD_TESTS=ON")
+endif()
 
 # ── Interface library (header-only) ──────────────────────────────────────────
 add_library(cli INTERFACE)

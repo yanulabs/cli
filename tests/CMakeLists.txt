@@ -114,3 +114,29 @@ set_tests_properties(cli_exit_ancestor_callback PROPERTIES
     PASS_REGULAR_EXPRESSION "remote-callback"
     FAIL_REGULAR_EXPRESSION "root-callback"
 )
+
+# libFuzzer is a Clang feature; keep it opt-in so normal builds stay portable.
+if(CLI_BUILD_FUZZERS)
+    if(NOT CMAKE_CXX_COMPILER_ID MATCHES "Clang")
+        message(FATAL_ERROR "CLI_BUILD_FUZZERS requires Clang")
+    endif()
+
+    add_executable(fuzz_parse fuzz_parse.cpp)
+    target_link_libraries(fuzz_parse PRIVATE cli::cli)
+    set_target_properties(fuzz_parse PROPERTIES
+        CXX_STANDARD          23
+        CXX_STANDARD_REQUIRED ON
+        CXX_EXTENSIONS        OFF
+    )
+    if(CLI_FUZZER_SANITIZERS)
+        set(CLI_FUZZ_SANITIZE_FLAG "-fsanitize=fuzzer,${CLI_FUZZER_SANITIZERS}")
+    else()
+        set(CLI_FUZZ_SANITIZE_FLAG "-fsanitize=fuzzer")
+    endif()
+    target_compile_options(fuzz_parse PRIVATE
+        ${CLI_FUZZ_SANITIZE_FLAG}
+        -fno-omit-frame-pointer
+        -g
+    )
+    target_link_options(fuzz_parse PRIVATE ${CLI_FUZZ_SANITIZE_FLAG})
+endif()
