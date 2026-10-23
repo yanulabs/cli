@@ -10,103 +10,79 @@
 //  · Type-safe Option<T>, Flag, Count, Positional<T> handles
 //  · Fluent builder API via C++23 deducing-this (no CRTP boilerplate)
 //  · Types out-of-the-box: bool · integrals · floats · string · path · vector
-//  · Constraints: .range() · .choices() · .validate(fn, desc)
+//  · Custom types via ADL: cli_parse( std::string_view ) & cli_format( const T& )
+//  · Constraints: .range() · .choices() · .validate(fn, desc) on Options & Positionals
+//  · Multi-value delimiter splitting: .delimiter(',') for --items=a,b,c
 //  · Mutually exclusive groups:  mutex_group({"--verbose","--quiet"})
 //  · Required-together groups:   require_together({"--output","--format"})
-//  · Per-option env-var fallback via .env("VAR")
+//  · Per-option & positional env-var fallback via .env("VAR")
 //  · Post-parse value transforms via .transform(fn)
-//  · Short-flag grouping   -vxf  ≡  -v -x -f
+//  · Short-flag grouping   -vxf  ≡  -v -x -f  (including -h / -V)
 //  · Count options:        -vvv  ≡  -v -v -v  (increments per occurrence)
 //  · Inline short value    -n42  ≡  -n 42
-//  · Inline long value   --out=file  ≡  --out file
+//  · Inline long value   --out=file  ≡  --out file  and  --flag=false
+//  · Standard '-' token treated as positional (stdin/stdout)
 //  · End-of-options marker  --
-//  · Subcommands with independent option sets and recursive help
-//  · Subcommand aliases: subcommand("commit").alias("ci")
-//  · Negatable flags: add_flag("--color").negatable()  →  --[no-]color
+//  · Subcommands with independent option sets, aliases, and recursive help
+//  · Negatable flags: add_flag("--color").default_val(true).negatable()
 //  · Named option sections in help: .section("Connection Options")
 //  · Auto-aligned, ANSI-colored, section-structured help output
 //  · Levenshtein "did you mean?" suggestions on unknown options
 //  · Bash / Fish / Zsh shell completion generators
-//  · Count options:  add_count("--verbose")  counts -v -v -v occurrences
-//  · Mutually exclusive groups: mutex_group({"--verbose","--quiet"})
-//  · Required-together groups: require_together({"--output","--format"})
-//  · Subcommand aliases: subcommand("commit").alias("ci")
-//  · Negatable flags: add_flag("--color").negatable()  →  --[no-]color
-//  · Post-parse transforms: .transform([](auto s){ return upper(s); })
-//  · Named option sections: .section("Connection Options")
-//  · Zsh shell completion generator
-//
-//  NEW FLUENT API (v2)
-//  ───────────────────
-//  cli::App app{"tool", "My blazing-fast tool", "1.0.0"};
-//
-//  auto verbose = app.add_flag("--verbose").short_name("-v")
-//                    .help("Enable verbose output");
-//  auto jobs    = app.add<unsigned>("--jobs").short_name("-j")
-//                    .help("Parallel jobs").default_val(4u).range(1u, 256u);
-//  auto output  = app.add<fs::path>("--output").short_name("-o")
-//                    .help("Output directory").required().meta("DIR");
-//  auto level   = app.add<std::string>("--level").short_name("-l")
-//                    .help("Log level").default_val("info")  // ← no cast!
-//                    .choices({"debug","info","warn","error"});
-//
-//  app.subcommand("build", "Compile sources")
-//     .on_execute([](cli::App& cmd) {
-//         auto target = cmd["--target"].as<std::string>();
-//         std::println("Building: {}", target);
-//     });
-//
-//  app.parse_or_exit(argc, argv);   // parses + fires on_execute callback
-//
-//  if (app.has_flag("--verbose")) { /* ... */ }
-//  auto n = app["--jobs"].as_or<int>(1);
-//
-//  REQUIREMENTS
-//  ────────────
-//  · C++23 (GCC ≥ 13, Clang ≥ 17, MSVC 19.35+)
-//  · std::from_chars for float: GCC ≥ 11, Clang ≥ 14, MSVC 2019 16.4+
 // ════════════════════════════════════════════════════════════════════════════
 
 #include <algorithm>
+#include <cctype>
 #include <charconv>
 #include <concepts>
+#include <cstddef>
+#include <cstdint>
 #include <cstdlib>
 #include <expected>
 #include <filesystem>
 #include <format>
 #include <functional>
+#include <initializer_list>
 #include <iostream>
+#include <limits>
 #include <memory>
 #include <numeric>
 #include <optional>
-#include <print>
 #include <ranges>
 #include <span>
+#include <stdexcept>
 #include <string>
 #include <string_view>
+#include <system_error>
 #include <type_traits>
+#include <unordered_map>
+#include <utility>
 #include <vector>
 
 #ifdef _WIN32
 #  include <io.h>
-#  define CLI_ISATTY(fd) ::_isatty(fd)
 #else
 #  include <unistd.h>
-#  define CLI_ISATTY(fd) ::isatty(fd)
 #endif
 
 namespace cli {
 
+class App;
+
 // ────────────────────────────────────────────────────────────────────────────
-// §1  ParseError — structured, descriptive error type
+// §1  ParseError — structured, descriptive error / control-flow type
 // ────────────────────────────────────────────────────────────────────────────
 
 struct ParseError {
     enum class Kind : uint8_t {
+        HelpRequested,
+        VersionRequested,
         UnknownOption,
         MissingValue,
+        UnexpectedValue,
         InvalidValue,
         MissingRequired,
+        MissingSubcommand,
         TooManyPositionals,
         ValidationFailed,
         OutOfRange,
@@ -117,92 +93,113 @@ struct ParseError {
 
     Kind        kind;
     std::string message;
+    const App*  context = nullptr; // Active App/subcommand where help/version/error occurred
 
-    // Named constructors for every error scenario
-    static ParseError unknown(std::string_view opt, std::string_view sug = {}) {
-        if (sug.empty())
-            return { Kind::UnknownOption, std::format("unknown option '{}'", opt) };
-        return { Kind::UnknownOption,
-                 std::format("unknown option '{}' — did you mean '{}'?", opt, sug) };
+    [[nodiscard]] constexpr bool is_exit_request() const noexcept {
+        return kind == Kind::HelpRequested || kind == Kind::VersionRequested;
     }
-    static ParseError missing_value(std::string_view opt) {
+
+    static ParseError help_requested(const App* app) {
+        return { Kind::HelpRequested, {}, app };
+    }
+    static ParseError version_requested(const App* app) {
+        return { Kind::VersionRequested, {}, app };
+    }
+    static ParseError unknown(std::string_view opt, std::string_view sug = {}, const App* app = nullptr) {
+        if (sug.empty())
+            return { Kind::UnknownOption, std::format("unknown option '{}'", opt), app };
+        return { Kind::UnknownOption,
+                 std::format("unknown option '{}' — did you mean '{}'?", opt, sug), app };
+    }
+    static ParseError missing_value(std::string_view opt, const App* app = nullptr) {
         return { Kind::MissingValue,
-                 std::format("option '{}' requires a value", opt) };
+                 std::format("option '{}' requires a value", opt), app };
+    }
+    static ParseError unexpected_value(std::string_view opt, std::string_view val, const App* app = nullptr) {
+        return { Kind::UnexpectedValue,
+                 std::format("option '{}' does not take a value (got '{}')", opt, val), app };
     }
     static ParseError invalid(std::string_view opt, std::string_view val,
-                              std::string_view why) {
+                              std::string_view why, const App* app = nullptr) {
         return { Kind::InvalidValue,
-                 std::format("invalid value '{}' for '{}': {}", val, opt, why) };
+                 std::format("invalid value '{}' for '{}': {}", val, opt, why), app };
     }
-    static ParseError missing_required(std::string_view name) {
+    static ParseError missing_required(std::string_view name, const App* app = nullptr) {
         return { Kind::MissingRequired,
-                 std::format("required option '{}' was not provided", name) };
+                 std::format("required option '{}' was not provided", name), app };
     }
-    static ParseError missing_positional(std::string_view name) {
+    static ParseError missing_positional(std::string_view name, const App* app = nullptr) {
         return { Kind::MissingRequired,
-                 std::format("required argument <{}> was not provided", name) };
+                 std::format("required argument <{}> was not provided", name), app };
+    }
+    static ParseError missing_subcommand(std::string_view app_name, const App* app = nullptr) {
+        return { Kind::MissingSubcommand,
+                 std::format("a command is required for '{}'", app_name), app };
     }
     static ParseError out_of_range(std::string_view opt, std::string_view val,
-                                   std::string_view lo, std::string_view hi) {
+                                   std::string_view lo, std::string_view hi, const App* app = nullptr) {
         return { Kind::OutOfRange,
                  std::format("value '{}' for '{}' is out of range [{}, {}]",
-                             val, opt, lo, hi) };
+                             val, opt, lo, hi), app };
     }
     static ParseError bad_choice(std::string_view opt, std::string_view val,
-                                 std::string_view choices) {
+                                 std::string_view choices, const App* app = nullptr) {
         return { Kind::BadChoice,
                  std::format("invalid choice '{}' for '{}' — valid: {}",
-                             val, opt, choices) };
+                             val, opt, choices), app };
     }
-    static ParseError validation(std::string_view opt, std::string_view desc) {
+    static ParseError validation(std::string_view opt, std::string_view desc, const App* app = nullptr) {
         return { Kind::ValidationFailed,
-                 std::format("validation failed for '{}': {}", opt, desc) };
+                 std::format("validation failed for '{}': {}", opt, desc), app };
     }
-    static ParseError too_many(std::string_view arg) {
+    static ParseError too_many(std::string_view arg, const App* app = nullptr) {
         return { Kind::TooManyPositionals,
-                 std::format("unexpected argument '{}'", arg) };
+                 std::format("unexpected argument '{}'", arg), app };
     }
-    static ParseError mutually_exclusive(std::string_view a, std::string_view b) {
+    static ParseError mutually_exclusive(std::string_view a, std::string_view b, const App* app = nullptr) {
         return { Kind::MutuallyExclusive,
-                 std::format("'{}' and '{}' are mutually exclusive", a, b) };
+                 std::format("'{}' and '{}' are mutually exclusive", a, b), app };
     }
-    static ParseError requires_option(std::string_view opt, std::string_view req) {
+    static ParseError requires_option(std::string_view opt, std::string_view req, const App* app = nullptr) {
         return { Kind::RequiresOption,
-                 std::format("'{}' requires '{}' to also be provided", opt, req) };
+                 std::format("'{}' requires '{}' to also be provided", opt, req), app };
     }
 };
 
 using ParseResult = std::expected<void, ParseError>;
 
 // ────────────────────────────────────────────────────────────────────────────
-// §2  Internal helpers — ANSI, Levenshtein, type traits, from_string
+// §2  Internal helpers — ANSI, Levenshtein, type traits, ADL hooks, from_string
 // ────────────────────────────────────────────────────────────────────────────
 
 namespace detail {
 
-// ── Terminal color ─────────────────────────────────────────────────────────
+[[nodiscard]] inline bool is_tty(int fd) noexcept {
+#ifdef _WIN32
+    return ::_isatty(fd) != 0;
+#else
+    return ::isatty(fd) != 0;
+#endif
+}
 
 inline bool color_enabled() noexcept {
-    static const bool v = CLI_ISATTY(1) != 0;
+    static const bool v = is_tty(1) && (std::getenv("NO_COLOR") == nullptr);
     return v;
 }
 
-// Thin helpers so call sites stay readable
 struct C {
-    static std::string_view rst()  { return color_enabled() ? "\033[0m"    : ""; }
-    static std::string_view bld()  { return color_enabled() ? "\033[1m"    : ""; }
-    static std::string_view dim()  { return color_enabled() ? "\033[2m"    : ""; }
-    static std::string_view cyn()  { return color_enabled() ? "\033[36m"   : ""; }
-    static std::string_view yel()  { return color_enabled() ? "\033[33m"   : ""; }
-    static std::string_view grn()  { return color_enabled() ? "\033[32m"   : ""; }
-    static std::string_view red()  { return color_enabled() ? "\033[31m"   : ""; }
-    static std::string_view bcyn() { return color_enabled() ? "\033[1;36m" : ""; }
-    static std::string_view byel() { return color_enabled() ? "\033[1;33m" : ""; }
-    static std::string_view bred() { return color_enabled() ? "\033[1;31m" : ""; }
-    static std::string_view bgrn() { return color_enabled() ? "\033[1;32m" : ""; }
+    static std::string_view rst()  noexcept { return color_enabled() ? "\033[0m"    : ""; }
+    static std::string_view bld()  noexcept { return color_enabled() ? "\033[1m"    : ""; }
+    static std::string_view dim()  noexcept { return color_enabled() ? "\033[2m"    : ""; }
+    static std::string_view cyn()  noexcept { return color_enabled() ? "\033[36m"   : ""; }
+    static std::string_view yel()  noexcept { return color_enabled() ? "\033[33m"   : ""; }
+    static std::string_view grn()  noexcept { return color_enabled() ? "\033[32m"   : ""; }
+    static std::string_view red()  noexcept { return color_enabled() ? "\033[31m"   : ""; }
+    static std::string_view bcyn() noexcept { return color_enabled() ? "\033[1;36m" : ""; }
+    static std::string_view byel() noexcept { return color_enabled() ? "\033[1;33m" : ""; }
+    static std::string_view bred() noexcept { return color_enabled() ? "\033[1;31m" : ""; }
+    static std::string_view bgrn() noexcept { return color_enabled() ? "\033[1;32m" : ""; }
 };
-
-// ── Levenshtein distance (for "did you mean?" suggestions) ────────────────
 
 inline size_t edit_distance(std::string_view a, std::string_view b) noexcept {
     const size_t m = a.size(), n = b.size();
@@ -211,29 +208,88 @@ inline size_t edit_distance(std::string_view a, std::string_view b) noexcept {
     std::vector<size_t> row(n + 1);
     std::iota(row.begin(), row.end(), size_t{0});
     for (size_t i = 1; i <= m; ++i) {
-        size_t prev = i;
+        size_t previous_diagonal = row[0]; // old row[i - 1]
+        row[0] = i;
         for (size_t j = 1; j <= n; ++j) {
-            const size_t tmp = row[j];
-            row[j] = (a[i-1] == b[j-1])
-                ? row[j-1]
-                : 1 + std::min({row[j], row[j-1], prev});
-            prev = tmp;
+            const size_t above = row[j]; // old row[j]
+            row[j] = (a[i - 1] == b[j - 1])
+                ? previous_diagonal
+                : 1 + std::min({row[j], row[j - 1], previous_diagonal});
+            previous_diagonal = above;
         }
     }
     return row[n];
 }
 
-// ── Type traits ────────────────────────────────────────────────────────────
+inline bool has_outer_whitespace(std::string_view sv) noexcept {
+    return !sv.empty()
+        && (std::isspace(static_cast<unsigned char>(sv.front())) != 0 ||
+            std::isspace(static_cast<unsigned char>(sv.back())) != 0);
+}
 
-template<typename T> struct is_vec                   : std::false_type {};
-template<typename T> struct is_vec<std::vector<T>>   : std::true_type  {};
-template<typename T> inline constexpr bool is_vec_v  = is_vec<T>::value;
+inline bool ascii_iequals(std::string_view a, std::string_view b) noexcept {
+    if (a.size() != b.size()) return false;
+    for (size_t i = 0; i < a.size(); ++i) {
+        if (std::tolower(static_cast<unsigned char>(a[i])) !=
+            std::tolower(static_cast<unsigned char>(b[i])))
+            return false;
+    }
+    return true;
+}
 
-template<typename T> struct elem_of              { using type = T; };
+// ── Negative number literal detector (-42, -3.14, -.5, -1e-3) ──────────────
+
+inline bool looks_like_negative_number(std::string_view sv) noexcept {
+    if (sv.size() < 2 || sv[0] != '-') return false;
+    const auto c1 = static_cast<unsigned char>(sv[1]);
+    if (std::isdigit(c1)) return true;
+    if (sv[1] == '.' && sv.size() >= 3 && std::isdigit(static_cast<unsigned char>(sv[2])))
+        return true;
+    return false;
+}
+
+// ── Type traits & ADL extensibility concepts ───────────────────────────────
+
+template<typename T> struct is_vec                  : std::false_type {};
+template<typename T> struct is_vec<std::vector<T>>  : std::true_type  {};
+template<typename T> inline constexpr bool is_vec_v = is_vec<T>::value;
+
+template<typename T> struct elem_of                 { using type = T; };
 template<typename T> struct elem_of<std::vector<T>> { using type = T; };
 template<typename T> using  elem_of_t = typename elem_of<T>::type;
 
-// ── Human-readable type name used in <META> placeholders ──────────────────
+// Stable, RTTI-free type token used by Lookup to recover the concrete option.
+template<typename T>
+inline constexpr char type_token = 0;
+
+// ── ADL poison pills ───────────────────────────────────────────────────────
+// These declarations exist only so unqualified lookup succeeds in the
+// requires-expressions below when the user has not supplied a hook.  ADL can
+// still find a `cli_parse` / `cli_format` declared in T's namespace, which is
+// the intended customization point.
+void cli_parse() = delete;
+void cli_format() = delete;
+
+// Makes a one-argument ADL hook dependent on T.  Without this, a call to
+// `cli_parse(sv)` inside a requires-expression would be non-dependent and a
+// missing hook would be a hard error instead of a false constraint.
+template<typename T>
+struct DependentStringView {
+    std::string_view value;
+    constexpr operator std::string_view() const noexcept { return value; }
+};
+
+template<typename T>
+concept CustomParsable = requires(std::string_view sv) {
+    { cli_parse(sv, std::type_identity<T>{}) } -> std::same_as<std::expected<T, std::string>>;
+} || requires(DependentStringView<T> sv) {
+    { cli_parse(sv) } -> std::same_as<std::expected<T, std::string>>;
+};
+
+template<typename T>
+concept CustomFormattable = requires(const T& v) {
+    { cli_format(v) } -> std::convertible_to<std::string>;
+};
 
 template<typename T>
 consteval std::string_view type_meta() noexcept {
@@ -244,31 +300,38 @@ consteval std::string_view type_meta() noexcept {
     else if constexpr (std::is_floating_point_v<U>)              return "FLOAT";
     else if constexpr (std::is_unsigned_v<U>)                    return "UINT";
     else if constexpr (std::is_integral_v<U>)                    return "INT";
-    else                                                          return "VALUE";
+    else                                                         return "VALUE";
 }
-
-// ── to_display: T → human-readable string ─────────────────────────────────
 
 template<typename T>
 [[nodiscard]] std::string to_display(const T& v) {
-    if constexpr (std::is_same_v<T, std::string>)
-        return std::format("\"{}\"", v);
+    if constexpr (is_vec_v<T>) {
+        std::string out;
+        bool first = true;
+        for (const auto& e : v) {
+            if (!first) out += ", ";
+            first = false;
+            out += to_display(e);
+        }
+        return out;
+    } else if constexpr (CustomFormattable<T>)
+        return std::string(cli_format(v));
+    else if constexpr (std::is_same_v<T, std::string>)
+        return std::string(v);
     else if constexpr (std::is_same_v<T, std::filesystem::path>)
         return v.string();
     else if constexpr (std::is_same_v<T, bool>)
         return v ? "true" : "false";
     else if constexpr (std::is_arithmetic_v<T>)
         return std::format("{}", v);
+    else if constexpr (std::formattable<T, char>)
+        return std::format("{}", v);
     else
         return "?";
 }
 
-// ── from_string<T>: std::string_view → std::expected<T, std::string> ──────
-// Single-function, if-constexpr dispatch. No specializations needed.
-
 template<typename T>
 [[nodiscard]] auto from_string(std::string_view sv) -> std::expected<T, std::string> {
-
     if constexpr (std::is_same_v<T, std::string>) {
         return std::string(sv);
 
@@ -276,92 +339,283 @@ template<typename T>
         return std::filesystem::path(sv);
 
     } else if constexpr (std::is_same_v<T, bool>) {
-        std::string lo(sv);
-        std::ranges::transform(lo, lo.begin(),
-            [](unsigned char c){ return (char)std::tolower(c); });
-        if (lo == "true"  || lo == "1" || lo == "yes" || lo == "on")  return true;
-        if (lo == "false" || lo == "0" || lo == "no"  || lo == "off") return false;
+        if (ascii_iequals(sv, "true")  || sv == "1" ||
+            ascii_iequals(sv, "yes")   || ascii_iequals(sv, "on"))  return true;
+        if (ascii_iequals(sv, "false") || sv == "0" ||
+            ascii_iequals(sv, "no")    || ascii_iequals(sv, "off")) return false;
         return std::unexpected(
-            std::format("'{}' is not a valid boolean — use true/false/1/0/yes/no", sv));
+            std::format("'{}' is not a valid boolean — use true/false/1/0/yes/no/on/off", sv));
 
     } else if constexpr (std::is_integral_v<T>) {
-        T val{};
-        auto [p, ec] = std::from_chars(sv.data(), sv.data() + sv.size(), val);
-        if (ec != std::errc{} || p != sv.data() + sv.size())
+        if (sv.empty())
+            return std::unexpected("empty string is not a valid integer");
+        if (has_outer_whitespace(sv))
             return std::unexpected(std::format("'{}' is not a valid integer", sv));
-        return val;
+
+        // Split the sign from the magnitude so that prefixed literals such as
+        // -0xFF and +0b1010 are accepted as well as their decimal forms.
+        std::string_view digits = sv;
+        bool negative = false;
+        if (digits.front() == '-' || digits.front() == '+') {
+            negative = digits.front() == '-';
+            digits.remove_prefix(1);
+        }
+        if (digits.empty())
+            return std::unexpected(std::format("'{}' is not a valid integer", sv));
+
+        int base = 10;
+        if (digits.starts_with("0x") || digits.starts_with("0X")) {
+            base = 16;
+            digits.remove_prefix(2);
+        } else if (digits.starts_with("0b") || digits.starts_with("0B")) {
+            base = 2;
+            digits.remove_prefix(2);
+        }
+        if (digits.empty())
+            return std::unexpected(std::format("'{}' is not a valid integer", sv));
+
+        using U = std::make_unsigned_t<T>;
+        U magnitude{};
+        auto [p, ec] = std::from_chars(digits.data(), digits.data() + digits.size(),
+                                       magnitude, base);
+        if (ec == std::errc::result_out_of_range)
+            return std::unexpected(std::format("'{}' overflows target integer type", sv));
+        if (ec != std::errc{} || p != digits.data() + digits.size())
+            return std::unexpected(std::format("'{}' is not a valid integer", sv));
+
+        if constexpr (std::is_unsigned_v<T>) {
+            if (negative)
+                return std::unexpected(std::format("'{}' cannot be negative", sv));
+            return static_cast<T>(magnitude);
+        } else {
+            using L = std::numeric_limits<T>;
+            constexpr U max_pos = static_cast<U>(L::max());
+            if (!negative) {
+                if (magnitude > max_pos)
+                    return std::unexpected(std::format("'{}' overflows target integer type", sv));
+                return static_cast<T>(magnitude);
+            }
+            constexpr U min_magnitude = max_pos + U{1};
+            if (magnitude > min_magnitude)
+                return std::unexpected(std::format("'{}' overflows target integer type", sv));
+            if (magnitude == min_magnitude)
+                return L::min();
+            return static_cast<T>(-static_cast<T>(magnitude));
+        }
 
     } else if constexpr (std::is_floating_point_v<T>) {
+        if (sv.empty())
+            return std::unexpected("empty string is not a valid number");
+        if (has_outer_whitespace(sv))
+            return std::unexpected(std::format("'{}' is not a valid number", sv));
+        std::string_view num = sv;
+        if (num.starts_with('+')) num.remove_prefix(1);
+        if (num.empty())
+            return std::unexpected(std::format("'{}' is not a valid number", sv));
         T val{};
 #if defined(__cpp_lib_to_chars) && __cpp_lib_to_chars >= 201611L
-        auto [p, ec] = std::from_chars(sv.data(), sv.data() + sv.size(), val);
-        if (ec != std::errc{} || p != sv.data() + sv.size())
+        auto [p, ec] = std::from_chars(num.data(), num.data() + num.size(), val);
+        if (ec != std::errc{} || p != num.data() + num.size())
             return std::unexpected(std::format("'{}' is not a valid number", sv));
         return val;
 #else
-        // Fallback for older stdlibs (from_chars for float not universally supported)
         try {
             size_t idx = 0;
+            std::string s(num);
             if constexpr (std::is_same_v<T, float>)
-                val = std::stof(std::string(sv), &idx);
+                val = std::stof(s, &idx);
             else if constexpr (std::is_same_v<T, double>)
-                val = std::stod(std::string(sv), &idx);
+                val = std::stod(s, &idx);
             else
-                val = std::stold(std::string(sv), &idx);
-            if (idx != sv.size())
+                val = std::stold(s, &idx);
+            if (idx != s.size())
                 return std::unexpected(std::format("'{}' is not a valid number", sv));
             return val;
         } catch (...) {
             return std::unexpected(std::format("'{}' is not a valid number", sv));
         }
 #endif
+    } else if constexpr (requires(std::string_view raw) {
+                             { cli_parse(raw, std::type_identity<T>{}) }
+                                 -> std::same_as<std::expected<T, std::string>>;
+                         }) {
+        return cli_parse(sv, std::type_identity<T>{});
+    } else if constexpr (CustomParsable<T>
+                         && requires(DependentStringView<T> raw) {
+                                { cli_parse(raw) }
+                                    -> std::same_as<std::expected<T, std::string>>;
+                            }) {
+        return cli_parse(DependentStringView<T>{sv});
     } else {
-        // Extensibility hook: if your type defines
-        //   std::expected<T, std::string> cli_parse(std::string_view)
-        // in its namespace, ADL will find it here.
-        return std::unexpected(
-            std::format("no parser registered for this type; value was '{}'", sv));
+        static_assert(sizeof(T) == 0,
+            "Type T is not supported out-of-the-box by cli::from_string<T>. "
+            "Define `std::expected<T, std::string> cli_parse(std::string_view, std::type_identity<T>)` "
+            "or `cli_parse(std::string_view)` in T's namespace.");
     }
 }
+
+// ────────────────────────────────────────────────────────────────────────────
+// §2.5  Registration validation & O(1) option-name index
+// ────────────────────────────────────────────────────────────────────────────
+
+struct OptionBase;
+
+// Transparent hash so the index can be queried with a string_view without
+// allocating a temporary std::string on the hot parse path.
+struct StringHash {
+    using is_transparent = void;
+
+    [[nodiscard]] size_t operator()(std::string_view s) const noexcept {
+        return std::hash<std::string_view>{}(s);
+    }
+    [[nodiscard]] size_t operator()(const std::string& s) const noexcept {
+        return operator()(std::string_view(s));
+    }
+};
+
+inline void validate_option_name(std::string_view name) {
+    if (name.size() < 2 || name.front() != '-')
+        throw std::invalid_argument(
+            std::format("cli: option name '{}' must start with '-'", name));
+    if (name == "--" || name == "-")
+        throw std::invalid_argument(
+            std::format("cli: '{}' is reserved and cannot be used as an option name", name));
+    if (name.starts_with("---"))
+        throw std::invalid_argument(
+            std::format("cli: option name '{}' has too many leading dashes", name));
+    if (name.find('=') != std::string_view::npos)
+        throw std::invalid_argument(
+            std::format("cli: option name '{}' must not contain '='", name));
+    for (char c : name) {
+        const auto u = static_cast<unsigned char>(c);
+        if (std::isspace(u) != 0 || std::iscntrl(u) != 0)
+            throw std::invalid_argument(
+                std::format("cli: option name '{}' must not contain whitespace or control characters", name));
+    }
+}
+
+inline void validate_command_name(std::string_view name) {
+    if (name.empty())
+        throw std::invalid_argument("cli: command name must not be empty");
+    if (name.front() == '-')
+        throw std::invalid_argument(
+            std::format("cli: command name '{}' must not start with '-'", name));
+    for (char c : name) {
+        const auto u = static_cast<unsigned char>(c);
+        if (std::isspace(u) != 0 || std::iscntrl(u) != 0)
+            throw std::invalid_argument(
+                std::format("cli: command name '{}' must not contain whitespace or control characters", name));
+    }
+}
+
+inline void validate_positional_name(std::string_view name) {
+    if (name.empty())
+        throw std::invalid_argument("cli: positional name must not be empty");
+    for (char c : name) {
+        const auto u = static_cast<unsigned char>(c);
+        if (std::isspace(u) != 0 || std::iscntrl(u) != 0)
+            throw std::invalid_argument(
+                std::format("cli: positional name '{}' must not contain whitespace or control characters", name));
+    }
+}
+
+inline void validate_env_name(std::string_view name) {
+    if (name.empty())
+        throw std::invalid_argument("cli: environment variable name must not be empty");
+    if (name.find('=') != std::string_view::npos)
+        throw std::invalid_argument(
+            std::format("cli: environment variable name '{}' must not contain '='", name));
+    if (name.find('\0') != std::string_view::npos)
+        throw std::invalid_argument(
+            "cli: environment variable name must not contain a NUL byte");
+}
+
+// Owned-key hash map: registration is cold, lookup is hot.  Copying the name
+// keeps keys valid even if an option's `names` vector reallocates later.
+struct OptionRegistry {
+    std::unordered_map<std::string, OptionBase*, StringHash, std::equal_to<>> by_name;
+
+    [[nodiscard]] OptionBase* find(std::string_view name) const noexcept {
+        const auto it = by_name.find(name);
+        return it == by_name.end() ? nullptr : it->second;
+    }
+
+    void ensure_available(std::string_view name) const {
+        if (find(name) != nullptr)
+            throw std::invalid_argument(
+                std::format("cli: duplicate option name '{}'", name));
+    }
+
+    void add(OptionBase* option, std::string_view name) {
+        const auto [it, inserted] = by_name.try_emplace(std::string(name), option);
+        (void)it;
+        if (!inserted)
+            throw std::invalid_argument(
+                std::format("cli: duplicate option name '{}'", name));
+    }
+
+    void remove(OptionBase* option) {
+        for (auto it = by_name.begin(); it != by_name.end();) {
+            if (it->second == option) it = by_name.erase(it);
+            else ++it;
+        }
+    }
+};
 
 // ────────────────────────────────────────────────────────────────────────────
 // §3  OptionBase — internal polymorphic option node
 // ────────────────────────────────────────────────────────────────────────────
 
 struct OptionBase {
-    std::vector<std::string> names;      // e.g. ["-v", "--verbose"]
+    std::vector<std::string> names;
     std::string              help_text;
-    std::string              meta;       // placeholder shown as <META>
+    std::string              meta;
     std::string              env_var;
     bool                     required_  = false;
     bool                     is_flag_   = false;
     bool                     is_set_    = false;
+    bool                     from_env_  = false;
     bool                     hidden_    = false;
-    std::string              section_;    // optional help-group name
-    bool                     negatable_ = false; // accept --no-FLAG to set false
+    std::string              section_;
+    bool                     negatable_ = false;
+    char                     delimiter_ = '\0';
+    bool                     has_default_        = false;
+    bool                     needs_finalize_     = false;
+    OptionRegistry*          registry_   = nullptr;
 
-    virtual ~OptionBase()              = default;
-    virtual void        finalize_value()                                    {}
-    virtual bool        has_value()    const                              = 0;
-    virtual ParseResult parse(std::string_view val, std::string_view opt_name) = 0;
-    virtual bool        has_default()  const = 0;
-    virtual void        apply_default()      = 0;
-    virtual std::string default_str()  const = 0;
-    virtual std::string choices_str()  const = 0;
-    virtual bool        is_multi()          const = 0;
-    virtual bool        is_count_option()   const noexcept { return false; }
-    virtual void        reset() { is_set_ = false; }
+    virtual ~OptionBase() = default;
+    virtual ParseResult parse(std::string_view val, std::string_view opt_name, const App* app) = 0;
+    virtual ParseResult parse_env(std::string_view val, const App* app) = 0;
+    // Fast path for an occurrence with no explicit value (`-v`, `--flag`).
+    // Count options override this to increment; bool flags avoid formatting
+    // and re-parsing the literal "true" on every token.
+    virtual ParseResult set_implicit(const App* app) {
+        return parse("true", display_name(), app);
+    }
+    virtual ParseResult set_negated(const App* app) {
+        return parse("false", display_name(), app);
+    }
+    virtual ParseResult validate_and_finalize(const App* app) = 0;
+    virtual bool        has_value()        const noexcept = 0;
+    virtual bool        has_default()      const noexcept = 0;
+    virtual void        apply_default()                   = 0;
+    virtual std::string default_str()      const          = 0;
+    virtual std::string choices_str()      const          = 0;
+    virtual bool        is_multi()         const noexcept = 0;
+    virtual bool        is_count_option()  const noexcept { return false; }
+    virtual const void* type_id()          const noexcept = 0;
+    virtual void        reset() noexcept { is_set_ = false; from_env_ = false; }
 
     [[nodiscard]] bool matches(std::string_view t) const noexcept {
-        return std::ranges::any_of(names, [t](const auto& n){ return n == t; });
+        return std::ranges::any_of(names, [t](const auto& n) { return n == t; });
     }
     [[nodiscard]] std::string_view short_name() const noexcept {
-        for (auto& n : names)
+        for (const auto& n : names)
             if (n.size() >= 2 && n[0] == '-' && n[1] != '-') return n;
         return {};
     }
     [[nodiscard]] std::string_view long_name() const noexcept {
-        for (auto& n : names)
+        for (const auto& n : names)
             if (n.size() >= 3 && n[0] == '-' && n[1] == '-') return n;
         return {};
     }
@@ -371,13 +625,27 @@ struct OptionBase {
     }
 };
 
+inline void append_option_name(OptionBase* option, std::string_view name) {
+    validate_option_name(name);
+    option->registry_->ensure_available(name);
+    option->names.emplace_back(name);
+    option->registry_->add(option, name);
+}
+
+inline void prepend_option_name(OptionBase* option, std::string_view name) {
+    validate_option_name(name);
+    option->registry_->ensure_available(name);
+    option->names.insert(option->names.begin(), std::string(name));
+    option->registry_->add(option, name);
+}
+
 // ────────────────────────────────────────────────────────────────────────────
 // §4  OptionImpl<T> — typed implementation of OptionBase
 // ────────────────────────────────────────────────────────────────────────────
 
 template<typename T>
 struct OptionImpl final : OptionBase {
-    using E = elem_of_t<T>;             // element type (= T when T is not vector)
+    using E = elem_of_t<T>;
 
     std::optional<T>              value;
     std::optional<T>              default_;
@@ -386,134 +654,189 @@ struct OptionImpl final : OptionBase {
     std::function<bool(const T&)> validator_;
     std::string                   validator_desc;
     std::function<T(T)>           transform_;
+    bool                          needs_check_ = false;
 
-    void finalize_value() override {
-        if (transform_ && value) value = transform_(*value);
-    }
-
-    void reset() override {
+    void reset() noexcept override {
         OptionBase::reset();
         value.reset();
+        needs_check_ = false;
     }
 
-    ParseResult parse(std::string_view sv, std::string_view opt) override {
+    ParseResult parse_one(std::string_view sv, std::string_view opt, const App* app) {
         if constexpr (is_vec_v<T>) {
-            // Multi-value: accumulate each token into the vector
             auto e = from_string<E>(sv);
-            if (!e) return std::unexpected(ParseError::invalid(opt, sv, e.error()));
-            if (range_ && (*e < range_->first || *e > range_->second))
-                return std::unexpected(ParseError::out_of_range(
-                    opt, sv, to_display(range_->first), to_display(range_->second)));
-            if (choices_ && !std::ranges::contains(*choices_, *e))
-                return std::unexpected(ParseError::bad_choice(opt, sv, fmt_choices()));
+            if (!e) return std::unexpected(ParseError::invalid(opt, sv, e.error(), app));
+            if (auto r = check_one(*e, opt, sv, app); !r) return r;
             if (!value) value = T{};
             value->push_back(std::move(*e));
         } else {
             auto r = from_string<T>(sv);
-            if (!r) return std::unexpected(ParseError::invalid(opt, sv, r.error()));
-            if (range_ && (*r < range_->first || *r > range_->second))
-                return std::unexpected(ParseError::out_of_range(
-                    opt, sv, to_display(range_->first), to_display(range_->second)));
-            if (choices_ && !std::ranges::contains(*choices_, *r))
-                return std::unexpected(ParseError::bad_choice(opt, sv, fmt_choices()));
+            if (!r) return std::unexpected(ParseError::invalid(opt, sv, r.error(), app));
+            if (auto c = check_one(*r, opt, sv, app); !c) return c;
             value = std::move(*r);
         }
-        is_set_ = true;
-        if (validator_ && !validator_(*value))
-            return std::unexpected(ParseError::validation(opt, validator_desc));
         return {};
     }
 
-    bool        has_default()  const override { return default_.has_value(); }
-    bool        has_value()    const override { return value.has_value(); }
-    void        apply_default()       override { if (default_) value = *default_; }
-    bool        is_multi()     const override { return is_vec_v<T>; }
+    ParseResult parse(std::string_view sv, std::string_view opt, const App* app) override {
+        if constexpr (is_vec_v<T>) {
+            if (delimiter_ != '\0') {
+                size_t start = 0;
+                while (start <= sv.size()) {
+                    const auto pos = sv.find(delimiter_, start);
+                    const auto tok = (pos == std::string_view::npos)
+                        ? sv.substr(start)
+                        : sv.substr(start, pos - start);
+                    if (auto r = parse_one(tok, opt, app); !r) return r;
+                    if (pos == std::string_view::npos) break;
+                    start = pos + 1;
+                }
+                is_set_ = true;
+                return {};
+            }
+        }
+        if (auto r = parse_one(sv, opt, app); !r) return r;
+        is_set_ = true;
+        return {};
+    }
+
+    ParseResult set_implicit(const App* app) override {
+        if constexpr (std::is_same_v<T, bool>) {
+            // Fast path only when there is no constraint to check.  A boolean
+            // can legitimately carry .range()/.choices(), and those must keep
+            // producing the same diagnostics as an explicit `--flag=true`.
+            if (!range_ && !choices_) {
+                value     = true;
+                is_set_   = true;
+                return {};
+            }
+        }
+        return OptionBase::set_implicit(app);
+    }
+
+    ParseResult set_negated(const App* app) override {
+        if constexpr (std::is_same_v<T, bool>) {
+            if (!range_ && !choices_) {
+                value     = false;
+                is_set_   = true;
+                return {};
+            }
+        }
+        return OptionBase::set_negated(app);
+    }
+
+    ParseResult parse_env(std::string_view sv, const App* app) override {
+        const char delim = (delimiter_ != '\0') ? delimiter_ : ',';
+        if constexpr (is_vec_v<T>) {
+            // An empty environment variable means "no values" for a vector.
+            // This keeps `TAGS=` from inventing a single empty tag, while a
+            // scalar string still treats the empty value as a real value.
+            if (sv.empty()) {
+                value     = T{};
+                from_env_ = true;
+                return {};
+            }
+            size_t start = 0;
+            while (start <= sv.size()) {
+                const auto pos = sv.find(delim, start);
+                const auto tok = (pos == std::string_view::npos)
+                    ? sv.substr(start)
+                    : sv.substr(start, pos - start);
+                if (auto r = parse_one(tok, env_var, app); !r) return r;
+                if (pos == std::string_view::npos) break;
+                start = pos + 1;
+            }
+        } else {
+            if (auto r = parse_one(sv, env_var, app); !r) return r;
+        }
+        from_env_ = true;
+        return {};
+    }
+
+    ParseResult validate_and_finalize(const App* app) override {
+        // Values parsed from the command line or environment were already
+        // checked element-by-element by parse_one().  Only defaults bypass that
+        // path, so avoid re-formatting and re-checking every hot-path value.
+        if (needs_check_) {
+            needs_check_ = false;
+            if (value && (range_ || choices_)) {
+                if constexpr (is_vec_v<T>) {
+                    for (const auto& e : *value)
+                        if (auto r = check_one(e, display_name(), to_display(e), app); !r) return r;
+                } else {
+                    if (auto r = check_one(*value, display_name(), to_display(*value), app); !r) return r;
+                }
+            }
+        }
+        if (validator_ && value && !validator_(*value))
+            return std::unexpected(ParseError::validation(display_name(), validator_desc, app));
+        if (transform_ && value)
+            value = transform_(std::move(*value));
+        return {};
+    }
+
+    bool has_default() const noexcept override { return default_.has_value(); }
+    bool has_value()   const noexcept override { return value.has_value(); }
+    void apply_default() override {
+        if (default_) {
+            value = *default_;
+            needs_check_ = true;
+        }
+    }
+    bool is_multi()    const noexcept override { return is_vec_v<T>; }
+    const void* type_id() const noexcept override { return &type_token<T>; }
 
     std::string default_str() const override {
         if (!default_) return {};
-        if constexpr (is_vec_v<T>) {
-            std::string s;
-            for (auto& e : *default_) { if (!s.empty()) s += ", "; s += to_display(e); }
-            return "[" + s + "]";
-        } else {
-            return to_display(*default_);
+        if constexpr (std::is_same_v<T, bool>) {
+            // Only show [default: true] on flags when default is true
+            if (is_flag_)
+                return *default_ ? "true" : std::string{};
         }
+        return to_display(*default_);
     }
 
     std::string choices_str() const override { return fmt_choices(); }
 
 private:
-    [[nodiscard]] std::string fmt_choices() const {
-        if (!choices_) return {};
-        std::string s;
-        for (const auto c : *choices_) { if (!s.empty()) s += "|"; s += to_display(c); }
-        return s;
-    }
-};
-
-// ────────────────────────────────────────────────────────────────────────────
-// §5  PositionalBase / PositionalImpl<T>
-// ────────────────────────────────────────────────────────────────────────────
-
-struct PositionalBase {
-    std::string name;
-    std::string help_text;
-    bool        required_ = true;
-    bool        is_set_   = false;
-    bool        variadic_ = false;   // true when T is vector or user sets it
-
-    virtual ~PositionalBase()                  = default;
-    virtual void        finalize_value()            {}
-    virtual ParseResult parse(std::string_view v) = 0;
-    virtual bool        has_default()  const      = 0;
-    virtual void        apply_default()            = 0;
-    virtual std::string default_str()  const      = 0;
-    virtual void        reset() { is_set_ = false; }
-};
-
-template<typename T>
-struct PositionalImpl final : PositionalBase {
-    using E = elem_of_t<T>;
-
-    std::optional<T>    value;
-    std::optional<T>    default_;
-    std::function<T(T)> transform_;
-
-    void finalize_value() override {
-        if (transform_ && value) value = transform_(*value);
-    }
-
-    ParseResult parse(std::string_view sv) override {
-        if constexpr (is_vec_v<T>) {
-            auto e = from_string<E>(sv);
-            if (!e) return std::unexpected(ParseError{
-                ParseError::Kind::InvalidValue,
-                std::format("invalid value '{}' for <{}>: {}", sv, name, e.error()) });
-            if (!value) value = T{};
-            value->push_back(std::move(*e));
-        } else {
-            auto r = from_string<T>(sv);
-            if (!r) return std::unexpected(ParseError{
-                ParseError::Kind::InvalidValue,
-                std::format("invalid value '{}' for <{}>: {}", sv, name, r.error()) });
-            value = std::move(*r);
+    ParseResult check_one(const E& e, std::string_view opt,
+                          std::string_view shown, const App* app) const {
+        if (range_) {
+            if constexpr (requires(const E& a, const E& b) {
+                              { a < b } -> std::convertible_to<bool>;
+                          }) {
+                // NaN compares false against every bound, so check it first.
+                // `hi < e` (rather than `e > hi`) supports ordered types that
+                // only define operator<.
+                if constexpr (std::is_floating_point_v<E>) {
+                    if (e != e)
+                        return std::unexpected(ParseError::out_of_range(
+                            opt, shown, to_display(range_->first), to_display(range_->second), app));
+                }
+                if (e < range_->first || range_->second < e)
+                    return std::unexpected(ParseError::out_of_range(
+                        opt, shown, to_display(range_->first), to_display(range_->second), app));
+            }
         }
-        is_set_ = true;
+        if (choices_) {
+            if constexpr (std::equality_comparable<E>) {
+                if (!std::ranges::contains(*choices_, e))
+                    return std::unexpected(ParseError::bad_choice(opt, shown, fmt_choices(), app));
+            }
+        }
         return {};
     }
 
-    bool        has_default()  const override { return default_.has_value(); }
-    void        apply_default()       override { if (default_) value = *default_; }
-    void        reset()               override { PositionalBase::reset(); value.reset(); }
-    std::string default_str()  const override {
-        if (!default_) return {};
-        if constexpr (is_vec_v<T>) {
-            std::string s;
-            for (auto& e : *default_) { if (!s.empty()) s += ", "; s += to_display(e); }
-            return s;
-        } else {
-            return to_display(*default_);
+    [[nodiscard]] std::string fmt_choices() const {
+        if (!choices_) return {};
+        std::string s;
+        bool first = true;
+        for (const auto& c : *choices_) {
+            if (!first) s += "|";
+            first = false;
+            s += to_display(c);
         }
+        return s;
     }
 };
 
@@ -522,29 +845,227 @@ struct PositionalImpl final : PositionalBase {
 struct CountImpl final : OptionBase {
     unsigned count_ = 0;
 
-    ParseResult parse(std::string_view, std::string_view) override {
+    ParseResult parse(std::string_view, std::string_view, const App*) override {
         ++count_;
         is_set_ = true;
         return {};
     }
-    bool        has_default()       const override { return false; }
-    bool        has_value()         const override { return count_ > 0; }
-    void        apply_default()           override {}
-    std::string default_str()       const override { return {}; }
-    std::string choices_str()       const override { return "count"; }
-    bool        is_multi()          const override { return false; }
-    bool        is_count_option()   const noexcept override { return true; }
-    void        reset()                   override { OptionBase::reset(); count_ = 0; }
+    ParseResult set_implicit(const App*) override {
+        ++count_;
+        is_set_ = true;
+        return {};
+    }
+    ParseResult parse_env(std::string_view sv, const App* app) override {
+        auto r = from_string<unsigned>(sv);
+        if (!r) return std::unexpected(ParseError::invalid(env_var, sv, r.error(), app));
+        count_    = *r;
+        from_env_ = true;
+        return {};
+    }
+    ParseResult validate_and_finalize(const App*) override { return {}; }
+    bool        has_default()      const noexcept override { return false; }
+    bool        has_value()        const noexcept override { return count_ > 0 || is_set_ || from_env_; }
+    void        apply_default()                   override {}
+    std::string default_str()      const          override { return {}; }
+    std::string choices_str()      const          override { return "count"; }
+    bool        is_multi()         const noexcept override { return false; }
+    bool        is_count_option()  const noexcept override { return true; }
+    const void* type_id()          const noexcept override { return &type_token<CountImpl>; }
+    void        reset()            noexcept       override { OptionBase::reset(); count_ = 0; }
+};
+
+// ────────────────────────────────────────────────────────────────────────────
+// §5  PositionalBase / PositionalImpl<T>
+// ────────────────────────────────────────────────────────────────────────────
+
+struct PositionalBase {
+    std::string name;
+    std::string label; // pre-rendered "<name>" for diagnostics
+    std::string help_text;
+    std::string env_var;
+    bool        required_ = true;
+    bool        is_set_   = false;
+    bool        from_env_ = false;
+    bool        variadic_ = false;
+    char        delimiter_ = '\0';
+    bool        has_default_     = false;
+    bool        needs_finalize_  = false;
+
+    virtual ~PositionalBase() = default;
+    virtual ParseResult parse(std::string_view v, const App* app)     = 0;
+    virtual ParseResult parse_env(std::string_view v, const App* app) = 0;
+    virtual ParseResult validate_and_finalize(const App* app)         = 0;
+    virtual bool        has_default() const noexcept                  = 0;
+    virtual void        apply_default()                               = 0;
+    virtual std::string default_str() const                           = 0;
+    virtual std::string choices_str() const                           = 0;
+    virtual void        reset() noexcept { is_set_ = false; from_env_ = false; }
+};
+
+template<typename T>
+struct PositionalImpl final : PositionalBase {
+    using E = elem_of_t<T>;
+
+    std::optional<T>              value;
+    std::optional<T>              default_;
+    std::optional<std::pair<E,E>> range_;
+    std::optional<std::vector<E>> choices_;
+    std::function<bool(const T&)> validator_;
+    std::string                   validator_desc;
+    std::function<T(T)>           transform_;
+    bool                          needs_check_ = false;
+
+    ParseResult parse_one(std::string_view sv, std::string_view error_label,
+                          const App* app) {
+        if constexpr (is_vec_v<T>) {
+            auto e = from_string<E>(sv);
+            if (!e) return std::unexpected(ParseError::invalid(error_label, sv, e.error(), app));
+            if (auto r = check_one(*e, error_label, sv, app); !r) return r;
+            if (!value) value = T{};
+            value->push_back(std::move(*e));
+        } else {
+            auto r = from_string<T>(sv);
+            if (!r) return std::unexpected(ParseError::invalid(error_label, sv, r.error(), app));
+            if (auto c = check_one(*r, error_label, sv, app); !c) return c;
+            value = std::move(*r);
+        }
+        return {};
+    }
+
+    ParseResult parse(std::string_view sv, const App* app) override {
+        if constexpr (is_vec_v<T>) {
+            if (delimiter_ != '\0') {
+                size_t start = 0;
+                while (start <= sv.size()) {
+                    const auto pos = sv.find(delimiter_, start);
+                    const auto tok = (pos == std::string_view::npos)
+                        ? sv.substr(start)
+                        : sv.substr(start, pos - start);
+                    if (auto r = parse_one(tok, label, app); !r) return r;
+                    if (pos == std::string_view::npos) break;
+                    start = pos + 1;
+                }
+                is_set_ = true;
+                return {};
+            }
+        }
+        if (auto r = parse_one(sv, label, app); !r) return r;
+        is_set_ = true;
+        return {};
+    }
+
+    ParseResult parse_env(std::string_view sv, const App* app) override {
+        const auto& env_label = env_var;
+        if constexpr (is_vec_v<T>) {
+            if (sv.empty()) {
+                value     = T{};
+                from_env_ = true;
+                return {};
+            }
+            const char delim = (delimiter_ != '\0') ? delimiter_ : ',';
+            size_t start = 0;
+            while (start <= sv.size()) {
+                const auto pos = sv.find(delim, start);
+                const auto tok = (pos == std::string_view::npos)
+                    ? sv.substr(start)
+                    : sv.substr(start, pos - start);
+                if (auto r = parse_one(tok, env_label, app); !r) return r;
+                if (pos == std::string_view::npos) break;
+                start = pos + 1;
+            }
+        } else {
+            if (auto r = parse_one(sv, env_label, app); !r) return r;
+        }
+        from_env_ = true;
+        return {};
+    }
+
+    ParseResult validate_and_finalize(const App* app) override {
+        // CLI and environment values were already checked in parse_one();
+        // only defaults need a second pass.
+        if (needs_check_) {
+            needs_check_ = false;
+            if (value && (range_ || choices_)) {
+                if constexpr (is_vec_v<T>) {
+                    for (const auto& e : *value)
+                        if (auto r = check_one(e, label, to_display(e), app); !r) return r;
+                } else {
+                    if (auto r = check_one(*value, label, to_display(*value), app); !r) return r;
+                }
+            }
+        }
+        if (validator_ && value && !validator_(*value))
+            return std::unexpected(ParseError::validation(label, validator_desc, app));
+        if (transform_ && value)
+            value = transform_(std::move(*value));
+        return {};
+    }
+
+    bool has_default() const noexcept override { return default_.has_value(); }
+    void apply_default() override {
+        if (default_) {
+            value = *default_;
+            needs_check_ = true;
+        }
+    }
+    void reset() noexcept override {
+        PositionalBase::reset();
+        value.reset();
+        needs_check_ = false;
+    }
+
+    std::string default_str() const override {
+        if (!default_) return {};
+        return to_display(*default_);
+    }
+
+    std::string choices_str() const override { return fmt_choices(); }
+
+private:
+    ParseResult check_one(const E& e, std::string_view error_label,
+                          std::string_view shown, const App* app) const {
+        if (range_) {
+            if constexpr (requires(const E& a, const E& b) {
+                              { a < b } -> std::convertible_to<bool>;
+                          }) {
+                // See OptionImpl::check_one: reject NaN and compare with `<`
+                // only so ordered user types need no operator>.
+                if constexpr (std::is_floating_point_v<E>) {
+                    if (e != e)
+                        return std::unexpected(ParseError::out_of_range(
+                            error_label, shown, to_display(range_->first), to_display(range_->second), app));
+                }
+                if (e < range_->first || range_->second < e)
+                    return std::unexpected(ParseError::out_of_range(
+                        error_label, shown, to_display(range_->first), to_display(range_->second), app));
+            }
+        }
+        if (choices_) {
+            if constexpr (std::equality_comparable<E>) {
+                if (!std::ranges::contains(*choices_, e))
+                    return std::unexpected(ParseError::bad_choice(error_label, shown, fmt_choices(), app));
+            }
+        }
+        return {};
+    }
+
+    [[nodiscard]] std::string fmt_choices() const {
+        if (!choices_) return {};
+        std::string s;
+        bool first = true;
+        for (const auto& c : *choices_) {
+            if (!first) s += "|";
+            first = false;
+            s += to_display(c);
+        }
+        return s;
+    }
 };
 
 } // namespace detail
 
 // ────────────────────────────────────────────────────────────────────────────
-// §6  Option<T>  — the user-facing typed option handle
-//
-//  Provides a rich fluent builder and ergonomic value access.
-//  Internally it is a pointer wrapper around detail::OptionImpl<T>.
-//  The App owns the OptionImpl; Option<T> is cheap to copy.
+// §6  Option<T> — user-facing typed option handle
 // ────────────────────────────────────────────────────────────────────────────
 
 template<typename T>
@@ -554,81 +1075,127 @@ class [[nodiscard]] Option {
 public:
     explicit Option(detail::OptionImpl<T>* p) noexcept : p_(p) {}
 
-    // ── Fluent builder ────────────────────────────────────────────────────
-
-    /// Set a default value — accepts anything implicitly convertible to T.
-    /// e.g. default_val("info") works for Option<std::string> without a cast.
-    auto&& default_val(this auto&& self, std::convertible_to<T> auto&& v)
-        { self.p_->default_ = T(std::forward<decltype(v)>(v)); return std::forward<decltype(self)>(self); }
-
-    /// Register a short-form alias (e.g. "-o") for this option
-    auto&& short_name(this auto&& self, std::string_view s) {
-        self.p_->names.insert(self.p_->names.begin(), std::string(s));
+    template<typename V>
+    auto&& default_val(this auto&& self, V&& v)
+        requires std::constructible_from<T, V&&>
+              && (!std::same_as<std::remove_cvref_t<V>, std::nullptr_t>) {
+        self.p_->default_ = T(std::forward<V>(v));
+        self.p_->has_default_ = true;
+        if (self.p_->range_ || self.p_->choices_)
+            self.p_->needs_finalize_ = true;
         return std::forward<decltype(self)>(self);
     }
 
-    /// Set / override the help description
-    auto&& help(this auto&& self, std::string_view h)
-        { self.p_->help_text = std::string(h); return std::forward<decltype(self)>(self); }
+    auto&& default_val(this auto&& self,
+                       std::initializer_list<detail::elem_of_t<T>> values)
+        requires detail::is_vec_v<T> {
+        self.p_->default_ = T(values.begin(), values.end());
+        self.p_->has_default_ = true;
+        if (self.p_->range_ || self.p_->choices_)
+            self.p_->needs_finalize_ = true;
+        return std::forward<decltype(self)>(self);
+    }
 
-    /// Mark the option as mandatory
-    auto&& required(this auto&& self, bool r = true)
-        { self.p_->required_ = r; return std::forward<decltype(self)>(self); }
+    auto&& short_name(this auto&& self, std::string_view s) {
+        detail::prepend_option_name(self.p_, s);
+        return std::forward<decltype(self)>(self);
+    }
 
-    /// Hide from help output
-    auto&& hidden(this auto&& self, bool h = true)
-        { self.p_->hidden_ = h; return std::forward<decltype(self)>(self); }
+    auto&& help(this auto&& self, std::string_view h) {
+        self.p_->help_text = std::string(h);
+        return std::forward<decltype(self)>(self);
+    }
 
-    /// Fall back to an environment variable when the option is absent
-    auto&& env(this auto&& self, std::string_view var)
-        { self.p_->env_var = std::string(var); return std::forward<decltype(self)>(self); }
+    auto&& required(this auto&& self, bool r = true) {
+        self.p_->required_ = r;
+        return std::forward<decltype(self)>(self);
+    }
 
-    /// Override the <META> placeholder shown in help (e.g. "DIR", "URL")
-    auto&& meta(this auto&& self, std::string_view m)
-        { self.p_->meta = std::string(m); return std::forward<decltype(self)>(self); }
+    auto&& hidden(this auto&& self, bool h = true) {
+        self.p_->hidden_ = h;
+        return std::forward<decltype(self)>(self);
+    }
 
-    /// Reject values outside [lo, hi] (inclusive)
-    auto&& range(this auto&& self, detail::elem_of_t<T> lo, detail::elem_of_t<T> hi)
-        { self.p_->range_ = { std::move(lo), std::move(hi) }; return std::forward<decltype(self)>(self); }
+    auto&& env(this auto&& self, std::string_view var) {
+        detail::validate_env_name(var);
+        self.p_->env_var = std::string(var);
+        return std::forward<decltype(self)>(self);
+    }
 
-    /// Restrict to an explicit set of allowed values
-    auto&& choices(this auto&& self, std::initializer_list<detail::elem_of_t<T>> c)
-        { self.p_->choices_ = std::vector<detail::elem_of_t<T>>(c); return std::forward<decltype(self)>(self); }
+    auto&& meta(this auto&& self, std::string_view m) {
+        self.p_->meta = std::string(m);
+        return std::forward<decltype(self)>(self);
+    }
 
-    /// Attach an arbitrary predicate validator
+    auto&& delimiter(this auto&& self, char d) requires detail::is_vec_v<T> {
+        self.p_->delimiter_ = d;
+        return std::forward<decltype(self)>(self);
+    }
+
+    auto&& range(this auto&& self, detail::elem_of_t<T> lo, detail::elem_of_t<T> hi) {
+        static_assert(requires(const detail::elem_of_t<T>& a, const detail::elem_of_t<T>& b) {
+                          { a < b } -> std::convertible_to<bool>;
+                          { b < a } -> std::convertible_to<bool>;
+                      },
+                      "range() requires an ordered element type");
+        if (hi < lo)
+            throw std::invalid_argument("cli: range lower bound exceeds upper bound");
+        self.p_->range_ = { std::move(lo), std::move(hi) };
+        if (self.p_->has_default_) self.p_->needs_finalize_ = true;
+        return std::forward<decltype(self)>(self);
+    }
+
+    auto&& choices(this auto&& self, std::initializer_list<detail::elem_of_t<T>> c) {
+        static_assert(std::equality_comparable<detail::elem_of_t<T>>,
+                      "choices() requires an equality-comparable element type");
+        if (c.size() == 0)
+            throw std::invalid_argument("cli: choices() requires at least one value");
+        self.p_->choices_ = std::vector<detail::elem_of_t<T>>(c);
+        if (self.p_->has_default_) self.p_->needs_finalize_ = true;
+        return std::forward<decltype(self)>(self);
+    }
+
     auto&& validate(this auto&& self,
                     std::function<bool(const T&)> fn,
                     std::string desc = "custom validation failed") {
-        self.p_->validator_      = std::move(fn);
-        self.p_->validator_desc  = std::move(desc);
+        self.p_->validator_     = std::move(fn);
+        self.p_->validator_desc = std::move(desc);
+        self.p_->needs_finalize_ = true;
         return std::forward<decltype(self)>(self);
     }
 
-    /// Apply a transformation to the parsed value (called after all constraints)
     auto&& transform(this auto&& self, std::function<T(T)> fn) {
         self.p_->transform_ = std::move(fn);
+        self.p_->needs_finalize_ = true;
         return std::forward<decltype(self)>(self);
     }
 
-    /// Assign this option to a named section in the help output
-    auto&& section(this auto&& self, std::string_view s)
-        { self.p_->section_ = std::string(s); return std::forward<decltype(self)>(self); }
-
-    // ── Value access ──────────────────────────────────────────────────────
+    auto&& section(this auto&& self, std::string_view s) {
+        self.p_->section_ = std::string(s);
+        return std::forward<decltype(self)>(self);
+    }
 
     [[nodiscard]] std::optional<T>&       get()       noexcept { return p_->value; }
     [[nodiscard]] const std::optional<T>& get() const noexcept { return p_->value; }
-    [[nodiscard]] const T&  operator*()  const { return *p_->value; }
+    [[nodiscard]] T&        operator*()       { return *p_->value; }
+    [[nodiscard]] const T&  operator*() const { return *p_->value; }
+    [[nodiscard]] T*        operator->()       { return &*p_->value; }
     [[nodiscard]] const T*  operator->() const { return &*p_->value; }
     [[nodiscard]] explicit operator bool() const noexcept { return p_->value.has_value(); }
     [[nodiscard]] bool is_set()   const noexcept { return p_->is_set_; }
-    [[nodiscard]] T    value()    const { return *p_->value; }  ///< assumes value present
-    [[nodiscard]] T    value_or(std::convertible_to<T> auto&& fallback) const
-        { return p_->value.value_or(T(std::forward<decltype(fallback)>(fallback))); }
+    [[nodiscard]] T&   value()       { return *p_->value; }
+    [[nodiscard]] T    value() const { return *p_->value; }
+    template<typename V>
+    [[nodiscard]] T value_or(V&& fallback) const
+        requires std::constructible_from<T, V&&>
+              && (!std::same_as<std::remove_cvref_t<V>, std::nullptr_t>) {
+        if (p_->value) return *p_->value;
+        return T(std::forward<V>(fallback));
+    }
 };
 
 // ────────────────────────────────────────────────────────────────────────────
-// §7  Flag — boolean switch with minimal footprint
+// §7  Flag — boolean switch
 // ────────────────────────────────────────────────────────────────────────────
 
 class [[nodiscard]] Flag {
@@ -637,29 +1204,43 @@ class [[nodiscard]] Flag {
 public:
     explicit Flag(detail::OptionImpl<bool>* p) noexcept : p_(p) {}
 
-    /// Register a short-form alias (e.g. "-v")
     auto&& short_name(this auto&& self, std::string_view s) {
-        self.p_->names.insert(self.p_->names.begin(), std::string(s));
+        detail::prepend_option_name(self.p_, s);
         return std::forward<decltype(self)>(self);
     }
-    /// Set / override the help description
-    auto&& help(this auto&& self, std::string_view h)
-        { self.p_->help_text = std::string(h); return std::forward<decltype(self)>(self); }
-    auto&& hidden(this auto&& self, bool h = true)
-        { self.p_->hidden_ = h; return std::forward<decltype(self)>(self); }
-    auto&& env(this auto&& self, std::string_view v)
-        { self.p_->env_var = std::string(v); return std::forward<decltype(self)>(self); }
+    auto&& help(this auto&& self, std::string_view h) {
+        self.p_->help_text = std::string(h);
+        return std::forward<decltype(self)>(self);
+    }
+    auto&& hidden(this auto&& self, bool h = true) {
+        self.p_->hidden_ = h;
+        return std::forward<decltype(self)>(self);
+    }
+    auto&& env(this auto&& self, std::string_view v) {
+        detail::validate_env_name(v);
+        self.p_->env_var = std::string(v);
+        return std::forward<decltype(self)>(self);
+    }
+    auto&& section(this auto&& self, std::string_view s) {
+        self.p_->section_ = std::string(s);
+        return std::forward<decltype(self)>(self);
+    }
+    auto&& required(this auto&& self, bool r = true) {
+        self.p_->required_ = r;
+        return std::forward<decltype(self)>(self);
+    }
+    auto&& default_val(this auto&& self, bool d) {
+        self.p_->default_ = d;
+        self.p_->has_default_ = true;
+        return std::forward<decltype(self)>(self);
+    }
+    auto&& negatable(this auto&& self, bool n = true) {
+        self.p_->negatable_ = n;
+        return std::forward<decltype(self)>(self);
+    }
 
-    /// Assign this flag to a named section in the help output
-    auto&& section(this auto&& self, std::string_view s)
-        { self.p_->section_ = std::string(s); return std::forward<decltype(self)>(self); }
-
-    /// Also accept --no-FLAG on the command line (sets the flag to false)
-    auto&& negatable(this auto&& self, bool n = true)
-        { self.p_->negatable_ = n; return std::forward<decltype(self)>(self); }
-
-    [[nodiscard]] bool operator*()         const noexcept { return p_->value.value_or(false); }
-    [[nodiscard]] explicit operator bool() const noexcept { return p_->value.value_or(false); }
+    [[nodiscard]] bool operator*()         const noexcept { return p_->value.value_or(p_->default_.value_or(false)); }
+    [[nodiscard]] explicit operator bool() const noexcept { return **this; }
     [[nodiscard]] bool is_set()            const noexcept { return p_->is_set_; }
 };
 
@@ -674,25 +1255,39 @@ public:
     explicit Count(detail::CountImpl* p) noexcept : p_(p) {}
 
     auto&& short_name(this auto&& self, std::string_view s) {
-        self.p_->names.insert(self.p_->names.begin(), std::string(s));
+        detail::prepend_option_name(self.p_, s);
         return std::forward<decltype(self)>(self);
     }
-    auto&& help(this auto&& self, std::string_view h)
-        { self.p_->help_text = std::string(h); return std::forward<decltype(self)>(self); }
-    auto&& hidden(this auto&& self, bool h = true)
-        { self.p_->hidden_ = h; return std::forward<decltype(self)>(self); }
-    auto&& section(this auto&& self, std::string_view s)
-        { self.p_->section_ = std::string(s); return std::forward<decltype(self)>(self); }
+    auto&& help(this auto&& self, std::string_view h) {
+        self.p_->help_text = std::string(h);
+        return std::forward<decltype(self)>(self);
+    }
+    auto&& hidden(this auto&& self, bool h = true) {
+        self.p_->hidden_ = h;
+        return std::forward<decltype(self)>(self);
+    }
+    auto&& env(this auto&& self, std::string_view v) {
+        detail::validate_env_name(v);
+        self.p_->env_var = std::string(v);
+        return std::forward<decltype(self)>(self);
+    }
+    auto&& section(this auto&& self, std::string_view s) {
+        self.p_->section_ = std::string(s);
+        return std::forward<decltype(self)>(self);
+    }
+    auto&& required(this auto&& self, bool r = true) {
+        self.p_->required_ = r;
+        return std::forward<decltype(self)>(self);
+    }
 
-    [[nodiscard]] unsigned     operator*()            const noexcept { return p_->count_; }
-    [[nodiscard]] explicit operator bool()            const noexcept { return p_->count_ > 0; }
-    [[nodiscard]] bool         is_set()               const noexcept { return p_->is_set_; }
-    [[nodiscard]] unsigned     value_or(unsigned fallback) const noexcept
-        { return p_->is_set_ ? p_->count_ : fallback; }
+    [[nodiscard]] unsigned operator*()            const noexcept { return p_->count_; }
+    [[nodiscard]] explicit operator bool()        const noexcept { return p_->count_ > 0; }
+    [[nodiscard]] bool     is_set()               const noexcept { return p_->is_set_; }
+    [[nodiscard]] unsigned value_or(unsigned fb)  const noexcept { return (p_->is_set_ || p_->from_env_) ? p_->count_ : fb; }
 };
 
 // ────────────────────────────────────────────────────────────────────────────
-// §8  Positional<T> — positional (non-option) argument handle
+// §8  Positional<T> — positional argument handle
 // ────────────────────────────────────────────────────────────────────────────
 
 template<typename T>
@@ -702,171 +1297,243 @@ class [[nodiscard]] Positional {
 public:
     explicit Positional(detail::PositionalImpl<T>* p) noexcept : p_(p) {}
 
-    auto&& default_val(this auto&& self, std::convertible_to<T> auto&& v) {
-        self.p_->default_  = T(std::forward<decltype(v)>(v));
+    template<typename V>
+    auto&& default_val(this auto&& self, V&& v)
+        requires std::constructible_from<T, V&&>
+              && (!std::same_as<std::remove_cvref_t<V>, std::nullptr_t>) {
+        self.p_->default_  = T(std::forward<V>(v));
         self.p_->required_ = false;
+        self.p_->has_default_ = true;
+        if (self.p_->range_ || self.p_->choices_) self.p_->needs_finalize_ = true;
         return std::forward<decltype(self)>(self);
     }
-    /// Set / override the help description
-    auto&& help(this auto&& self, std::string_view h)
-        { self.p_->help_text = std::string(h); return std::forward<decltype(self)>(self); }
-    auto&& required(this auto&& self, bool r = true)
-        { self.p_->required_ = r; return std::forward<decltype(self)>(self); }
-
-    /// Apply a transformation to the parsed positional value
+    auto&& default_val(this auto&& self,
+                       std::initializer_list<detail::elem_of_t<T>> values)
+        requires detail::is_vec_v<T> {
+        self.p_->default_  = T(values.begin(), values.end());
+        self.p_->required_ = false;
+        self.p_->has_default_ = true;
+        if (self.p_->range_ || self.p_->choices_) self.p_->needs_finalize_ = true;
+        return std::forward<decltype(self)>(self);
+    }
+    auto&& help(this auto&& self, std::string_view h) {
+        self.p_->help_text = std::string(h);
+        return std::forward<decltype(self)>(self);
+    }
+    auto&& required(this auto&& self, bool r = true) {
+        self.p_->required_ = r;
+        return std::forward<decltype(self)>(self);
+    }
+    auto&& env(this auto&& self, std::string_view var) {
+        detail::validate_env_name(var);
+        self.p_->env_var = std::string(var);
+        return std::forward<decltype(self)>(self);
+    }
+    auto&& delimiter(this auto&& self, char d) requires detail::is_vec_v<T> {
+        self.p_->delimiter_ = d;
+        return std::forward<decltype(self)>(self);
+    }
+    auto&& range(this auto&& self, detail::elem_of_t<T> lo, detail::elem_of_t<T> hi) {
+        static_assert(requires(const detail::elem_of_t<T>& a, const detail::elem_of_t<T>& b) {
+                          { a < b } -> std::convertible_to<bool>;
+                          { b < a } -> std::convertible_to<bool>;
+                      },
+                      "range() requires an ordered element type");
+        if (hi < lo)
+            throw std::invalid_argument("cli: range lower bound exceeds upper bound");
+        self.p_->range_ = { std::move(lo), std::move(hi) };
+        if (self.p_->has_default_) self.p_->needs_finalize_ = true;
+        return std::forward<decltype(self)>(self);
+    }
+    auto&& choices(this auto&& self, std::initializer_list<detail::elem_of_t<T>> c) {
+        static_assert(std::equality_comparable<detail::elem_of_t<T>>,
+                      "choices() requires an equality-comparable element type");
+        if (c.size() == 0)
+            throw std::invalid_argument("cli: choices() requires at least one value");
+        self.p_->choices_ = std::vector<detail::elem_of_t<T>>(c);
+        if (self.p_->has_default_) self.p_->needs_finalize_ = true;
+        return std::forward<decltype(self)>(self);
+    }
+    auto&& validate(this auto&& self,
+                    std::function<bool(const T&)> fn,
+                    std::string desc = "custom validation failed") {
+        self.p_->validator_     = std::move(fn);
+        self.p_->validator_desc = std::move(desc);
+        self.p_->needs_finalize_ = true;
+        return std::forward<decltype(self)>(self);
+    }
     auto&& transform(this auto&& self, std::function<T(T)> fn) {
         self.p_->transform_ = std::move(fn);
+        self.p_->needs_finalize_ = true;
         return std::forward<decltype(self)>(self);
     }
 
     [[nodiscard]] std::optional<T>&       get()       noexcept { return p_->value; }
     [[nodiscard]] const std::optional<T>& get() const noexcept { return p_->value; }
-    [[nodiscard]] const T&  operator*()  const { return *p_->value; }
+    [[nodiscard]] T&        operator*()       { return *p_->value; }
+    [[nodiscard]] const T&  operator*() const { return *p_->value; }
+    [[nodiscard]] T*        operator->()       { return &*p_->value; }
     [[nodiscard]] const T*  operator->() const { return &*p_->value; }
     [[nodiscard]] explicit operator bool() const noexcept { return p_->value.has_value(); }
     [[nodiscard]] bool is_set()    const noexcept { return p_->is_set_; }
-    [[nodiscard]] T    value()     const { return *p_->value; }
-    [[nodiscard]] T    value_or(std::convertible_to<T> auto&& fallback) const
-        { return p_->value.value_or(T(std::forward<decltype(fallback)>(fallback))); }
+    [[nodiscard]] T&   value()       { return *p_->value; }
+    [[nodiscard]] T    value() const { return *p_->value; }
+    template<typename V>
+    [[nodiscard]] T value_or(V&& fallback) const
+        requires std::constructible_from<T, V&&>
+              && (!std::same_as<std::remove_cvref_t<V>, std::nullptr_t>) {
+        if (p_->value) return *p_->value;
+        return T(std::forward<V>(fallback));
+    }
 };
 
 // ────────────────────────────────────────────────────────────────────────────
-// §9  App — the main parser, subcommand node, and help renderer
+// §9  App — main parser, subcommand node, and help renderer
 // ────────────────────────────────────────────────────────────────────────────
 
 class App {
     std::string name_, desc_, version_, author_;
-    std::vector<std::string>                                examples_;
-    std::vector<std::unique_ptr<detail::OptionBase>>        options_;
-    std::vector<std::unique_ptr<detail::PositionalBase>>    positionals_;
-    std::vector<std::unique_ptr<App>>                       subcommands_;
+    std::vector<std::string>                             examples_;
+    detail::OptionRegistry                               registry_;
+    std::vector<std::unique_ptr<detail::OptionBase>>     options_;
+    std::vector<std::unique_ptr<detail::PositionalBase>> positionals_;
+    std::vector<std::unique_ptr<App>>                    subcommands_;
+    std::unordered_map<std::string, App*, detail::StringHash, std::equal_to<>>
+                                                         command_index_;
     App*  parent_     = nullptr;
     App*  active_sub_ = nullptr;
-    std::function<void(App&)>                               callback_;
-    std::vector<std::string>               aliases_;
-    std::vector<std::vector<std::string>>  mutex_groups_;
-    std::vector<std::vector<std::string>>  require_groups_;
+    std::function<void(App&)>                            callback_;
+    std::vector<std::string>                             aliases_;
+    bool                                                 require_subcommand_ = false;
+    std::vector<std::vector<std::string>>                mutex_groups_;
+    std::vector<std::vector<std::string>>                require_groups_;
+    // Group references are resolved once after registration and reused by
+    // every parse.  Pointers stay valid because options are heap-owned.
+    std::vector<std::vector<detail::OptionBase*>>        mutex_resolved_;
+    std::vector<std::vector<detail::OptionBase*>>        require_resolved_;
+    bool                                                 groups_dirty_ = true;
 
     App(const App&)            = delete;
     App& operator=(const App&) = delete;
+    // Moving an App would invalidate parent links for owned subcommands and
+    // any Option<T>/Positional<T> handles held by the caller.  Keep it stable.
+    App(App&&)                 = delete;
+    App& operator=(App&&)      = delete;
 
 public:
-    // ── Constructors ──────────────────────────────────────────────────────
-
-    /// Two-arg: name + description (version set later via .version())
     explicit App(std::string name, std::string desc = {})
         : name_(std::move(name)), desc_(std::move(desc)) {}
 
-    /// Three-arg convenience: name, description, version inline
     App(std::string name, std::string desc, std::string ver)
         : name_(std::move(name)), desc_(std::move(desc)), version_(std::move(ver)) {}
 
-    App(App&&) = default;
-
     // ── Dynamic lookup proxy ──────────────────────────────────────────────
 
-    /// Zero-overhead proxy returned by operator[]. Provides type-safe access
-    /// without keeping handles to individual options.
     struct Lookup {
-        detail::OptionBase* p_;
+        detail::OptionBase* p_ = nullptr;
         [[nodiscard]] explicit operator bool() const noexcept { return p_ && p_->has_value(); }
         [[nodiscard]] bool is_set()            const noexcept { return p_ && p_->is_set_; }
         [[nodiscard]] bool found()             const noexcept { return p_ != nullptr; }
 
-        /// Return the option's value; asserts that it is set.
+        template<typename T>
+        [[nodiscard]] std::optional<T> try_as() const {
+            if (!p_) return std::nullopt;
+            if constexpr (std::is_integral_v<T>) {
+                if (p_->type_id() == &detail::type_token<detail::CountImpl>) {
+                    if (!p_->has_value()) return std::nullopt;
+                    return static_cast<T>(static_cast<const detail::CountImpl*>(p_)->count_);
+                }
+            }
+            if (p_->type_id() == &detail::type_token<T>) {
+                const auto* impl = static_cast<const detail::OptionImpl<T>*>(p_);
+                if (impl->value) return *impl->value;
+            }
+            return std::nullopt;
+        }
+
         template<typename T>
         [[nodiscard]] T as() const {
-            // Count options queried as unsigned fall back to CountImpl
-            if constexpr (std::is_same_v<std::remove_cv_t<T>, unsigned>) {
-                if (auto* cnt = dynamic_cast<detail::CountImpl*>(p_))
-                    return static_cast<T>(cnt->count_);
-            }
-            auto* impl = dynamic_cast<detail::OptionImpl<T>*>(p_);
-            if (!impl || !impl->value) return T{}; // graceful
-            return *impl->value;
+            return try_as<T>().value_or(T{});
         }
 
-        /// Return the option's value or @p fallback when not set / not found.
         template<typename T>
         [[nodiscard]] T as_or(T fallback) const {
-            // Count options queried as unsigned fall back to CountImpl
-            if constexpr (std::is_same_v<std::remove_cv_t<T>, unsigned>) {
-                if (auto* cnt = dynamic_cast<detail::CountImpl*>(p_))
-                    return cnt->is_set_ ? static_cast<T>(cnt->count_) : fallback;
-            }
-            auto* impl = dynamic_cast<detail::OptionImpl<T>*>(p_);
-            if (!impl || !impl->value) return fallback;
-            return *impl->value;
+            return try_as<T>().value_or(std::move(fallback));
         }
 
-        /// Return the count for a Count option (add_count). Returns 0 if not found or not a count.
         [[nodiscard]] unsigned as_count() const noexcept {
-            if (auto* cnt = dynamic_cast<detail::CountImpl*>(p_))
-                return cnt->count_;
+            if (p_ && p_->type_id() == &detail::type_token<detail::CountImpl>)
+                return static_cast<const detail::CountImpl*>(p_)->count_;
             return 0u;
         }
     };
 
-    /// Look up any registered option by name (short or long).
-    /// Returns a Lookup proxy; check .found() before calling .as<T>().
     [[nodiscard]] Lookup operator[](std::string_view name) const noexcept {
-        for (auto& o : options_)
-            if (o->matches(name)) return Lookup{o.get()};
-        return Lookup{nullptr};
+        return Lookup{find_opt(name)};
     }
 
     // ── App metadata builder ──────────────────────────────────────────────
 
-    auto&& version(this auto&& self, std::string v)  { self.version_ = std::move(v); return std::forward<decltype(self)>(self); }
-    auto&& author (this auto&& self, std::string a)  { self.author_  = std::move(a); return std::forward<decltype(self)>(self); }
+    auto&& version(this auto&& self, std::string v) {
+        self.version_ = std::move(v);
+        return std::forward<decltype(self)>(self);
+    }
+    auto&& author(this auto&& self, std::string a) {
+        self.author_ = std::move(a);
+        return std::forward<decltype(self)>(self);
+    }
+    auto&& example(this auto&& self, std::string ex) {
+        self.examples_.push_back(std::move(ex));
+        return std::forward<decltype(self)>(self);
+    }
 
-    /// Add an example to the help EXAMPLES section
-    auto&& example(this auto&& self, std::string ex)
-        { self.examples_.push_back(std::move(ex)); return std::forward<decltype(self)>(self); }
+    // ── Option registration (v1 compat) ───────────────────────────────────
 
-    // ── Option registration ─────────────────────────────────────────────────
-    //  v1 (compat): positional-arg style, kept for backward compatibility.
-
-    /// Register a typed option with optional short and long names
     template<typename T>
     [[nodiscard]] Option<T> option(std::string_view sn, std::string_view ln,
-                                    std::string_view help) {
+                                   std::string_view help) {
+        if (sn.empty() && ln.empty())
+            throw std::invalid_argument("cli: option requires at least one name");
         auto impl = std::make_unique<detail::OptionImpl<T>>();
-        if (!sn.empty()) impl->names.emplace_back(sn);
-        if (!ln.empty()) impl->names.emplace_back(ln);
-        impl->help_text  = std::string(help);
-        impl->meta       = std::string(detail::type_meta<T>());
-        auto* p          = impl.get();
-        options_.push_back(std::move(impl));
+        impl->help_text = std::string(help);
+        impl->meta      = std::string(detail::type_meta<T>());
+        auto* p         = impl.get();
+        adopt_option(std::move(impl), {sn, ln});
         return Option<T>(p);
     }
 
-    /// Convenience overload with long name only
     template<typename T>
-    [[nodiscard]] Option<T> option(std::string_view ln, std::string_view help)
-        { return option<T>({}, ln, help); }
+    [[nodiscard]] Option<T> option(std::string_view ln, std::string_view help) {
+        return option<T>({}, ln, help);
+    }
 
-    /// Register a boolean flag (presence = true, absence = false)
     [[nodiscard]] Flag flag(std::string_view sn, std::string_view ln, std::string_view help) {
-        auto impl        = std::make_unique<detail::OptionImpl<bool>>();
-        if (!sn.empty()) impl->names.emplace_back(sn);
-        if (!ln.empty()) impl->names.emplace_back(ln);
-        impl->help_text  = std::string(help);
-        impl->is_flag_   = true;
-        auto* p          = impl.get();
-        options_.push_back(std::move(impl));
+        if (sn.empty() && ln.empty())
+            throw std::invalid_argument("cli: option requires at least one name");
+        auto impl = std::make_unique<detail::OptionImpl<bool>>();
+        impl->help_text = std::string(help);
+        impl->is_flag_  = true;
+        auto* p         = impl.get();
+        adopt_option(std::move(impl), {sn, ln});
         return Flag(p);
     }
 
-    /// Convenience overload with long name only
-    [[nodiscard]] Flag flag(std::string_view ln, std::string_view help)
-        { return flag({}, ln, help); }
+    [[nodiscard]] Flag flag(std::string_view ln, std::string_view help) {
+        return flag({}, ln, help);
+    }
 
-    /// Register a positional argument.  Use T = std::vector<U> for variadic.
     template<typename T>
     [[nodiscard]] Positional<T> positional(std::string_view name, std::string_view help) {
+        detail::validate_positional_name(name);
+        if (std::ranges::any_of(positionals_, [](const auto& p) {
+                return p->variadic_;
+            })) {
+            throw std::invalid_argument(
+                "cli: a variadic positional must be the last positional");
+        }
         auto impl       = std::make_unique<detail::PositionalImpl<T>>();
         impl->name      = std::string(name);
+        impl->label     = std::format("<{}>", name);
         impl->help_text = std::string(help);
         impl->variadic_ = detail::is_vec_v<T>;
         auto* p         = impl.get();
@@ -874,296 +1541,414 @@ public:
         return Positional<T>(p);
     }
 
-    // ── Option registration ─────────────────────────────────────────────────
-    //  v2 (preferred): start with the primary (long) name, chain the rest.
+    // ── Option registration (v2 fluent) ───────────────────────────────────
 
-    /// Create a typed option. Chain .short_name(), .help(), .default_val(), etc.
-    /// Example: auto jobs = app.add<int>("--jobs").short_name("-j").help("N").default_val(4);
     template<typename T>
     [[nodiscard]] Option<T> add(std::string_view long_name) {
+        detail::validate_option_name(long_name);
         auto impl = std::make_unique<detail::OptionImpl<T>>();
-        impl->names.emplace_back(long_name);
         impl->meta = std::string(detail::type_meta<T>());
-        auto* p   = impl.get();
-        options_.push_back(std::move(impl));
+        auto* p    = impl.get();
+        adopt_option(std::move(impl), {long_name});
         return Option<T>(p);
     }
 
-    /// Create a boolean flag. Chain .short_name(), .help(), etc.
-    /// Example: auto verbose = app.add_flag("--verbose").short_name("-v").help("...");
     [[nodiscard]] Flag add_flag(std::string_view long_name) {
+        detail::validate_option_name(long_name);
         auto impl      = std::make_unique<detail::OptionImpl<bool>>();
-        impl->names.emplace_back(long_name);
         impl->is_flag_ = true;
         auto* p        = impl.get();
-        options_.push_back(std::move(impl));
+        adopt_option(std::move(impl), {long_name});
         return Flag(p);
     }
 
-    /// Create a positional argument. Chain .help(), .default_val(), etc.
     template<typename T>
     [[nodiscard]] Positional<T> add_positional(std::string_view name) {
+        detail::validate_positional_name(name);
+        // A variadic positional consumes every remaining token, so nothing
+        // registered after it could ever be reached.  Reject the configuration
+        // at registration time instead of silently leaving the later
+        // positional unsatisfiable.
+        if (std::ranges::any_of(positionals_, [](const auto& p) {
+                return p->variadic_;
+            })) {
+            throw std::invalid_argument(
+                "cli: a variadic positional must be the last positional");
+        }
+
         auto impl       = std::make_unique<detail::PositionalImpl<T>>();
         impl->name      = std::string(name);
+        impl->label     = std::format("<{}>", name);
         impl->variadic_ = detail::is_vec_v<T>;
         auto* p         = impl.get();
         positionals_.push_back(std::move(impl));
         return Positional<T>(p);
     }
 
-    /// Create a count option. Each occurrence increments by 1. Chain .short_name(), .help(), etc.
-    /// Example: auto verbosity = app.add_count("--verbose").short_name("-v").help("verbosity level");
     [[nodiscard]] Count add_count(std::string_view long_name) {
+        detail::validate_option_name(long_name);
         auto impl      = std::make_unique<detail::CountImpl>();
-        impl->names.emplace_back(long_name);
         impl->is_flag_ = true;
         auto* p        = impl.get();
-        options_.push_back(std::move(impl));
+        adopt_option(std::move(impl), {long_name});
         return Count(p);
     }
 
-    /// Declare a set of mutually exclusive options — at most one may be set.
     App& mutex_group(std::initializer_list<std::string_view> names) {
         std::vector<std::string> g;
         g.reserve(names.size());
         for (auto n : names) g.emplace_back(n);
         mutex_groups_.push_back(std::move(g));
+        groups_dirty_ = true;
         return *this;
     }
 
-    /// Declare options that must all be provided together — if any is set, all must be.
     App& require_together(std::initializer_list<std::string_view> names) {
         std::vector<std::string> g;
         g.reserve(names.size());
         for (auto n : names) g.emplace_back(n);
         require_groups_.push_back(std::move(g));
+        groups_dirty_ = true;
+        return *this;
+    }
+    // ── Subcommand registration ───────────────────────────────────────────
+
+    App& require_subcommand(bool required = true) {
+        require_subcommand_ = required;
         return *this;
     }
 
-    // ── Subcommand registration ─────────────────────────────────────────────
-
-    /// Create and return a reference to a nested subcommand App
     [[nodiscard]] App& subcommand(std::string name, std::string desc = {}) {
+        detail::validate_command_name(name);
+        if (command_index_.contains(name))
+            throw std::invalid_argument(
+                std::format("cli: duplicate command name '{}'", name));
+        std::string key = name;
         auto sub     = std::make_unique<App>(std::move(name), std::move(desc));
         sub->parent_ = this;
         auto* p      = sub.get();
         subcommands_.push_back(std::move(sub));
+        try {
+            const auto [it, inserted] = command_index_.emplace(std::move(key), p);
+            (void)it;
+            if (!inserted)
+                throw std::invalid_argument(
+                    std::format("cli: duplicate command name '{}'", p->name_));
+        } catch (...) {
+            if (!subcommands_.empty() && subcommands_.back().get() == p)
+                subcommands_.pop_back();
+            throw;
+        }
         return *p;
     }
 
-    /// Add an alias for this subcommand (e.g., "ci" for "commit")
     App& alias(std::string name) {
-        aliases_.push_back(std::move(name));
+        detail::validate_command_name(name);
+        if (name_ == name)
+            throw std::invalid_argument(
+                std::format("cli: alias '{}' duplicates the command name", name));
+        if (std::ranges::contains(aliases_, name))
+            throw std::invalid_argument(
+                std::format("cli: duplicate alias '{}'", name));
+        if (parent_ != nullptr && parent_->command_index_.contains(name))
+            throw std::invalid_argument(
+                std::format("cli: alias '{}' conflicts with another command", name));
+        aliases_.push_back(name);
+        if (parent_ != nullptr) {
+            try {
+                const auto [it, inserted] = parent_->command_index_.emplace(std::move(name), this);
+                (void)it;
+                if (!inserted)
+                    throw std::invalid_argument(
+                        std::format("cli: alias '{}' conflicts with another command",
+                                    aliases_.back()));
+            } catch (...) {
+                aliases_.pop_back();
+                throw;
+            }
+        }
         return *this;
     }
 
-    /// Register a callback to fire when this subcommand is selected.
-    /// Called automatically by parse_or_exit() after a successful parse.
     App& on_execute(std::function<void(App&)> fn) {
         callback_ = std::move(fn);
         return *this;
     }
 
-    /// Returns true if an on_execute callback is registered.
     [[nodiscard]] bool has_callback() const noexcept { return callback_ != nullptr; }
-
-    /// Explicitly invoke the on_execute callback for this app node.
     void fire_callback() { if (callback_) callback_(*this); }
 
-    /// Reset all parsed state so the App can be reused for another parse().
-    /// Clears all option/positional values and the active subcommand pointer.
-    void reset() {
-        for (auto& opt : options_)   opt->reset();
+    void reset() noexcept {
+        for (auto& opt : options_)     opt->reset();
         for (auto& pos : positionals_) pos->reset();
         active_sub_ = nullptr;
         for (auto& sub : subcommands_) sub->reset();
     }
 
-    /// Returns the subcommand that was selected, or nullptr
     [[nodiscard]] App* active_subcommand() const noexcept { return active_sub_; }
 
-    /// Check if a particular subcommand was selected by name
-    [[nodiscard]] bool is_subcommand(std::string_view n) const noexcept
-        { return active_sub_ && active_sub_->name_ == n; }
+    [[nodiscard]] bool is_subcommand(std::string_view n) const noexcept {
+        return active_sub_
+            && (active_sub_->name_ == n
+                || std::ranges::contains(active_sub_->aliases_, n));
+    }
 
-    // ── Convenience queries ─────────────────────────────────────────────────
-
-    /// True if the named flag is currently active (true). For negatable flags,
-    /// returns false when the flag was set to false via --no-FLAG.
     [[nodiscard]] bool has_flag(std::string_view name) const noexcept {
         auto l = (*this)[name];
         return l.found() && l.as_or<bool>(false);
     }
 
-    /// True if the named option has a value (set on CLI or via default).
     [[nodiscard]] bool has_option(std::string_view name) const noexcept {
         auto l = (*this)[name];
         if (!l.found()) return false;
-        return l.is_set() || l.p_->has_default();
+        return l.is_set() || l.p_->from_env_ || l.p_->has_default_;
     }
 
     [[nodiscard]] const std::string& name()        const noexcept { return name_;    }
     [[nodiscard]] const std::string& description() const noexcept { return desc_;    }
     [[nodiscard]] const std::string& ver()         const noexcept { return version_; }
 
-    // ── Parse ───────────────────────────────────────────────────────────────
+    // ── Parse ─────────────────────────────────────────────────────────────
 
-    /// Parse argc/argv.  argv[0] (program name) is automatically skipped.
-    [[nodiscard]] ParseResult parse(int argc, char** argv) {
-        std::span<char* const> args(argv + 1, static_cast<size_t>(argc > 0 ? argc - 1 : 0));
+    [[nodiscard]] ParseResult parse(int argc, const char* const* argv) {
+        reset();
+        // Treat a null argv as an empty command line rather than constructing
+        // a non-empty span over a null pointer.
+        std::span<const char* const> raw;
+        if (argv != nullptr && argc > 0)
+            raw = std::span<const char* const>(argv, static_cast<size_t>(argc));
+        std::vector<std::string_view> tokens;
+        if (raw.size() > 1) {
+            tokens.reserve(raw.size() - 1);
+            for (size_t i = 1; i < raw.size(); ++i)
+                tokens.emplace_back(raw[i] ? std::string_view(raw[i]) : std::string_view{});
+        }
+        return do_parse(tokens);
+    }
+
+    [[nodiscard]] ParseResult parse(std::span<const std::string_view> args) {
+        reset();
         return do_parse(args);
     }
 
-    /// Parse from a braced list of string tokens (no program name needed).
-    /// Ideal for testing: auto r = app.parse({"-j", "8", "--output", "/tmp"});
     [[nodiscard]] ParseResult parse(std::initializer_list<std::string_view> args) {
-        std::vector<std::string> storage(args.begin(), args.end());
-        std::vector<char*> ptrs;
-        ptrs.reserve(storage.size() + 1);
-        ptrs.push_back(name_.data()); // placeholder argv[0]; skipped by parse()
-        for (auto& s : storage) ptrs.push_back(s.data());
-        return parse(static_cast<int>(ptrs.size()), ptrs.data());
+        reset();
+        return do_parse(std::span<const std::string_view>(args.begin(), args.size()));
     }
 
-    /// Parse and exit on failure. After a successful parse, fires the
-    /// deepest active subcommand's on_execute callback (if registered),
-    /// falling back to the root callback if none is registered on the sub.
-    void parse_or_exit(int argc, char** argv) {
+    void parse_or_exit(int argc, const char* const* argv) {
         auto r = parse(argc, argv);
-        if (!r) { print_error(r.error()); std::exit(1); }
-        // Walk to the deepest active subcommand
+        if (!r) {
+            const auto& err = r.error();
+            const App* target_app = err.context ? err.context : this;
+            if (err.kind == ParseError::Kind::HelpRequested) {
+                target_app->print_help();
+                std::exit(0);
+            }
+            if (err.kind == ParseError::Kind::VersionRequested) {
+                std::cout << std::format("{} {}\n", target_app->full_name(),
+                                         target_app->effective_version());
+                std::exit(0);
+            }
+            target_app->print_error(err);
+            std::exit(1);
+        }
         App* target = active_sub_;
         while (target && target->active_sub_) target = target->active_sub_;
-        App* dispatch = target ? target : this;
-        if (dispatch->callback_) dispatch->callback_(*dispatch);
-        else if (dispatch != this && callback_) callback_(*this);
+        if (!target) target = this;
+        // Use the deepest command that actually has a callback, walking up
+        // through intermediate commands before falling back to the root.
+        for (App* command = target; command != nullptr; command = command->parent_) {
+            if (command->callback_) {
+                command->callback_(*command);
+                return;
+            }
+        }
     }
 
     // ── Help ──────────────────────────────────────────────────────────────
 
-    void print_help() const {
+    /// Render the complete help screen as a string (useful for tests/logging).
+    [[nodiscard]] std::string help_text() const {
         using X = detail::C;
-        auto full = full_name();
+        const auto full = full_name();
+        const auto ver  = effective_version();
 
-        // ── Header ──────────────────────────────────────────────────────
-        std::print("{}{}{}", X::bld(), full, X::rst());
-        if (!version_.empty())
-            std::print("  {}v{}{}", X::dim(), version_, X::rst());
+        std::string out;
+        out += std::format("{}{}{}", X::bld(), full, X::rst());
+        if (!ver.empty())
+            out += std::format("  {}v{}{}", X::dim(), ver, X::rst());
         if (!desc_.empty())
-            std::print("  —  {}", desc_);
-        std::println();
+            out += std::format("  —  {}", desc_);
+        out += '\n';
         if (!author_.empty())
-            std::println("{}  Author: {}{}", X::dim(), author_, X::rst());
-        std::println();
+            out += std::format("{}  Author: {}{}\n", X::dim(), author_, X::rst());
+        out += '\n';
 
-        // ── Usage ────────────────────────────────────────────────────────
-        std::println("{}USAGE{}", X::byel(), X::rst());
-        std::print("  {}", full);
-        std::print(" [OPTIONS]");
-        if (!subcommands_.empty())     std::print(" <COMMAND>");
-        for (auto& pos : positionals_) {
-                if (pos->variadic_)
-                    std::print(" <{}...>", pos->name);
-                else if (pos->required_)
-                    std::print(" <{}>", pos->name);
-                else
-                    std::print(" [{}]", pos->name);
+        out += std::format("{}USAGE{}\n", X::byel(), X::rst());
+        out += std::format("  {} [OPTIONS]", full);
+        if (!subcommands_.empty())
+            out += require_subcommand_ ? " <COMMAND>" : " [COMMAND]";
+        for (const auto& pos : positionals_) {
+            if (pos->variadic_)
+                out += pos->required_
+                    ? std::format(" <{}...>", pos->name)
+                    : std::format(" [{}...]", pos->name);
+            else if (pos->required_)
+                out += std::format(" <{}>", pos->name);
+            else
+                out += std::format(" [{}]", pos->name);
         }
-        std::println();
-        std::println();
+        out += "\n\n";
 
-        // ── Options ──────────────────────────────────────────────────────
-        std::println("{}OPTIONS{}", X::byel(), X::rst());
-        render_option_list();
-        std::println();
+        out += std::format("{}OPTIONS{}\n", X::byel(), X::rst());
+        render_option_list(out);
+        out += '\n';
 
-        // ── Positional arguments ─────────────────────────────────────────
         if (!positionals_.empty()) {
-            std::println("{}ARGUMENTS{}", X::byel(), X::rst());
-            for (auto& pos : positionals_) {
-                std::string lhs = std::format("  <{}{}>",
-                    pos->name, pos->variadic_ ? "..." : "");
-                std::print("{}{:<32}{}", X::bcyn(), lhs, X::rst());
-                std::print("{}", pos->help_text);
-                if (!pos->default_str().empty())
-                    std::print("  {}[default: {}]{}", X::dim(), pos->default_str(), X::rst());
-                if (pos->required_)
-                    std::print("  {}[required]{}", X::bred(), X::rst());
-                std::println();
+            out += std::format("{}ARGUMENTS{}\n", X::byel(), X::rst());
+            size_t pos_col = 0;
+            for (const auto& pos : positionals_) {
+                const size_t w = 3 + pos->name.size() + (pos->variadic_ ? 3 : 0);
+                pos_col = std::max(pos_col, w);
             }
-            std::println();
+            pos_col = std::max(pos_col + 2, size_t(30));
+            for (const auto& pos : positionals_) {
+                const auto body = std::format("{}{}", pos->name, pos->variadic_ ? "..." : "");
+                const std::string lhs = pos->required_
+                    ? std::format("  <{}>", body)
+                    : std::format("  [{}]", body);
+                out += std::format("{}{:<{}}{}", X::bcyn(), lhs, pos_col, X::rst());
+                out += pos->help_text;
+                if (!pos->default_str().empty())
+                    out += std::format("  {}[default: {}]{}", X::dim(), pos->default_str(), X::rst());
+                if (!pos->choices_str().empty())
+                    out += std::format("  {}[{}]{}", X::dim(), pos->choices_str(), X::rst());
+                if (!pos->env_var.empty())
+                    out += std::format("  {}[env: {}]{}", X::dim(), pos->env_var, X::rst());
+                if (pos->required_)
+                    out += std::format("  {}[required]{}", X::bred(), X::rst());
+                out += '\n';
+            }
+            out += '\n';
         }
 
-        // ── Subcommands ──────────────────────────────────────────────────
         if (!subcommands_.empty()) {
-            std::println("{}COMMANDS{}", X::byel(), X::rst());
+            out += std::format("{}COMMANDS{}\n", X::byel(), X::rst());
             size_t col = 4;
-            for (auto& s : subcommands_) {
+            for (const auto& s : subcommands_) {
                 size_t w = s->name_.size();
-                for (auto& a : s->aliases_) w += 2 + a.size();
+                for (const auto& a : s->aliases_) w += 2 + a.size();
                 col = std::max(col, w + 4);
             }
-            for (auto& s : subcommands_) {
+            for (const auto& s : subcommands_) {
                 std::string lhs = "  " + s->name_;
-                for (auto& a : s->aliases_) lhs += ", " + a;
-                std::print("{}{:<{}}{}", X::bcyn(), lhs, col, X::rst());
-                std::println("{}", s->desc_);
+                for (const auto& a : s->aliases_) lhs += ", " + a;
+                out += std::format("{}{:<{}}{}", X::bcyn(), lhs, col, X::rst());
+                out += std::format("{}\n", s->desc_);
             }
-            std::println();
-            std::println("{}  Run '{} <COMMAND> --help' for details on a command.{}",
+            out += '\n';
+            out += std::format("{}  Run '{} <COMMAND> --help' for details on a command.{}\n\n",
                 X::dim(), full, X::rst());
-            std::println();
         }
 
-        // ── Examples ─────────────────────────────────────────────────────
         if (!examples_.empty()) {
-            std::println("{}EXAMPLES{}", X::byel(), X::rst());
-            for (auto& ex : examples_)
-                std::println("  {}{}{}", X::grn(), ex, X::rst());
-            std::println();
+            out += std::format("{}EXAMPLES{}\n", X::byel(), X::rst());
+            for (const auto& ex : examples_)
+                out += std::format("  {}{}{}\n", X::grn(), ex, X::rst());
+            out += '\n';
         }
+
+        return out;
     }
 
-    // ── Error display ─────────────────────────────────────────────────────
+    void print_help() const {
+        std::cout << help_text();
+    }
+
+    void print_help(std::ostream& out) const {
+        out << help_text();
+    }
 
     void print_error(const ParseError& e) const {
         using X = detail::C;
-        std::println(stderr, "{}error:{} {}", X::bred(), X::rst(), e.message);
-        std::println(stderr, "{}Try '{} --help' for usage information.{}",
-            X::dim(), full_name(), X::rst());
+        const App* ctx = e.context ? e.context : this;
+        std::cerr << std::format("{}error:{} {}\n", X::bred(), X::rst(), e.message);
+        std::cerr << std::format("{}Try '{} --help' for usage information.{}\n",
+            X::dim(), ctx->full_name(), X::rst());
     }
 
     // ── Shell completion generators ───────────────────────────────────────
 
     void bash_completion(std::ostream& out = std::cout) const {
+        // Keep the generated function identifier valid even when the app name
+        // is a path or otherwise not a shell identifier.
         auto fn = name_;
-        std::ranges::replace(fn, '-', '_');
-        out << "# Bash completion for " << name_ << "\n";
+        for (auto& c : fn)
+            if (!std::isalnum(static_cast<unsigned char>(c))) c = '_';
+
+        // Quote only when needed so the common `tool` case stays unquoted.
+        auto shell_word = [](std::string_view s) {
+            const bool safe = !s.empty() && std::ranges::all_of(s, [](char c) {
+                const auto u = static_cast<unsigned char>(c);
+                return std::isalnum(u) || c == '_' || c == '-' || c == '.'
+                    || c == '/' || c == '+';
+            });
+            if (safe) return std::string(s);
+            std::string quoted = "'";
+            for (char c : s) {
+                if (c == '\'') quoted += "'\\''";
+                else           quoted += c;
+            }
+            quoted += '\'';
+            return quoted;
+        };
+        auto dq_escape = [](std::string_view s) {
+            std::string escaped;
+            escaped.reserve(s.size());
+            for (char c : s) {
+                if (c == '\\' || c == '"' || c == '$' || c == '`') escaped += '\\';
+                escaped += c;
+            }
+            return escaped;
+        };
+
+        std::string comment = name_;
+        for (auto& c : comment)
+            if (std::iscntrl(static_cast<unsigned char>(c))) c = ' ';
+
+        out << "# Bash completion for " << comment << "\n";
         out << "_" << fn << "() {\n"
                "    local cur prev opts subs\n"
                "    cur=\"${COMP_WORDS[COMP_CWORD]}\"\n"
                "    opts=\"";
-        for (auto& opt : options_) {
-            for (auto& n : opt->names) out << n << " ";
+        for (const auto& opt : options_) {
+            if (opt->hidden_) continue;
+            for (const auto& n : opt->names) out << dq_escape(n) << " ";
             if (opt->negatable_) {
-                auto ln = std::string(opt->long_name());
-                if (ln.starts_with("--")) out << "--no-" << ln.substr(2) << " ";
+                auto ln = opt->long_name();
+                if (ln.starts_with("--"))
+                    out << dq_escape("--no-" + std::string(ln.substr(2))) << " ";
             }
         }
-        out << "--help --version\"\n"
-               "    subs=\"";
-        for (auto& s : subcommands_) {
-            out << s->name_ << " ";
-            for (auto& a : s->aliases_) out << a << " ";
+        if (!find_opt("-h"))      out << "-h ";
+        if (!find_opt("--help"))  out << "--help ";
+        if (!effective_version().empty()) {
+            if (!find_opt("-V"))        out << "-V ";
+            if (!find_opt("--version")) out << "--version ";
+        }
+        out << "\"\n    subs=\"";
+        for (const auto& s : subcommands_) {
+            out << dq_escape(s->name_) << " ";
+            for (const auto& a : s->aliases_) out << dq_escape(a) << " ";
         }
         out << "\"\n"
                "    COMPREPLY=($(compgen -W \"${opts} ${subs}\" -- \"${cur}\"))\n"
                "}\n"
-               "complete -F _" << fn << " " << name_ << "\n";
+               "complete -F _" << fn << " " << shell_word(name_) << "\n";
     }
 
     void fish_completion(std::ostream& out = std::cout) const {
-        // Escape single quotes for fish shell completion strings
         auto fish_esc = [](std::string_view s) {
             std::string r;
             r.reserve(s.size());
@@ -1171,38 +1956,70 @@ public:
                 r += (c == '\'') ? "'\"'\"'" : std::string(1, c);
             return r;
         };
+        auto fish_word = [&](std::string_view s) {
+            const bool safe = !s.empty() && std::ranges::all_of(s, [](char c) {
+                const auto u = static_cast<unsigned char>(c);
+                return std::isalnum(u) || c == '_' || c == '-' || c == '.'
+                    || c == '/' || c == '+';
+            });
+            if (safe) return std::string(s);
+            return std::string("'") + fish_esc(s) + "'";
+        };
 
-        for (auto& opt : options_) {
+        for (const auto& opt : options_) {
             if (opt->hidden_) continue;
-            out << "complete -c " << name_;
+            out << "complete -c " << fish_word(name_);
             auto sn = opt->short_name();
             auto ln = opt->long_name();
-            if (!sn.empty()) out << " -s " << sn.substr(1);
-            if (!ln.empty()) out << " -l " << ln.substr(2);
+            if (!sn.empty()) {
+                // Fish distinguishes classic one-letter shorts (-v) from
+                // old-style single-dash long options (-verbose).
+                if (sn.size() == 2) out << " -s " << fish_word(sn.substr(1));
+                else                out << " -o " << fish_word(sn.substr(1));
+            }
+            if (!ln.empty()) out << " -l " << fish_word(ln.substr(2));
             if (opt->is_flag_) out << " -f";
+            else               out << " -r";
             if (!opt->choices_str().empty() && !opt->is_count_option()) {
-                out << " -a '";
-                for (char c : opt->choices_str())
-                    out << (c == '|' ? ' ' : c);
-                out << "'";
+                std::string choices;
+                for (char c : opt->choices_str()) {
+                    if (c == '|') choices += ' ';
+                    else if (c != '"') choices += c;
+                }
+                out << " -a '" << fish_esc(choices) << "'";
             }
             if (!opt->help_text.empty())
                 out << " -d '" << fish_esc(opt->help_text) << "'";
             out << "\n";
-        }
-        out << "complete -c " << name_ << " -s h -l help    -f -d 'Print help'\n";
-        if (!version_.empty())
-            out << "complete -c " << name_ << " -s V -l version -f -d 'Print version'\n";
 
-        // Subcommand completions
-        for (auto& s : subcommands_) {
-            out << "complete -c " << name_ << " -f -a '" << s->name_ << "'";
+            if (opt->negatable_ && !ln.empty() && ln.starts_with("--")) {
+                out << "complete -c " << fish_word(name_) << " -l "
+                    << fish_word("no-" + std::string(ln.substr(2))) << " -f";
+                out << " -d 'Disable --" << fish_esc(ln.substr(2)) << "'\n";
+            }
+        }
+        if (!find_opt("-h"))
+            out << "complete -c " << fish_word(name_) << " -s h -f -d 'Print help'\n";
+        if (!find_opt("--help"))
+            out << "complete -c " << fish_word(name_) << " -l help -f -d 'Print help'\n";
+        if (!effective_version().empty()) {
+            if (!find_opt("-V"))
+                out << "complete -c " << fish_word(name_) << " -s V -f -d 'Print version'\n";
+            if (!find_opt("--version"))
+                out << "complete -c " << fish_word(name_) << " -l version -f -d 'Print version'\n";
+        }
+
+        for (const auto& s : subcommands_) {
+            out << "complete -c " << fish_word(name_) << " -f -a '"
+                << fish_esc(s->name_) << "'";
             if (!s->desc_.empty()) out << " -d '" << fish_esc(s->desc_) << "'";
             out << "\n";
-            for (auto& a : s->aliases_) {
-                out << "complete -c " << name_ << " -f -a '" << a << "'";
+            for (const auto& a : s->aliases_) {
+                out << "complete -c " << fish_word(name_) << " -f -a '"
+                    << fish_esc(a) << "'";
                 if (!s->desc_.empty())
-                    out << " -d '" << fish_esc(s->desc_) << " (→ " << s->name_ << ")'";
+                    out << " -d '" << fish_esc(s->desc_) << " (→ "
+                        << fish_esc(s->name_) << ")'";
                 out << "\n";
             }
         }
@@ -1210,9 +2027,24 @@ public:
 
     void zsh_completion(std::ostream& out = std::cout) const {
         auto fn = name_;
-        for (auto& c : fn) if (!std::isalnum((unsigned char)c)) c = '_';
+        for (auto& c : fn) if (!std::isalnum(static_cast<unsigned char>(c))) c = '_';
 
-        out << "#compdef " << name_ << "\n\n";
+        auto zsh_esc = [](std::string_view s) {
+            std::string r;
+            r.reserve(s.size());
+            for (char c : s) {
+                if (c == '\'') r += "'\\''";
+                else if (c == '[' || c == ']' || c == ':') { r += '\\'; r += c; }
+                else r += c;
+            }
+            return r;
+        };
+
+        std::string compdef_name = name_;
+        for (auto& c : compdef_name)
+            if (std::iscntrl(static_cast<unsigned char>(c))) c = '_';
+
+        out << "#compdef " << compdef_name << "\n\n";
         out << "_" << fn << "() {\n";
 
         if (!subcommands_.empty()) {
@@ -1222,37 +2054,80 @@ public:
 
         out << "    local -a args\n";
         out << "    args=(\n";
-        for (auto& opt : options_) {
+
+        auto choice_action = [&zsh_esc](const detail::OptionBase& opt) {
+            if (opt.is_flag_ || opt.is_count_option()) return std::string{};
+            const auto choices = opt.choices_str();
+            if (choices.empty()) return std::string{};
+            std::string action = "(";
+            for (char c : choices) {
+                if (c == '|') action += ' ';
+                else if (c != '"') action += c;
+            }
+            action += ')';
+            return zsh_esc(action);
+        };
+
+        auto emit_spec = [&](const detail::OptionBase& opt) {
+            const auto sn = opt.short_name();
+            const auto ln = opt.long_name();
+            if (sn.empty() && ln.empty()) return;
+            const auto sn_esc = zsh_esc(sn);
+            const auto ln_esc = zsh_esc(ln);
+
+            std::string spec;
+            if (opt.is_multi()) spec += '*';
+            if (!sn.empty() && !ln.empty()) {
+                spec += "'(" + sn_esc + " " + ln_esc + ")'{"
+                        + sn_esc + "," + ln_esc + "}";
+                spec += "'";
+            } else {
+                spec += "'" + (ln.empty() ? sn_esc : ln_esc);
+            }
+            if (!opt.help_text.empty())
+                spec += "[" + zsh_esc(opt.help_text) + "]";
+            spec += "'";
+            if (!opt.is_flag_) {
+                const auto meta = opt.meta.empty() ? std::string("value") : zsh_esc(opt.meta);
+                auto action = choice_action(opt);
+                if (action.empty()) action = "_default";
+                spec += ":" + meta + ":" + action;
+            }
+            out << "        " << spec << "\n";
+
+            if (opt.negatable_ && !ln.empty() && ln.starts_with("--")) {
+                out << "        '--no-" << zsh_esc(ln.substr(2)) << "[Disable --"
+                    << zsh_esc(ln.substr(2)) << "]'\n";
+            }
+        };
+
+        for (const auto& opt : options_) {
             if (opt->hidden_) continue;
-            auto sn = opt->short_name();
-            auto ln = opt->long_name();
-            out << "        ";
-            if (!sn.empty() && !ln.empty())
-                out << "'(" << sn << " " << ln << ")'{" << sn << "," << ln << "}";
-            else if (!ln.empty())
-                out << "'" << ln << "'";
-            else if (!sn.empty())
-                out << "'" << sn << "'";
-            if (!opt->is_flag_)
-                out << "=[" << (!opt->meta.empty() ? opt->meta : "value") << "]";
-            if (!opt->help_text.empty())
-                out << "'[" << opt->help_text << "]'";
-            else
-                out << "''";
-            out << "\n";
+            emit_spec(*opt);
         }
-        out << "        '(-h --help)'{-h,--help}'[Print help]'\n";
-        if (!version_.empty())
-            out << "        '(-V --version)'{-V,--version}'[Print version]'\n";
+        if (!find_opt("-h") && !find_opt("--help")) {
+            out << "        '(-h --help)'{-h,--help}'[Print help]'\n";
+        } else {
+            if (!find_opt("-h"))     out << "        '-h[Print help]'\n";
+            if (!find_opt("--help")) out << "        '--help[Print help]'\n";
+        }
+        if (!effective_version().empty()) {
+            if (!find_opt("-V") && !find_opt("--version")) {
+                out << "        '(-V --version)'{-V,--version}'[Print version]'\n";
+            } else {
+                if (!find_opt("-V"))        out << "        '-V[Print version]'\n";
+                if (!find_opt("--version")) out << "        '--version[Print version]'\n";
+            }
+        }
         out << "    )\n\n";
 
         if (!subcommands_.empty()) {
             out << "    local -a subcmds\n";
             out << "    subcmds=(\n";
-            for (auto& s : subcommands_) {
-                out << "        '" << s->name_ << ":" << s->desc_ << "'\n";
-                for (auto& a : s->aliases_)
-                    out << "        '" << a << ":" << s->desc_ << " (alias)'\n";
+            for (const auto& s : subcommands_) {
+                out << "        '" << zsh_esc(s->name_) << ":" << zsh_esc(s->desc_) << "'\n";
+                for (const auto& a : s->aliases_)
+                    out << "        '" << zsh_esc(a) << ":" << zsh_esc(s->desc_) << " (alias)'\n";
             }
             out << "    )\n\n";
             out << "    _arguments -C $args[@] ':command:->command'\n";
@@ -1269,216 +2144,375 @@ public:
 
 private:
 
-    // ── Core parsing logic ────────────────────────────────────────────────
+    void adopt_option(std::unique_ptr<detail::OptionBase> impl,
+                      std::initializer_list<std::string_view> names) {
+        auto* p = impl.get();
+        options_.push_back(std::move(impl));
+        try {
+            p->registry_ = &registry_;
+            for (auto name : names)
+                if (!name.empty()) detail::append_option_name(p, name);
+        } catch (...) {
+            // Registration is transactional: a bad or duplicate name must not
+            // leave a half-registered option behind.
+            registry_.remove(p);
+            options_.pop_back();
+            throw;
+        }
+    }
 
-    [[nodiscard]] ParseResult do_parse(std::span<char* const> args) {
-        // 1. Pull in env-var defaults before touching argv
-        apply_env_vars();
+    void validate_group_references() {
+        if (!groups_dirty_) return;
+        auto resolve = [this](const std::vector<std::vector<std::string>>& groups,
+                              std::vector<std::vector<detail::OptionBase*>>& resolved,
+                              std::string_view kind) {
+            resolved.clear();
+            resolved.reserve(groups.size());
+            for (const auto& group : groups) {
+                std::vector<detail::OptionBase*> members;
+                members.reserve(group.size());
+                for (const auto& name : group) {
+                    auto* opt = find_opt(name);
+                    if (opt == nullptr)
+                        throw std::invalid_argument(std::format(
+                            "cli: {} references unknown option '{}'", kind, name));
+                    if (std::ranges::contains(members, opt))
+                        throw std::invalid_argument(std::format(
+                            "cli: {} references the same option more than once ('{}')",
+                            kind, name));
+                    members.push_back(opt);
+                }
+                resolved.push_back(std::move(members));
+            }
+        };
+        resolve(mutex_groups_, mutex_resolved_, "mutex_group");
+        resolve(require_groups_, require_resolved_, "require_together");
+        groups_dirty_ = false;
+    }
 
-        bool   end_opts = false;
-        size_t pos_idx  = 0;
+    [[nodiscard]] ParseResult do_parse(std::span<const std::string_view> args) {
+        validate_group_references();
+        bool   end_opts       = false;
+        bool   saw_positional = false;
+        size_t pos_idx        = 0;
+        // Version lookup walks the parent chain; cache it for the token loop.
+        const bool has_version = !effective_version().empty();
+        const bool has_subcommands = !subcommands_.empty();
 
         for (size_t i = 0; i < args.size(); ++i) {
-            std::string_view arg(args[i]);
+            const std::string_view arg = args[i];
 
             // ── End-of-options sentinel
-            if (!end_opts && arg == "--") { end_opts = true; continue; }
-
-            // ── Built-in --help / -h (always wins, no lookup needed)
-            if (!end_opts && (arg == "--help" || arg == "-h"))
-                { print_help(); std::exit(0); }
-
-            // ── Built-in --version / -V
-            if (!end_opts && (arg == "--version" || arg == "-V") && !version_.empty())
-                { std::println("{} {}", name_, version_); std::exit(0); }
-
-            // ── Subcommand dispatch (non-option tokens before any '--')
-            if (!end_opts && !arg.starts_with('-') && !subcommands_.empty()) {
-                for (auto& sub : subcommands_) {
-                    bool name_match = (sub->name_ == arg) ||
-                        std::ranges::any_of(sub->aliases_, [&](const auto& a){ return a == arg; });
-                    if (name_match) {
-                        active_sub_ = sub.get();
-                        // Validate parent's own requirements before descending
-                        if (auto r = finalize(); !r) return r;
-                        return sub->do_parse(args.subspan(i + 1));
-                    }
-                }
-                // Falls through to positional handling
+            if (!end_opts && arg == "--") {
+                end_opts = true;
+                continue;
             }
 
-            // ── Positional argument
-            if (end_opts || !arg.starts_with('-')) {
+            // ── Built-in --help / -h (unless user registered their own -h/--help)
+            if (!end_opts && (arg == "--help" || arg == "-h") && !find_opt(arg))
+                return std::unexpected(ParseError::help_requested(this));
+
+            // ── Built-in --version / -V (unless user registered their own -V/--version)
+            if (!end_opts && has_version
+                && (arg == "--version" || arg == "-V") && !find_opt(arg))
+                return std::unexpected(ParseError::version_requested(this));
+
+            // ── Subcommand dispatch (only before any positional argument)
+            if (!end_opts && !saw_positional && has_subcommands
+                && !arg.starts_with('-')) {
+                if (auto* sub = find_command(arg)) {
+                    active_sub_ = sub;
+                    // Parse child first so `tool sub --help` succeeds even if parent has required options.
+                    // Any child failure (including --help / --version) is returned as-is;
+                    // finalizing the parent here would mask the real error.
+                    auto sub_res = sub->do_parse(args.subspan(i + 1));
+                    if (!sub_res) return sub_res;
+                    if (auto r = finalize(/*subcommand_active=*/true); !r)
+                        return r;
+                    return {};
+                }
+            }
+
+            // ── Positional argument (including single '-' stdin/stdout token)
+            if (end_opts || !arg.starts_with('-') || arg == "-") {
+                saw_positional = true;
                 if (pos_idx < positionals_.size()) {
                     auto& pos = positionals_[pos_idx];
-                    if (auto r = pos->parse(arg); !r) return r;
+                    if (auto r = pos->parse(arg, this); !r) return r;
                     if (!pos->variadic_) ++pos_idx;
                 } else {
-                    return std::unexpected(ParseError::too_many(arg));
+                    return std::unexpected(ParseError::too_many(arg, this));
                 }
                 continue;
             }
 
-            // ── Negative numeric literals: -1, -3, -3.14, -42, etc.
-            // If the character after '-' is a digit and no registered short option
-            // matches -N, treat the whole token as a positional value.
-            if (arg.size() >= 2 && std::isdigit(static_cast<unsigned char>(arg[1]))) {
-                const auto sopt1 = std::string(1, '-') + arg[1];
-                if (!find_opt(sopt1)) {
+            // ── Negative numeric literals: -1, -3.14, -.5
+            if (detail::looks_like_negative_number(arg)) {
+                const char short_name[2] = {'-', arg[1]};
+                // A registered name that happens to look numeric (for example
+                // a single-dash long option `-1abc`) still wins.  The same is
+                // true for an inline spelling such as `-1abc=5`.
+                const auto eq = arg.find('=');
+                const bool has_registered_prefix =
+                    eq != std::string_view::npos && find_opt(arg.substr(0, eq)) != nullptr;
+                if (!find_opt(std::string_view(short_name, 2)) &&
+                    !find_opt(arg) && !has_registered_prefix) {
+                    saw_positional = true;
                     if (pos_idx < positionals_.size()) {
                         auto& pos = positionals_[pos_idx];
-                        if (auto r = pos->parse(arg); !r) return r;
+                        if (auto r = pos->parse(arg, this); !r) return r;
                         if (!pos->variadic_) ++pos_idx;
                     } else {
-                        return std::unexpected(ParseError::too_many(arg));
+                        return std::unexpected(ParseError::too_many(arg, this));
                     }
                     continue;
                 }
             }
 
-            // ── Long option:  --name  or  --name=value
+            // ── Long option: --name or --name=value
             if (arg.starts_with("--")) {
-                const auto eq      = arg.find('=');
-                const auto name    = (eq != std::string_view::npos) ? arg.substr(0, eq) : arg;
-                const auto inlval  = (eq != std::string_view::npos) ? arg.substr(eq + 1)
-                                                                     : std::string_view{};
-                const bool has_eq  = (eq != std::string_view::npos);
+                const auto eq     = arg.find('=');
+                const bool has_eq = (eq != std::string_view::npos);
+                const auto name   = has_eq ? arg.substr(0, eq) : arg;
+                const auto inlval = has_eq ? arg.substr(eq + 1) : std::string_view{};
 
-                // Handle --no-FLAG for negatable flags
-                if (!has_eq && name.starts_with("--no-")) {
-                    auto positive_name = std::string("--") + std::string(name.substr(5));
-                    auto* nopt = find_opt(positive_name);
+                // An exact option name wins over the --no-FLAG interpretation.
+                auto* opt = find_opt(name);
+                if (!opt && !has_eq && name.starts_with("--no-")) {
+                    // Build "--" + name.substr(5) on the stack for the common
+                    // case; long names fall back to an owned string.
+                    const auto positive = name.substr(5);
+                    detail::OptionBase* nopt = nullptr;
+                    if (positive.size() <= 126) {
+                        char buf[128];
+                        buf[0] = '-';
+                        buf[1] = '-';
+                        std::ranges::copy(positive, buf + 2);
+                        nopt = find_opt(std::string_view(buf, positive.size() + 2));
+                    } else {
+                        std::string full;
+                        full.reserve(positive.size() + 2);
+                        full.append("--").append(positive);
+                        nopt = find_opt(full);
+                    }
                     if (nopt && nopt->is_flag_ && nopt->negatable_) {
-                        if (auto r = nopt->parse("false", name); !r) return r;
+                        if (auto r = nopt->set_negated(this); !r) return r;
                         continue;
                     }
                 }
-
-                auto* opt = find_opt(name);
-                if (!opt) return std::unexpected(ParseError::unknown(name, suggest(name)));
+                if (!opt) return std::unexpected(ParseError::unknown(name, suggest(name), this));
 
                 if (opt->is_flag_) {
-                    if (auto r = opt->parse("true", name); !r) return r;
+                    if (has_eq) {
+                        if (opt->is_count_option())
+                            return std::unexpected(ParseError::unexpected_value(name, inlval, this));
+                        if (auto r = opt->parse(inlval, name, this); !r) return r;
+                    } else {
+                        if (auto r = opt->set_implicit(this); !r) return r;
+                    }
                 } else if (has_eq) {
-                    if (auto r = opt->parse(inlval, name); !r) return r;
+                    if (auto r = opt->parse(inlval, name, this); !r) return r;
                 } else {
                     if (++i >= args.size())
-                        return std::unexpected(ParseError::missing_value(name));
-                    if (auto r = opt->parse(std::string_view(args[i]), name); !r) return r;
+                        return std::unexpected(ParseError::missing_value(name, this));
+                    if (auto r = opt->parse(args[i], name, this); !r) return r;
                 }
                 continue;
             }
 
-            // ── Short option(s):  -v  ·  -vxf  ·  -n5  ·  -n 5
-            // (at this point arg starts with '-' and len >= 2)
+            // A registered single-dash name may carry an inline value, e.g.
+            // `-verbose=5` or `-color=false`, just like its `--long` form.
+            if (arg.size() > 2 && arg[1] != '-') {
+                const auto eq = arg.find('=');
+                if (eq != std::string_view::npos) {
+                    const auto name = arg.substr(0, eq);
+                    if (auto* exact = find_opt(name)) {
+                        const auto inlval = arg.substr(eq + 1);
+                        if (exact->is_count_option())
+                            return std::unexpected(ParseError::unexpected_value(name, inlval, this));
+                        if (auto r = exact->parse(inlval, name, this); !r) return r;
+                        continue;
+                    }
+                }
+            }
+
+            // A registered single-dash name longer than one character (for
+            // example `-verbose`) is matched as a whole token before falling
+            // back to short-flag grouping.
+            if (auto* exact = find_opt(arg)) {
+                if (exact->is_flag_) {
+                    if (auto r = exact->set_implicit(this); !r) return r;
+                } else {
+                    if (++i >= args.size())
+                        return std::unexpected(ParseError::missing_value(arg, this));
+                    if (auto r = exact->parse(args[i], arg, this); !r) return r;
+                }
+                continue;
+            }
+
+            // ── Short option(s): -v · -vxf · -n5 · -n 5
             for (size_t ch = 1; ch < arg.size(); ++ch) {
-                const auto sopt = std::string("-") + arg[ch];
+                const char short_name[2] = {'-', arg[ch]};
+                const std::string_view sopt(short_name, 2);
                 auto* opt = find_opt(sopt);
-                if (!opt) return std::unexpected(ParseError::unknown(sopt, suggest(sopt)));
+                if (!opt) {
+                    if (sopt == "-h") return std::unexpected(ParseError::help_requested(this));
+                    if (sopt == "-V" && has_version)
+                        return std::unexpected(ParseError::version_requested(this));
+                    return std::unexpected(ParseError::unknown(sopt, suggest(sopt), this));
+                }
 
                 if (opt->is_flag_) {
-                    if (auto r = opt->parse("true", sopt); !r) return r;
-                    // Continue to next char (grouped flags: -vxf)
+                    // `-v=false` mirrors the long `--flag=false` spelling.
+                    if (ch + 1 < arg.size() && arg[ch + 1] == '=') {
+                        const auto inlval = arg.substr(ch + 2);
+                        if (opt->is_count_option())
+                            return std::unexpected(ParseError::unexpected_value(sopt, inlval, this));
+                        if (auto r = opt->parse(inlval, sopt, this); !r) return r;
+                        break;
+                    }
+                    if (auto r = opt->set_implicit(this); !r) return r;
                 } else {
-                    // Value = rest of this arg (inline: -n5) or next arg (-n 5)
                     std::string_view val;
                     if (ch + 1 < arg.size()) {
                         val = arg.substr(ch + 1);
+                        if (!val.empty() && val.front() == '=')
+                            val.remove_prefix(1);
                     } else {
                         if (++i >= args.size())
-                            return std::unexpected(ParseError::missing_value(sopt));
-                        val = std::string_view(args[i]);
+                            return std::unexpected(ParseError::missing_value(sopt, this));
+                        val = args[i];
                     }
-                    if (auto r = opt->parse(val, sopt); !r) return r;
-                    break;  // consumed everything in this arg token
+                    if (auto r = opt->parse(val, sopt, this); !r) return r;
+                    break;
                 }
             }
-        } // for each arg
+        }
 
-        return finalize();
+        return finalize(/*subcommand_active=*/false);
     }
 
-    // Apply defaults and enforce required constraints
-    [[nodiscard]] ParseResult finalize() {
-        for (auto& opt : options_)
-            if (!opt->is_set_ && opt->has_default()) opt->apply_default();
-        for (auto& pos : positionals_)
-            if (!pos->is_set_ && pos->has_default()) pos->apply_default();
-
+    [[nodiscard]] ParseResult finalize(bool subcommand_active) {
+        // 1. Apply environment fallbacks, then defaults, then enforce
+        //    required options.  These are independent per option, so a single
+        //    pass replaces three separate traversals.
         for (auto& opt : options_) {
-            if (opt->required_ && !opt->is_set_ && !opt->has_default())
-                return std::unexpected(ParseError::missing_required(opt->display_name()));
-        }
-        for (auto& pos : positionals_) {
-            if (pos->required_ && !pos->is_set_)
-                return std::unexpected(ParseError::missing_positional(pos->name));
+            if (!opt->is_set_ && !opt->env_var.empty()) {
+                if (const char* v = std::getenv(opt->env_var.c_str())) {
+                    if (auto r = opt->parse_env(v, this); !r) return r;
+                }
+            }
+            if (!opt->is_set_ && !opt->from_env_ && opt->has_default_)
+                opt->apply_default();
+            if (opt->required_ && !opt->is_set_ && !opt->from_env_ && !opt->has_default_)
+                return std::unexpected(ParseError::missing_required(opt->display_name(), this));
         }
 
-        // ── Mutex group constraints
-        for (auto& group : mutex_groups_) {
+        for (auto& pos : positionals_) {
+            if (!pos->is_set_ && !pos->env_var.empty()) {
+                if (const char* v = std::getenv(pos->env_var.c_str())) {
+                    if (auto r = pos->parse_env(v, this); !r) return r;
+                }
+            }
+            if (!pos->is_set_ && !pos->from_env_ && pos->has_default_)
+                pos->apply_default();
+        }
+        if (!subcommand_active) {
+            for (const auto& pos : positionals_) {
+                // Match options: a configured default satisfies required() even
+                // when required() is applied after default_val().
+                if (pos->required_ && !pos->is_set_ && !pos->from_env_
+                    && !pos->has_default_)
+                    return std::unexpected(ParseError::missing_positional(pos->name, this));
+            }
+            if (require_subcommand_ && !subcommands_.empty())
+                return std::unexpected(ParseError::missing_subcommand(full_name(), this));
+        }
+
+        // 2. Mutex group constraints.  Values supplied through the environment
+        // count as explicit choices; defaults do not.
+        for (const auto& group : mutex_resolved_) {
             std::string first_set;
-            for (auto& n : group) {
-                auto* opt = find_opt(n);
-                if (opt && opt->is_set_) {
+            for (auto* opt : group) {
+                if (opt->is_set_ || opt->from_env_) {
                     if (!first_set.empty())
-                        return std::unexpected(ParseError::mutually_exclusive(first_set, n));
-                    first_set = n;
+                        return std::unexpected(ParseError::mutually_exclusive(
+                            first_set, opt->display_name(), this));
+                    first_set = opt->display_name();
                 }
             }
         }
 
-        // ── Require-together constraints
-        for (auto& group : require_groups_) {
-            std::string any_set;
-            for (auto& n : group) {
-                auto* opt = find_opt(n);
-                if (opt && opt->is_set_) { any_set = n; break; }
+        // 3. Require-together constraints
+        for (const auto& group : require_resolved_) {
+            std::string_view any_set;
+            for (auto* opt : group) {
+                if (opt->is_set_ || opt->from_env_) {
+                    any_set = opt->display_name();
+                    break;
+                }
             }
             if (!any_set.empty()) {
-                for (auto& n : group) {
-                    auto* opt = find_opt(n);
-                    if (!opt || !opt->is_set_)
-                        return std::unexpected(ParseError::requires_option(any_set, n));
+                for (auto* opt : group) {
+                    if (!opt->is_set_ && !opt->from_env_)
+                        return std::unexpected(ParseError::requires_option(
+                            any_set, opt->display_name(), this));
                 }
             }
         }
 
-        // ── Post-parse transforms
+        // 4. Run whole-value validators and post-parse transforms
         for (auto& opt : options_)
-            opt->finalize_value();
+            if (opt->needs_finalize_)
+                if (auto r = opt->validate_and_finalize(this); !r) return r;
         for (auto& pos : positionals_)
-            pos->finalize_value();
+            if (pos->needs_finalize_)
+                if (auto r = pos->validate_and_finalize(this); !r) return r;
 
         return {};
     }
 
-    // ── Lookup helpers ────────────────────────────────────────────────────
-
     [[nodiscard]] detail::OptionBase* find_opt(std::string_view n) const noexcept {
-        for (auto& o : options_) if (o->matches(n)) return o.get();
-        return nullptr;
+        return registry_.find(n);
+    }
+
+    [[nodiscard]] App* find_command(std::string_view n) const noexcept {
+        const auto it = command_index_.find(n);
+        return it == command_index_.end() ? nullptr : it->second;
     }
 
     [[nodiscard]] std::string suggest(std::string_view token) const {
-        // Strip leading '-' so "--verbos" vs "--verbose" = distance 1 (not 7)
         auto strip = [](std::string_view s) {
             while (!s.empty() && s[0] == '-') s.remove_prefix(1);
             return s;
         };
         const auto tok = strip(token);
+        // Suggestions are a diagnostic aid, not a hot path.  Cap the input so
+        // an adversarial token cannot force quadratic edit-distance work even
+        // if the application registered an equally huge option name.
+        if (tok.size() > 128) return {};
+        // Avoid quadratic edit-distance work for absurdly long unknown tokens.
+        // A candidate can only be within distance 3 when its length is close.
+        auto distance = [tok](std::string_view candidate) -> size_t {
+            const size_t diff = tok.size() > candidate.size()
+                ? tok.size() - candidate.size()
+                : candidate.size() - tok.size();
+            if (diff > 3) return SIZE_MAX;
+            return detail::edit_distance(tok, candidate);
+        };
         std::string best;
         size_t best_d = SIZE_MAX;
-        for (auto& o : options_) {
-            for (auto& n : o->names) {
-                const auto d = detail::edit_distance(tok, strip(n));
+        for (const auto& o : options_) {
+            if (o->hidden_) continue;
+            for (const auto& n : o->names) {
+                const auto d = distance(strip(n));
                 if (d < best_d && d <= 3) { best_d = d; best = n; }
             }
-            // Also suggest --no-X variants for negatable flags
             if (o->negatable_) {
                 auto ln = o->long_name();
                 if (ln.starts_with("--")) {
                     auto neg = std::string("--no-") + std::string(ln.substr(2));
-                    const auto d = detail::edit_distance(tok, strip(neg));
+                    const auto d = distance(strip(neg));
                     if (d < best_d && d <= 3) { best_d = d; best = neg; }
                 }
             }
@@ -1486,37 +2520,45 @@ private:
         return best;
     }
 
-    void apply_env_vars() {
-        for (auto& opt : options_) {
-            if (opt->env_var.empty() || opt->is_set_) continue;
-            if (const char* v = std::getenv(opt->env_var.c_str()))
-                static_cast<void>(opt->parse(v, opt->env_var)); // best-effort, non-fatal
-        }
+    [[nodiscard]] std::string_view effective_version() const noexcept {
+        for (const App* p = this; p; p = p->parent_)
+            if (!p->version_.empty()) return p->version_;
+        return {};
     }
-
-    // ── Help rendering ────────────────────────────────────────────────────
 
     [[nodiscard]] std::string full_name() const {
         return parent_ ? (parent_->full_name() + " " + name_) : name_;
     }
 
-    void render_option_list() const {
+    void render_option_list(std::string& out) const {
         using X = detail::C;
 
-        // ── Collect section ordering (preserve first-appearance order)
+        // Built-ins step aside name-by-name when the user registered a custom
+        // option with the same spelling.
+        const bool show_help_short = find_opt("-h") == nullptr;
+        const bool show_help_long  = find_opt("--help") == nullptr;
+        const bool has_version     = !effective_version().empty();
+        const bool show_ver_short  = has_version && find_opt("-V") == nullptr;
+        const bool show_ver_long   = has_version && find_opt("--version") == nullptr;
+
         std::vector<std::string> section_order;
-        for (auto& o : options_) {
+        for (const auto& o : options_) {
             if (o->hidden_) continue;
             if (!std::ranges::contains(section_order, o->section_))
                 section_order.push_back(o->section_);
         }
-        if (!std::ranges::contains(section_order, std::string{}))
+        const bool has_unnamed = std::ranges::any_of(options_, [](const auto& o) {
+            return !o->hidden_ && o->section_.empty();
+        });
+        const bool has_builtin = show_help_short || show_help_long
+                              || show_ver_short || show_ver_long;
+        if ((has_unnamed || has_builtin)
+            && !std::ranges::contains(section_order, std::string{}))
             section_order.push_back({});
 
         const bool has_named = std::ranges::any_of(section_order,
-            [](const auto& s){ return !s.empty(); });
+            [](const auto& s) { return !s.empty(); });
 
-        // ── Measure widest left-hand column
         size_t col = 0;
         auto measure = [&](std::string_view sn, std::string_view ln,
                            std::string_view meta, bool is_flag, bool neg) {
@@ -1525,21 +2567,24 @@ private:
             if (!sn.empty() && !ln.empty()) w += 2;
             if (!ln.empty()) {
                 if (neg && ln.starts_with("--"))
-                    w += 7 + (ln.size() - 2); // "--[no-]" + flagname
+                    w += 7 + (ln.size() - 2);
                 else
                     w += ln.size();
             }
-            if (!is_flag && !meta.empty()) w += 2 + meta.size() + 1;
+            if (!is_flag && !meta.empty()) w += 3 + meta.size();
             col = std::max(col, w);
         };
-        for (auto& o : options_)
+        for (const auto& o : options_)
             if (!o->hidden_)
                 measure(o->short_name(), o->long_name(), o->meta, o->is_flag_, o->negatable_);
-        measure("-h", "--help",    {}, true, false);
-        measure("-V", "--version", {}, true, false);
+        if (show_help_short || show_help_long)
+            measure(show_help_short ? "-h" : "", show_help_long ? "--help" : "",
+                    {}, true, false);
+        if (show_ver_short || show_ver_long)
+            measure(show_ver_short ? "-V" : "", show_ver_long ? "--version" : "",
+                    {}, true, false);
         col = std::max(col + 2, size_t(30));
 
-        // ── Print one row
         auto row = [&](std::string_view sn, std::string_view ln, std::string_view meta,
                        bool is_flag, bool neg, std::string_view help, bool req,
                        std::string_view def, std::string_view choices_s,
@@ -1555,32 +2600,39 @@ private:
             }
             if (!is_flag && !meta.empty())
                 lhs += std::format(" <{}>", meta);
-            std::print("{}{:<{}}{}", X::bcyn(), lhs, col, X::rst());
-            std::print("{}", help);
-            if (req)               std::print("  {}[required]{}", X::bred(), X::rst());
-            if (!def.empty())      std::print("  {}[default: {}]{}", X::dim(), def, X::rst());
-            if (!choices_s.empty()) std::print("  {}[{}]{}", X::dim(), choices_s, X::rst());
-            if (!env_v.empty())    std::print("  {}[env: {}]{}", X::dim(), env_v, X::rst());
-            std::println();
+            out += std::format("{}{:<{}}{}", X::bcyn(), lhs, col, X::rst());
+            out += help;
+            if (req)                 out += std::format("  {}[required]{}", X::bred(), X::rst());
+            if (!def.empty())        out += std::format("  {}[default: {}]{}", X::dim(), def, X::rst());
+            if (!choices_s.empty())  out += std::format("  {}[{}]{}", X::dim(), choices_s, X::rst());
+            if (!env_v.empty())      out += std::format("  {}[env: {}]{}", X::dim(), env_v, X::rst());
+            out += '\n';
         };
 
-        // ── Render by section
         for (size_t si = 0; si < section_order.size(); ++si) {
             const auto& sec = section_order[si];
-            if (has_named && !sec.empty()) {
-                if (si > 0) std::println(); // blank line between sections
-                std::println("{}  {}{}:", X::bld(), sec, X::rst());
+            if (si > 0) out += '\n';
+            if (has_named) {
+                if (!sec.empty())
+                    out += std::format("{}  {}{}:\n", X::bld(), sec, X::rst());
+                else
+                    out += std::format("{}  Other Options{}:\n", X::bld(), X::rst());
             }
-            for (auto& o : options_) {
+            for (const auto& o : options_) {
                 if (o->hidden_ || o->section_ != sec) continue;
                 row(o->short_name(), o->long_name(), o->meta,
                     o->is_flag_, o->negatable_, o->help_text, o->required_,
                     o->default_str(), o->choices_str(), o->env_var);
             }
             if (sec.empty()) {
-                row("-h", "--help",    {}, true, false, "Print help and exit",    false, {}, {}, {});
-                if (!version_.empty())
-                    row("-V", "--version", {}, true, false, "Print version and exit", false, {}, {}, {});
+                if (show_help_short || show_help_long)
+                    row(show_help_short ? "-h" : "",
+                        show_help_long ? "--help" : "",
+                        {}, true, false, "Print help and exit", false, {}, {}, {});
+                if (show_ver_short || show_ver_long)
+                    row(show_ver_short ? "-V" : "",
+                        show_ver_long ? "--version" : "",
+                        {}, true, false, "Print version and exit", false, {}, {}, {});
             }
         }
     }
