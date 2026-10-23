@@ -1,8 +1,9 @@
 add_executable(basic       basic.cpp)
 add_executable(subcommands subcommands.cpp)
 add_executable(completions completions.cpp)
+add_executable(config      config.cpp)
 
-foreach(target basic subcommands completions)
+foreach(target basic subcommands completions config)
     target_link_libraries(${target} PRIVATE cli::cli)
     set_target_properties(${target} PROPERTIES
         CXX_STANDARD          23
