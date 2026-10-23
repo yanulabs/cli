@@ -18,6 +18,7 @@ set(CLI_TEST_SOURCES
     test_lifecycle.cpp
     test_custom_types.cpp
     test_robustness.cpp
+    test_upstream_edge_cases.cpp
 )
 
 add_executable(test_parse ${CLI_TEST_SOURCES})
@@ -49,6 +50,7 @@ set(CLI_TEST_DOMAINS
     robustness
     subcommands
     tokens
+    upstream_edge_cases
     values
 )
 
