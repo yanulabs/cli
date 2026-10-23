@@ -1,0 +1,187 @@
+name: CI
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  unix:
+    name: ${{ matrix.os }} / ${{ matrix.build_type }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-24.04
+            cxx: g++-14
+            cc: gcc-14
+            build_type: Debug
+          - os: ubuntu-24.04
+            cxx: g++-14
+            cc: gcc-14
+            build_type: Release
+          - os: macos-latest
+            cxx: clang++
+            cc: clang
+            build_type: Debug
+          - os: macos-latest
+            cxx: clang++
+            cc: clang
+            build_type: Release
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install GCC 14
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y g++-14
+      - name: Configure
+        env:
+          CC: ${{ matrix.cc }}
+          CXX: ${{ matrix.cxx }}
+        run: >
+          cmake -S . -B build
+          -DCMAKE_BUILD_TYPE=${{ matrix.build_type }}
+          -DCLI_BUILD_EXAMPLES=ON
+          -DCLI_BUILD_TESTS=ON
+          -DCLI_INSTALL=OFF
+      - name: Build
+        run: cmake --build build --parallel
+      - name: Test
+        run: ctest --test-dir build --output-on-failure
+
+  windows:
+    name: windows / ${{ matrix.build_type }}
+    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        build_type: [Debug, Release]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Configure
+        run: >
+          cmake -S . -B build
+          -DCLI_BUILD_EXAMPLES=ON
+          -DCLI_BUILD_TESTS=ON
+          -DCLI_INSTALL=OFF
+      - name: Build
+        run: cmake --build build --config ${{ matrix.build_type }} --parallel
+      - name: Test
+        run: ctest --test-dir build -C ${{ matrix.build_type }} --output-on-failure
+
+  sanitizers:
+    name: ASan + UBSan
+    runs-on: ubuntu-24.04
+    env:
+      ASAN_OPTIONS: detect_leaks=0
+      UBSAN_OPTIONS: halt_on_error=1:print_stacktrace=1
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install GCC 14
+        run: sudo apt-get update && sudo apt-get install -y g++-14
+      - name: Configure
+        env:
+          CC: gcc-14
+          CXX: g++-14
+        run: >
+          cmake -S . -B build
+          -DCMAKE_BUILD_TYPE=Debug
+          -DCLI_BUILD_EXAMPLES=ON
+          -DCLI_BUILD_TESTS=ON
+          -DCLI_INSTALL=OFF
+          -DCMAKE_CXX_FLAGS="-fsanitize=address,undefined -fno-omit-frame-pointer"
+          -DCMAKE_EXE_LINKER_FLAGS="-fsanitize=address,undefined"
+      - name: Build
+        run: cmake --build build --parallel
+      - name: Test
+        run: ctest --test-dir build --output-on-failure
+
+  install:
+    name: install + find_package consumer
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install GCC 14
+        run: sudo apt-get update && sudo apt-get install -y g++-14
+      - name: Configure and install
+        env:
+          CC: gcc-14
+          CXX: g++-14
+        run: |
+          cmake -S . -B build \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCLI_BUILD_EXAMPLES=OFF \
+            -DCLI_BUILD_TESTS=OFF \
+            -DCLI_INSTALL=ON
+          cmake --build build --parallel
+          cmake --install build --prefix "$RUNNER_TEMP/cli-install"
+      - name: Build a downstream consumer
+        run: |
+          mkdir -p "$RUNNER_TEMP/cli-consumer"
+          cat > "$RUNNER_TEMP/cli-consumer/CMakeLists.txt" <<'EOF'
+          cmake_minimum_required(VERSION 3.25)
+          project(consumer LANGUAGES CXX)
+          find_package(cli REQUIRED CONFIG)
+          add_executable(consumer main.cpp)
+          target_link_libraries(consumer PRIVATE cli::cli)
+          EOF
+          cat > "$RUNNER_TEMP/cli-consumer/main.cpp" <<'EOF'
+          #include <cli.hpp>
+          int main() {
+              cli::App app("consumer");
+              auto value = app.add<int>("--value");
+              auto result = app.parse({"--value", "7"});
+              return result && *value == 7 ? 0 : 1;
+          }
+          EOF
+          cmake -S "$RUNNER_TEMP/cli-consumer" -B "$RUNNER_TEMP/cli-consumer/build" \
+            -DCMAKE_PREFIX_PATH="$RUNNER_TEMP/cli-install"
+          cmake --build "$RUNNER_TEMP/cli-consumer/build" --parallel
+          "$RUNNER_TEMP/cli-consumer/build/consumer"
+
+  strict:
+    name: strict warnings + no RTTI
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install GCC 14
+        run: sudo apt-get update && sudo apt-get install -y g++-14
+      - name: Compile all translation units
+        run: >
+          g++-14 -std=c++23 -Iinclude -Itests
+          -Wall -Wextra -Wpedantic -Wshadow -Wconversion -Wsign-conversion
+          -Werror -fno-rtti -fsyntax-only tests/*.cpp
+          examples/*.cpp
+
+  fuzz:
+    name: libFuzzer smoke
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Clang 19 and libc++
+        run: |
+          wget -q https://apt.llvm.org/llvm.sh
+          chmod +x llvm.sh
+          sudo ./llvm.sh 19
+          sudo apt-get install -y libc++-19-dev libc++abi-19-dev
+      - name: Configure
+        run: >
+          cmake -S . -B build
+          -DCMAKE_BUILD_TYPE=RelWithDebInfo
+          -DCMAKE_CXX_COMPILER=clang++-19
+          -DCMAKE_CXX_FLAGS="-stdlib=libc++"
+          -DCLI_BUILD_EXAMPLES=OFF
+          -DCLI_BUILD_TESTS=ON
+          -DCLI_BUILD_FUZZERS=ON
+          -DCLI_INSTALL=OFF
+      - name: Build fuzz target
+        run: cmake --build build --target fuzz_parse --parallel
+      - name: Fuzz
+        run: ./build/tests/fuzz_parse -runs=100000 -max_len=4096 -timeout=5 -print_final_stats=1
