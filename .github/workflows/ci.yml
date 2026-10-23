@@ -160,6 +160,29 @@ jobs:
           -Werror -fno-rtti -fsyntax-only tests/*.cpp
           examples/*.cpp
 
+  benchmarks:
+    name: benchmark smoke
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install GCC 14
+        run: sudo apt-get update && sudo apt-get install -y g++-14
+      - name: Configure
+        env:
+          CC: gcc-14
+          CXX: g++-14
+        run: >
+          cmake -S . -B build
+          -DCMAKE_BUILD_TYPE=Release
+          -DCLI_BUILD_EXAMPLES=OFF
+          -DCLI_BUILD_TESTS=OFF
+          -DCLI_BUILD_BENCHMARKS=ON
+          -DCLI_INSTALL=OFF
+      - name: Build and run
+        run: |
+          cmake --build build --target bench_parse --parallel
+          ./build/bench/bench_parse 50000
+
   fuzz:
     name: libFuzzer smoke
     runs-on: ubuntu-24.04
