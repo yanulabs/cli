@@ -41,13 +41,24 @@ TEST_CASE("an unknown subcommand name falls through to a positional") {
     CHECK(!app.active_subcommand());
 }
 
-TEST_CASE("an unknown subcommand without a positional is unexpected") {
+TEST_CASE("an unknown subcommand without a positional is reported as an unknown command") {
     cli::App app("t");
     (void)app.subcommand("build", "");
 
     auto r = app.parse({"notacommand"});
     REQUIRE(!r);
+    CHECK(r.error().kind == cli::ParseError::Kind::UnknownCommand);
+    CHECK(contains(r.error().message, "notacommand"));
+}
+
+TEST_CASE("after -- a surplus token is not treated as an unknown command") {
+    cli::App app("t");
+    (void)app.subcommand("build", "");
+
+    auto r = app.parse({"--", "notacommand"});
+    REQUIRE(!r);
     CHECK(r.error().kind == cli::ParseError::Kind::TooManyPositionals);
+    CHECK(contains(r.error().message, "notacommand"));
 }
 
 TEST_CASE("nested subcommands dispatch recursively") {

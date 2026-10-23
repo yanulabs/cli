@@ -9,6 +9,7 @@ set(CLI_TEST_SOURCES
     test_constraints.cpp
     test_groups.cpp
     test_environment.cpp
+    test_extensions.cpp
     test_subcommands.cpp
     test_errors.cpp
     test_help.cpp
@@ -37,6 +38,7 @@ set(CLI_TEST_DOMAINS
     custom_types
     environment
     errors
+    extensions
     flags
     groups
     help

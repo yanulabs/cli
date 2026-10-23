@@ -13,25 +13,31 @@
 //  · Custom types via ADL: cli_parse( std::string_view ) & cli_format( const T& )
 //  · Constraints: .range() · .choices() · .validate(fn, desc) on Options & Positionals
 //  · Multi-value delimiter splitting: .delimiter(',') for --items=a,b,c
+//  · Fixed/range/at-least arity: .nargs(2) · .nargs(1,3) · .nargs_at_least(1)
 //  · Mutually exclusive groups:  mutex_group({"--verbose","--quiet"})
 //  · Required-together groups:   require_together({"--output","--format"})
+//  · Require-at-least-one groups: require_one_of({"--json","--yaml"})
 //  · Per-option & positional env-var fallback via .env("VAR")
+//  · INI config files + @response files with CLI/env/config precedence
 //  · Post-parse value transforms via .transform(fn)
 //  · Short-flag grouping   -vxf  ≡  -v -x -f  (including -h / -V)
 //  · Count options:        -vvv  ≡  -v -v -v  (increments per occurrence)
 //  · Inline short value    -n42  ≡  -n 42
 //  · Inline long value   --out=file  ≡  --out file  and  --flag=false
+//  · Long-option abbreviation (.allow_abbrev) and option aliases (.alias)
+//  · Unknown-option / unknown-command "did you mean?" suggestions
 //  · Standard '-' token treated as positional (stdin/stdout)
 //  · End-of-options marker  --
-//  · Subcommands with independent option sets, aliases, and recursive help
+//  · Subcommands with independent option sets, aliases, hidden verbs, recursion
 //  · Negatable flags: add_flag("--color").default_val(true).negatable()
 //  · Named option sections in help: .section("Connection Options")
 //  · Auto-aligned, ANSI-colored, section-structured help output
-//  · Levenshtein "did you mean?" suggestions on unknown options
 //  · Bash / Fish / Zsh shell completion generators
+//  · allow_extras() + remaining_args() for wrapper/forwarding tools
 // ════════════════════════════════════════════════════════════════════════════
 
 #include <algorithm>
+#include <array>
 #include <cctype>
 #include <charconv>
 #include <concepts>
@@ -41,9 +47,11 @@
 #include <expected>
 #include <filesystem>
 #include <format>
+#include <fstream>
 #include <functional>
 #include <initializer_list>
 #include <iostream>
+#include <iterator>
 #include <limits>
 #include <memory>
 #include <numeric>
@@ -89,6 +97,10 @@ struct ParseError {
         BadChoice,
         MutuallyExclusive,
         RequiresOption,
+        UnknownCommand,
+        ConfigError,
+        AmbiguousOption,
+        ResponseFileError,
     };
 
     Kind        kind;
@@ -136,6 +148,10 @@ struct ParseError {
         return { Kind::MissingSubcommand,
                  std::format("a command is required for '{}'", app_name), app };
     }
+    static ParseError missing_one_of(std::string_view names, const App* app = nullptr) {
+        return { Kind::MissingRequired,
+                 std::format("one of {} must be provided", names), app };
+    }
     static ParseError out_of_range(std::string_view opt, std::string_view val,
                                    std::string_view lo, std::string_view hi, const App* app = nullptr) {
         return { Kind::OutOfRange,
@@ -163,6 +179,29 @@ struct ParseError {
     static ParseError requires_option(std::string_view opt, std::string_view req, const App* app = nullptr) {
         return { Kind::RequiresOption,
                  std::format("'{}' requires '{}' to also be provided", opt, req), app };
+    }
+    static ParseError unknown_command(std::string_view cmd, std::string_view sug = {},
+                                      const App* app = nullptr) {
+        if (sug.empty())
+            return { Kind::UnknownCommand,
+                     std::format("unknown command '{}'", cmd), app };
+        return { Kind::UnknownCommand,
+                 std::format("unknown command '{}' — did you mean '{}'?", cmd, sug), app };
+    }
+    static ParseError config(std::string_view path, std::string_view why,
+                             const App* app = nullptr) {
+        return { Kind::ConfigError,
+                 std::format("config file '{}': {}", path, why), app };
+    }
+    static ParseError ambiguous(std::string_view opt, std::string_view matches,
+                                const App* app = nullptr) {
+        return { Kind::AmbiguousOption,
+                 std::format("option '{}' is ambiguous — matches: {}", opt, matches), app };
+    }
+    static ParseError response_file(std::string_view path, std::string_view why,
+                                    const App* app = nullptr) {
+        return { Kind::ResponseFileError,
+                 std::format("response file '{}': {}", path, why), app };
     }
 };
 
@@ -534,8 +573,16 @@ inline void validate_env_name(std::string_view name) {
 // keeps keys valid even if an option's `names` vector reallocates later.
 struct OptionRegistry {
     std::unordered_map<std::string, OptionBase*, StringHash, std::equal_to<>> by_name;
+    // One-character short options are by far the most common token shape.
+    // A direct ASCII index avoids hashing for every `-v` / `-j` lookup.
+    std::array<OptionBase*, 128> one_char{};
 
     [[nodiscard]] OptionBase* find(std::string_view name) const noexcept {
+        if (name.size() == 2 && name[0] == '-') {
+            const auto c = static_cast<unsigned char>(name[1]);
+            if (c < one_char.size() && one_char[c] != nullptr)
+                return one_char[c];
+        }
         const auto it = by_name.find(name);
         return it == by_name.end() ? nullptr : it->second;
     }
@@ -552,9 +599,15 @@ struct OptionRegistry {
         if (!inserted)
             throw std::invalid_argument(
                 std::format("cli: duplicate option name '{}'", name));
+        if (name.size() == 2 && name[0] == '-') {
+            const auto c = static_cast<unsigned char>(name[1]);
+            if (c < one_char.size()) one_char[c] = option;
+        }
     }
 
     void remove(OptionBase* option) {
+        for (auto& slot : one_char)
+            if (slot == option) slot = nullptr;
         for (auto it = by_name.begin(); it != by_name.end();) {
             if (it->second == option) it = by_name.erase(it);
             else ++it;
@@ -575,10 +628,16 @@ struct OptionBase {
     bool                     is_flag_   = false;
     bool                     is_set_    = false;
     bool                     from_env_  = false;
+    bool                     from_config_ = false;
     bool                     hidden_    = false;
     std::string              section_;
     bool                     negatable_ = false;
     char                     delimiter_ = '\0';
+    // 0/0 means the classic one-value-per-occurrence behaviour.  When set,
+    // nargs_min_/nargs_max_ count *tokens* consumed by one occurrence
+    // (SIZE_MAX means unbounded).
+    size_t                   nargs_min_ = 0;
+    size_t                   nargs_max_ = 0;
     bool                     has_default_        = false;
     bool                     needs_finalize_     = false;
     OptionRegistry*          registry_   = nullptr;
@@ -604,7 +663,7 @@ struct OptionBase {
     virtual bool        is_multi()         const noexcept = 0;
     virtual bool        is_count_option()  const noexcept { return false; }
     virtual const void* type_id()          const noexcept = 0;
-    virtual void        reset() noexcept { is_set_ = false; from_env_ = false; }
+    virtual void        reset() noexcept { is_set_ = false; from_env_ = false; from_config_ = false; }
 
     [[nodiscard]] bool matches(std::string_view t) const noexcept {
         return std::ranges::any_of(names, [t](const auto& n) { return n == t; });
@@ -886,6 +945,7 @@ struct PositionalBase {
     bool        required_ = true;
     bool        is_set_   = false;
     bool        from_env_ = false;
+    bool        from_config_ = false;
     bool        variadic_ = false;
     char        delimiter_ = '\0';
     bool        has_default_     = false;
@@ -899,7 +959,7 @@ struct PositionalBase {
     virtual void        apply_default()                               = 0;
     virtual std::string default_str() const                           = 0;
     virtual std::string choices_str() const                           = 0;
-    virtual void        reset() noexcept { is_set_ = false; from_env_ = false; }
+    virtual void        reset() noexcept { is_set_ = false; from_env_ = false; from_config_ = false; }
 };
 
 template<typename T>
@@ -1062,6 +1122,248 @@ private:
     }
 };
 
+// ────────────────────────────────────────────────────────────────────────────
+// §5.5  Config data — small INI/TOML-style reader
+// ────────────────────────────────────────────────────────────────────────────
+
+struct ConfigData {
+    using Section = std::unordered_map<std::string, std::string, StringHash, std::equal_to<>>;
+    std::unordered_map<std::string, Section, StringHash, std::equal_to<>> sections;
+};
+
+[[nodiscard]] inline std::string_view trim_view(std::string_view s) noexcept {
+    while (!s.empty() && std::isspace(static_cast<unsigned char>(s.front())))
+        s.remove_prefix(1);
+    while (!s.empty() && std::isspace(static_cast<unsigned char>(s.back())))
+        s.remove_suffix(1);
+    return s;
+}
+
+inline void strip_matching_quotes(std::string& s) {
+    if (s.size() >= 2 && ((s.front() == '"' && s.back() == '"')
+                          || (s.front() == '\'' && s.back() == '\'')))
+        s = s.substr(1, s.size() - 2);
+}
+
+/// Remove an unquoted `#`/`;` comment that starts a new field (preceded by
+/// whitespace), preserving hashes inside paths such as `a#b`.
+[[nodiscard]] inline std::string_view strip_inline_comment(std::string_view s) noexcept {
+    char quote = '\0';
+    bool escaped = false;
+    for (size_t i = 0; i < s.size(); ++i) {
+        const char c = s[i];
+        if (escaped) { escaped = false; continue; }
+        if (quote != '\0') {
+            if (c == '\\' && quote == '"') escaped = true;
+            else if (c == quote) quote = '\0';
+            continue;
+        }
+        if (c == '"' || c == '\'') {
+            quote = c;
+        } else if ((c == '#' || c == ';')
+                   && (i == 0 || std::isspace(static_cast<unsigned char>(s[i - 1])))) {
+            return s.substr(0, i);
+        }
+    }
+    return s;
+}
+
+[[nodiscard]] inline std::expected<ConfigData, std::string>
+parse_config(std::string_view text) {
+    ConfigData data;
+    std::string section;
+    size_t line_no = 0;
+    while (!text.empty()) {
+        ++line_no;
+        const auto nl = text.find('\n');
+        auto line = trim_view(text.substr(0, nl));
+        text = (nl == std::string_view::npos) ? std::string_view{}
+                                              : text.substr(nl + 1);
+        if (!line.empty() && line.back() == '\r')
+            line.remove_suffix(1);
+        if (line.empty() || line.front() == '#' || line.front() == ';')
+            continue;
+        if (line.front() == '[') {
+            const auto close = line.find(']');
+            if (close == std::string_view::npos)
+                return std::unexpected(
+                    std::format("line {}: unterminated section header", line_no));
+            section = std::string(trim_view(line.substr(1, close - 1)));
+            if (section.empty())
+                return std::unexpected(
+                    std::format("line {}: empty section name", line_no));
+            continue;
+        }
+        const auto eq = line.find('=');
+        std::string key;
+        std::string value;
+        if (eq == std::string_view::npos) {
+            key   = std::string(trim_view(line));
+            value = "true";
+        } else {
+            key   = std::string(trim_view(line.substr(0, eq)));
+            auto raw_value = trim_view(line.substr(eq + 1));
+            value = std::string(trim_view(strip_inline_comment(raw_value)));
+        }
+        if (key.empty())
+            return std::unexpected(
+                std::format("line {}: missing key", line_no));
+        strip_matching_quotes(value);
+        data.sections[section][std::move(key)] = std::move(value);
+    }
+    return data;
+}
+
+/// Return the config value for the first matching option spelling.
+[[nodiscard]] inline const std::string*
+config_value_for(const ConfigData::Section& section,
+                 const std::vector<std::string>& names) {
+    for (const auto& name : names) {
+        std::string_view key = name;
+        if (key.starts_with("--"))      key.remove_prefix(2);
+        else if (key.starts_with('-'))  key.remove_prefix(1);
+        if (const auto it = section.find(key); it != section.end())
+            return &it->second;
+        if (const auto it = section.find(name); it != section.end())
+            return &it->second;
+    }
+    return nullptr;
+}
+
+/// Split `[a, "b,c"]` (or a plain scalar) into individual config values.
+[[nodiscard]] inline std::vector<std::string> config_values(std::string_view raw) {
+    const bool list = raw.size() >= 2 && raw.front() == '[' && raw.back() == ']';
+    if (!list) return { std::string(raw) };
+    raw = raw.substr(1, raw.size() - 2);
+    std::vector<std::string> values;
+    std::string current;
+    char quote = '\0';
+    for (char c : raw) {
+        if (quote != '\0') {
+            if (c == quote) quote = '\0';
+            else current += c;
+        } else if (c == '"' || c == '\'') {
+            quote = c;
+        } else if (c == ',') {
+            auto v = trim_view(current);
+            values.emplace_back(v);
+            current.clear();
+        } else {
+            current += c;
+        }
+    }
+    auto last = trim_view(current);
+    if (!last.empty() || !values.empty())
+        values.emplace_back(last);
+    return values;
+}
+
+// ── Response-file tokenisation ──────────────────────────────────────────────
+
+[[nodiscard]] inline std::expected<std::vector<std::string>, std::string>
+tokenize_response_file(std::string_view text) {
+    std::vector<std::string> tokens;
+    std::string current;
+    bool started = false;
+    char quote   = '\0';
+    bool escaped = false;
+    bool comment = false;
+    for (char c : text) {
+        if (comment) {
+            if (c == '\n') comment = false;
+            continue;
+        }
+        if (escaped) {
+            current += c;
+            started = true;
+            escaped = false;
+            continue;
+        }
+        if (quote != '\0') {
+            if (c == quote) quote = '\0';
+            else if (c == '\\' && quote == '"') escaped = true;
+            else current += c;
+            started = true;
+            continue;
+        }
+        if (c == '\\') {
+            escaped = true;
+            started = true;
+        } else if (c == '"' || c == '\'') {
+            quote   = c;
+            started = true;
+        } else if (c == '#') {
+            if (!started) {
+                comment = true;
+            } else {
+                current += c;
+            }
+        } else if (std::isspace(static_cast<unsigned char>(c))) {
+            if (started) {
+                tokens.push_back(std::move(current));
+                current.clear();
+                started = false;
+            }
+        } else {
+            current += c;
+            started = true;
+        }
+    }
+    if (escaped || quote != '\0')
+        return std::unexpected("unterminated quote or escape");
+    if (started) tokens.push_back(std::move(current));
+    return tokens;
+}
+
+inline std::expected<std::vector<std::string>, ParseError>
+expand_response_tokens(std::span<const std::string_view> args,
+                       const App* app, unsigned depth = 0) {
+    std::vector<std::string> expanded;
+    expanded.reserve(args.size());
+    for (const auto token : args) {
+        if (token.size() < 2 || token.front() != '@') {
+            expanded.emplace_back(token);
+            continue;
+        }
+        if (token[1] == '@') { // escape: @@name expands to @name
+            expanded.emplace_back(token.substr(1));
+            continue;
+        }
+        if (depth >= 8)
+            return std::unexpected(ParseError::response_file(
+                token.substr(1), "nesting exceeds 8 levels", app));
+        const std::string path(token.substr(1));
+        std::ifstream in(path, std::ios::binary);
+        if (!in)
+            return std::unexpected(ParseError::response_file(
+                path, "cannot open file", app));
+        in.seekg(0, std::ios::end);
+        const auto end = in.tellg();
+        if (end < 0)
+            return std::unexpected(ParseError::response_file(
+                path, "cannot determine size", app));
+        constexpr std::streamoff max_size = 4 * 1024 * 1024;
+        if (end > max_size)
+            return std::unexpected(ParseError::response_file(
+                path, "file is larger than 4 MiB", app));
+        in.seekg(0, std::ios::beg);
+        std::string text(static_cast<size_t>(end), '\0');
+        if (end > 0 && !in.read(text.data(), end))
+            return std::unexpected(ParseError::response_file(
+                path, "read failed", app));
+        auto tokens = tokenize_response_file(text);
+        if (!tokens)
+            return std::unexpected(ParseError::response_file(path, tokens.error(), app));
+        std::vector<std::string_view> views;
+        views.reserve(tokens->size());
+        for (const auto& t : *tokens) views.emplace_back(t);
+        auto nested = expand_response_tokens(views, app, depth + 1);
+        if (!nested) return nested;
+        for (auto& t : *nested) expanded.push_back(std::move(t));
+    }
+    return expanded;
+}
+
 } // namespace detail
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -1170,9 +1472,49 @@ public:
         return std::forward<decltype(self)>(self);
     }
 
+    /// Register an additional spelling for this option.
+    auto&& alias(this auto&& self, std::string_view s) {
+        detail::append_option_name(self.p_, s);
+        return std::forward<decltype(self)>(self);
+    }
+
+    /// Consume exactly `n` following tokens for one occurrence.
+    auto&& nargs(this auto&& self, size_t n) requires detail::is_vec_v<T> {
+        if (n == 0)
+            throw std::invalid_argument("cli: nargs() requires at least one value");
+        self.p_->nargs_min_ = n;
+        self.p_->nargs_max_ = n;
+        return std::forward<decltype(self)>(self);
+    }
+
+    /// Consume between `lo` and `hi` following tokens for one occurrence.
+    auto&& nargs(this auto&& self, size_t lo, size_t hi) requires detail::is_vec_v<T> {
+        if (lo == 0 || hi < lo)
+            throw std::invalid_argument(
+                "cli: nargs(lo, hi) requires 1 <= lo <= hi");
+        self.p_->nargs_min_ = lo;
+        self.p_->nargs_max_ = hi;
+        return std::forward<decltype(self)>(self);
+    }
+
+    /// Consume at least `lo` tokens, stopping at the next option-looking token.
+    auto&& nargs_at_least(this auto&& self, size_t lo) requires detail::is_vec_v<T> {
+        if (lo == 0)
+            throw std::invalid_argument(
+                "cli: nargs_at_least() requires at least one value");
+        self.p_->nargs_min_ = lo;
+        self.p_->nargs_max_ = static_cast<size_t>(-1);
+        return std::forward<decltype(self)>(self);
+    }
+
     auto&& section(this auto&& self, std::string_view s) {
         self.p_->section_ = std::string(s);
         return std::forward<decltype(self)>(self);
+    }
+
+    /// Alias for section(), matching the vocabulary of other CLI libraries.
+    auto&& group(this auto&& self, std::string_view s) {
+        return std::forward<decltype(self)>(self).section(s);
     }
 
     [[nodiscard]] std::optional<T>&       get()       noexcept { return p_->value; }
@@ -1225,6 +1567,15 @@ public:
         self.p_->section_ = std::string(s);
         return std::forward<decltype(self)>(self);
     }
+    /// Alias for section(), matching the vocabulary of other CLI libraries.
+    auto&& group(this auto&& self, std::string_view s) {
+        return std::forward<decltype(self)>(self).section(s);
+    }
+    /// Register an additional spelling for this option.
+    auto&& alias(this auto&& self, std::string_view s) {
+        detail::append_option_name(self.p_, s);
+        return std::forward<decltype(self)>(self);
+    }
     auto&& required(this auto&& self, bool r = true) {
         self.p_->required_ = r;
         return std::forward<decltype(self)>(self);
@@ -1275,6 +1626,15 @@ public:
         self.p_->section_ = std::string(s);
         return std::forward<decltype(self)>(self);
     }
+    /// Alias for section(), matching the vocabulary of other CLI libraries.
+    auto&& group(this auto&& self, std::string_view s) {
+        return std::forward<decltype(self)>(self).section(s);
+    }
+    /// Register an additional spelling for this option.
+    auto&& alias(this auto&& self, std::string_view s) {
+        detail::append_option_name(self.p_, s);
+        return std::forward<decltype(self)>(self);
+    }
     auto&& required(this auto&& self, bool r = true) {
         self.p_->required_ = r;
         return std::forward<decltype(self)>(self);
@@ -1283,7 +1643,7 @@ public:
     [[nodiscard]] unsigned operator*()            const noexcept { return p_->count_; }
     [[nodiscard]] explicit operator bool()        const noexcept { return p_->count_ > 0; }
     [[nodiscard]] bool     is_set()               const noexcept { return p_->is_set_; }
-    [[nodiscard]] unsigned value_or(unsigned fb)  const noexcept { return (p_->is_set_ || p_->from_env_) ? p_->count_ : fb; }
+    [[nodiscard]] unsigned value_or(unsigned fb)  const noexcept { return (p_->is_set_ || p_->from_env_ || p_->from_config_) ? p_->count_ : fb; }
 };
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -1405,12 +1765,25 @@ class App {
     std::function<void(App&)>                            callback_;
     std::vector<std::string>                             aliases_;
     bool                                                 require_subcommand_ = false;
+    bool                                                 hidden_ = false;
+    bool                                                 allow_extras_ = false;
+    bool                                                 allow_abbrev_ = false;
+    bool                                                 response_files_ = false;
+    std::vector<std::string>                             remaining_args_;
+    std::string                                          config_file_;
+    bool                                                 config_required_ = false;
+    detail::OptionImpl<std::string>*                     config_option_ = nullptr;
+    detail::ConfigData                                   config_data_;
+    std::string                                          config_loaded_path_;
+    bool                                                 config_loaded_ = false;
     std::vector<std::vector<std::string>>                mutex_groups_;
     std::vector<std::vector<std::string>>                require_groups_;
+    std::vector<std::vector<std::string>>                require_one_groups_;
     // Group references are resolved once after registration and reused by
     // every parse.  Pointers stay valid because options are heap-owned.
     std::vector<std::vector<detail::OptionBase*>>        mutex_resolved_;
     std::vector<std::vector<detail::OptionBase*>>        require_resolved_;
+    std::vector<std::vector<detail::OptionBase*>>        require_one_resolved_;
     bool                                                 groups_dirty_ = true;
 
     App(const App&)            = delete;
@@ -1611,10 +1984,87 @@ public:
         groups_dirty_ = true;
         return *this;
     }
+
+    /// At least one of the listed options must be provided.
+    App& require_one_of(std::initializer_list<std::string_view> names) {
+        if (names.size() == 0)
+            throw std::invalid_argument("cli: require_one_of() requires at least one option");
+        std::vector<std::string> g;
+        g.reserve(names.size());
+        for (auto n : names) g.emplace_back(n);
+        require_one_groups_.push_back(std::move(g));
+        groups_dirty_ = true;
+        return *this;
+    }
     // ── Subcommand registration ───────────────────────────────────────────
 
     App& require_subcommand(bool required = true) {
         require_subcommand_ = required;
+        return *this;
+    }
+
+    /// Hide this command from help and shell-completion output.  It remains
+    /// fully dispatchable, which is useful for internal or experimental verbs.
+    App& hidden(bool h = true) {
+        hidden_ = h;
+        return *this;
+    }
+
+    /// Collect unknown options and surplus positional tokens instead of
+    /// failing, and expose them through remaining_args().
+    App& allow_extras(bool enabled = true) {
+        allow_extras_ = enabled;
+        return *this;
+    }
+
+    /// Accept unambiguous prefixes of long options, e.g. --verb → --verbose.
+    App& allow_abbrev(bool enabled = true) {
+        allow_abbrev_ = enabled;
+        return *this;
+    }
+
+    /// Expand `@file` arguments using shell-like quoting.  Must be enabled on
+    /// the root command; nested response files are supported up to 8 levels.
+    App& response_files(bool enabled = true) {
+        if (parent_ != nullptr)
+            throw std::invalid_argument(
+                "cli: response_files() must be configured on the root command");
+        response_files_ = enabled;
+        return *this;
+    }
+
+    /// Tokens that were not consumed by an option or positional.  Populated
+    /// only when allow_extras() is enabled.
+    [[nodiscard]] const std::vector<std::string>& remaining_args() const noexcept {
+        return remaining_args_;
+    }
+
+    /// Load defaults from an INI/TOML-style file.  Command-line values win
+    /// over environment variables, which win over config values, which win
+    /// over built-in defaults.  A missing file is ignored unless `required`.
+    App& config_file(std::string path, bool required = false) {
+        if (parent_ != nullptr)
+            throw std::invalid_argument(
+                "cli: config_file() must be configured on the root command");
+        config_file_     = std::move(path);
+        config_required_ = required;
+        config_loaded_   = false;
+        config_loaded_path_.clear();
+        config_data_ = {};
+        return *this;
+    }
+
+    /// Register a `--config <FILE>` option whose value overrides config_file()
+    /// for this invocation.  Must be called on the root command.
+    App& config_option(std::string_view name = "--config") {
+        if (parent_ != nullptr)
+            throw std::invalid_argument(
+                "cli: config_option() must be configured on the root command");
+        if (config_option_ != nullptr)
+            throw std::invalid_argument("cli: config_option() already registered");
+        auto opt = add<std::string>(name);
+        opt.help("Read defaults from an INI-style config file").meta("FILE");
+        config_option_ = opt.p_;
         return *this;
     }
 
@@ -1681,6 +2131,8 @@ public:
     void reset() noexcept {
         for (auto& opt : options_)     opt->reset();
         for (auto& pos : positionals_) pos->reset();
+        remaining_args_.clear();
+        config_loaded_ = false;
         active_sub_ = nullptr;
         for (auto& sub : subcommands_) sub->reset();
     }
@@ -1701,7 +2153,8 @@ public:
     [[nodiscard]] bool has_option(std::string_view name) const noexcept {
         auto l = (*this)[name];
         if (!l.found()) return false;
-        return l.is_set() || l.p_->from_env_ || l.p_->has_default_;
+        return l.is_set() || l.p_->from_env_ || l.p_->from_config_
+            || l.p_->has_default_;
     }
 
     [[nodiscard]] const std::string& name()        const noexcept { return name_;    }
@@ -1717,23 +2170,29 @@ public:
         std::span<const char* const> raw;
         if (argv != nullptr && argc > 0)
             raw = std::span<const char* const>(argv, static_cast<size_t>(argc));
-        std::vector<std::string_view> tokens;
-        if (raw.size() > 1) {
-            tokens.reserve(raw.size() - 1);
-            for (size_t i = 1; i < raw.size(); ++i)
-                tokens.emplace_back(raw[i] ? std::string_view(raw[i]) : std::string_view{});
-        }
-        return do_parse(tokens);
+        // Skip argv[0] without copying the remaining pointers into a vector.
+        return run_parse(raw.size() > 1 ? raw.subspan(1)
+                                        : std::span<const char* const>{});
     }
 
     [[nodiscard]] ParseResult parse(std::span<const std::string_view> args) {
         reset();
-        return do_parse(args);
+        return run_parse(args);
     }
 
     [[nodiscard]] ParseResult parse(std::initializer_list<std::string_view> args) {
         reset();
-        return do_parse(std::span<const std::string_view>(args.begin(), args.size()));
+        return run_parse(std::span<const std::string_view>(args.begin(), args.size()));
+    }
+
+    /// Convenience overload for callers that already own a vector of strings.
+    template<typename Allocator>
+    [[nodiscard]] ParseResult parse(const std::vector<std::string, Allocator>& args) {
+        reset();
+        std::vector<std::string_view> tokens;
+        tokens.reserve(args.size());
+        for (const auto& a : args) tokens.emplace_back(a);
+        return run_parse(std::span<const std::string_view>(tokens));
     }
 
     void parse_or_exit(int argc, const char* const* argv) {
@@ -1837,11 +2296,13 @@ public:
             out += std::format("{}COMMANDS{}\n", X::byel(), X::rst());
             size_t col = 4;
             for (const auto& s : subcommands_) {
+                if (s->hidden_) continue;
                 size_t w = s->name_.size();
                 for (const auto& a : s->aliases_) w += 2 + a.size();
                 col = std::max(col, w + 4);
             }
             for (const auto& s : subcommands_) {
+                if (s->hidden_) continue;
                 std::string lhs = "  " + s->name_;
                 for (const auto& a : s->aliases_) lhs += ", " + a;
                 out += std::format("{}{:<{}}{}", X::bcyn(), lhs, col, X::rst());
@@ -1939,6 +2400,7 @@ public:
         }
         out << "\"\n    subs=\"";
         for (const auto& s : subcommands_) {
+            if (s->hidden_) continue;
             out << dq_escape(s->name_) << " ";
             for (const auto& a : s->aliases_) out << dq_escape(a) << " ";
         }
@@ -2010,6 +2472,7 @@ public:
         }
 
         for (const auto& s : subcommands_) {
+            if (s->hidden_) continue;
             out << "complete -c " << fish_word(name_) << " -f -a '"
                 << fish_esc(s->name_) << "'";
             if (!s->desc_.empty()) out << " -d '" << fish_esc(s->desc_) << "'";
@@ -2125,6 +2588,7 @@ public:
             out << "    local -a subcmds\n";
             out << "    subcmds=(\n";
             for (const auto& s : subcommands_) {
+                if (s->hidden_) continue;
                 out << "        '" << zsh_esc(s->name_) << ":" << zsh_esc(s->desc_) << "'\n";
                 for (const auto& a : s->aliases_)
                     out << "        '" << zsh_esc(a) << ":" << zsh_esc(s->desc_) << " (alias)'\n";
@@ -2187,10 +2651,182 @@ private:
         };
         resolve(mutex_groups_, mutex_resolved_, "mutex_group");
         resolve(require_groups_, require_resolved_, "require_together");
+        resolve(require_one_groups_, require_one_resolved_, "require_one_of");
         groups_dirty_ = false;
     }
 
-    [[nodiscard]] ParseResult do_parse(std::span<const std::string_view> args) {
+    [[nodiscard]] App* root_app() noexcept {
+        App* app = this;
+        while (app->parent_ != nullptr) app = app->parent_;
+        return app;
+    }
+
+    /// Load the root config file once per parse, honoring a CLI-provided path.
+    [[nodiscard]] ParseResult ensure_config_loaded() {
+        App* root = root_app();
+        std::string path = root->config_file_;
+        bool required    = root->config_required_;
+        if (root->config_option_ != nullptr && root->config_option_->value) {
+            path     = *root->config_option_->value;
+            required = true;
+        }
+        if (path.empty()) {
+            root->config_loaded_ = true;
+            root->config_loaded_path_.clear();
+            root->config_data_ = {};
+            return {};
+        }
+        if (root->config_loaded_ && root->config_loaded_path_ == path)
+            return {};
+
+        root->config_loaded_      = true;
+        root->config_loaded_path_ = path;
+        root->config_data_        = {};
+
+        std::ifstream in(path, std::ios::binary);
+        if (!in)
+            return required
+                ? std::unexpected(ParseError::config(path, "cannot open file", root))
+                : ParseResult{};
+        in.seekg(0, std::ios::end);
+        const auto end = in.tellg();
+        if (end < 0)
+            return std::unexpected(ParseError::config(path, "cannot determine size", root));
+        constexpr std::streamoff max_size = 4 * 1024 * 1024;
+        if (end > max_size)
+            return std::unexpected(ParseError::config(path, "file is larger than 4 MiB", root));
+        in.seekg(0, std::ios::beg);
+        std::string text(static_cast<size_t>(end), '\0');
+        if (end > 0 && !in.read(text.data(), end))
+            return std::unexpected(ParseError::config(path, "read failed", root));
+        auto parsed = detail::parse_config(text);
+        if (!parsed)
+            return std::unexpected(ParseError::config(path, parsed.error(), root));
+        root->config_data_ = std::move(*parsed);
+        return {};
+    }
+
+    /// Full command path used as the config section name (`remote.add`).
+    [[nodiscard]] std::string config_section_key() const {
+        std::string path;
+        for (const App* app = this; app->parent_ != nullptr; app = app->parent_) {
+            if (!path.empty()) path.insert(0, 1, '.');
+            path.insert(0, app->name_);
+        }
+        return path;
+    }
+
+    [[nodiscard]] ParseResult apply_config_option(
+        detail::OptionBase* opt, const detail::ConfigData::Section& section) {
+        if (opt->is_set_ || opt->from_env_ || opt->from_config_) return {};
+        if (const auto* raw = detail::config_value_for(section, opt->names)) {
+            auto values = opt->is_multi() ? detail::config_values(*raw)
+                                          : std::vector<std::string>{ *raw };
+            if (values.empty()) return {};
+            for (const auto& v : values) {
+                if (auto r = opt->parse(v, opt->display_name(), this); !r) return r;
+            }
+            opt->is_set_     = false;
+            opt->from_config_ = true;
+            return {};
+        }
+        // `no-flags = true` is accepted as a config-native way to negate a
+        // negatable flag, even if --no-flags was not registered explicitly.
+        if (opt->is_flag_ && opt->negatable_) {
+            const auto ln = opt->long_name();
+            if (ln.starts_with("--")) {
+                std::string key = "no-";
+                key.append(ln.substr(2));
+                if (const auto it = section.find(key); it != section.end()) {
+                    if (auto r = opt->set_negated(this); !r) return r;
+                    opt->is_set_      = false;
+                    opt->from_config_ = true;
+                }
+            }
+        }
+        return {};
+    }
+
+    [[nodiscard]] ParseResult apply_config_positional(
+        detail::PositionalBase* pos, const detail::ConfigData::Section& section) {
+        if (pos->is_set_ || pos->from_env_ || pos->from_config_) return {};
+        const auto it = section.find(pos->name);
+        if (it == section.end()) return {};
+        auto values = pos->variadic_ ? detail::config_values(it->second)
+                                     : std::vector<std::string>{ it->second };
+        if (values.empty()) return {};
+        for (const auto& v : values) {
+            if (auto r = pos->parse(v, this); !r) return r;
+        }
+        pos->is_set_      = false;
+        pos->from_config_ = true;
+        return {};
+    }
+
+    template<typename Token>
+    [[nodiscard]] static std::string_view token_text(const Token& token) noexcept {
+        if constexpr (std::is_pointer_v<Token>)
+            return token != nullptr ? std::string_view(token) : std::string_view{};
+        else
+            return std::string_view(token);
+    }
+
+    /// True when a token should stop a variable-length value run.  Negative
+    /// numbers and a lone `-` remain values; `--` is always a boundary.
+    [[nodiscard]] bool is_option_boundary(std::string_view t) const noexcept {
+        if (t.size() < 2 || t.front() != '-') return false;
+        if (t == "--") return true;
+        if (detail::looks_like_negative_number(t)) return false;
+        return true;
+    }
+
+    /// Consume the remaining tokens of a `.nargs()` occurrence.  `already`
+    /// counts values supplied inline (for example `--files=a`).
+    template<typename Token>
+    [[nodiscard]] ParseResult consume_nargs(detail::OptionBase* opt, size_t& i,
+                                            std::span<const Token> args,
+                                            std::string_view opt_name,
+                                            size_t already) {
+        size_t count = already;
+        while (count < opt->nargs_max_ && i + 1 < args.size()) {
+            const auto next = token_text(args[i + 1]);
+            if (next == "--") break;
+            // With an exact arity, dash-prefixed tokens are values.  With a
+            // range, stop as soon as the minimum is met and an option-looking
+            // token appears, so `--files a b --verbose` does not swallow the
+            // flag.
+            if (opt->nargs_max_ != opt->nargs_min_
+                && count >= opt->nargs_min_ && is_option_boundary(next))
+                break;
+            if (auto r = opt->parse(next, opt_name, this); !r) return r;
+            ++i;
+            ++count;
+        }
+        if (count < opt->nargs_min_)
+            return std::unexpected(ParseError::missing_value(opt_name, this));
+        return {};
+    }
+
+    /// Expand response files (when enabled) and dispatch to the parser.
+    template<typename Token>
+    [[nodiscard]] ParseResult run_parse(std::span<const Token> tokens) {
+        if (!response_files_ || tokens.empty())
+            return do_parse(tokens);
+        std::vector<std::string_view> views;
+        views.reserve(tokens.size());
+        for (const auto& token : tokens)
+            views.emplace_back(token_text(token));
+        auto expanded = detail::expand_response_tokens(views, this);
+        if (!expanded) return std::unexpected(std::move(expanded.error()));
+        std::vector<std::string_view> expanded_views;
+        expanded_views.reserve(expanded->size());
+        for (const auto& token : *expanded)
+            expanded_views.emplace_back(token);
+        return do_parse(std::span<const std::string_view>(expanded_views));
+    }
+
+    template<typename Token>
+    [[nodiscard]] ParseResult do_parse(std::span<const Token> args) {
         validate_group_references();
         bool   end_opts       = false;
         bool   saw_positional = false;
@@ -2200,7 +2836,7 @@ private:
         const bool has_subcommands = !subcommands_.empty();
 
         for (size_t i = 0; i < args.size(); ++i) {
-            const std::string_view arg = args[i];
+            const std::string_view arg = token_text(args[i]);
 
             // ── End-of-options sentinel
             if (!end_opts && arg == "--") {
@@ -2235,11 +2871,17 @@ private:
 
             // ── Positional argument (including single '-' stdin/stdout token)
             if (end_opts || !arg.starts_with('-') || arg == "-") {
+                const bool first_positional = !saw_positional;
                 saw_positional = true;
                 if (pos_idx < positionals_.size()) {
                     auto& pos = positionals_[pos_idx];
                     if (auto r = pos->parse(arg, this); !r) return r;
                     if (!pos->variadic_) ++pos_idx;
+                } else if (allow_extras_) {
+                    remaining_args_.emplace_back(arg);
+                } else if (has_subcommands && first_positional && !end_opts) {
+                    return std::unexpected(ParseError::unknown_command(
+                        arg, suggest_command(arg), this));
                 } else {
                     return std::unexpected(ParseError::too_many(arg, this));
                 }
@@ -2257,11 +2899,17 @@ private:
                     eq != std::string_view::npos && find_opt(arg.substr(0, eq)) != nullptr;
                 if (!find_opt(std::string_view(short_name, 2)) &&
                     !find_opt(arg) && !has_registered_prefix) {
+                    const bool first_positional = !saw_positional;
                     saw_positional = true;
                     if (pos_idx < positionals_.size()) {
                         auto& pos = positionals_[pos_idx];
                         if (auto r = pos->parse(arg, this); !r) return r;
                         if (!pos->variadic_) ++pos_idx;
+                    } else if (allow_extras_) {
+                        remaining_args_.emplace_back(arg);
+                    } else if (has_subcommands && first_positional) {
+                        return std::unexpected(ParseError::unknown_command(
+                            arg, suggest_command(arg), this));
                     } else {
                         return std::unexpected(ParseError::too_many(arg, this));
                     }
@@ -2300,7 +2948,22 @@ private:
                         continue;
                     }
                 }
-                if (!opt) return std::unexpected(ParseError::unknown(name, suggest(name), this));
+                if (!opt && allow_abbrev_) {
+                    auto match = resolve_prefix(name);
+                    if (match.option != nullptr) {
+                        opt = match.option;
+                    } else if (match.ambiguous) {
+                        return std::unexpected(
+                            ParseError::ambiguous(name, match.names, this));
+                    }
+                }
+                if (!opt) {
+                    if (allow_extras_) {
+                        remaining_args_.emplace_back(arg);
+                        continue;
+                    }
+                    return std::unexpected(ParseError::unknown(name, suggest(name), this));
+                }
 
                 if (opt->is_flag_) {
                     if (has_eq) {
@@ -2312,10 +2975,16 @@ private:
                     }
                 } else if (has_eq) {
                     if (auto r = opt->parse(inlval, name, this); !r) return r;
+                    if (opt->nargs_max_ != 0) {
+                        if (auto r = consume_nargs(opt, i, args, name, 1); !r) return r;
+                    }
                 } else {
                     if (++i >= args.size())
                         return std::unexpected(ParseError::missing_value(name, this));
-                    if (auto r = opt->parse(args[i], name, this); !r) return r;
+                    if (auto r = opt->parse(token_text(args[i]), name, this); !r) return r;
+                    if (opt->nargs_max_ != 0) {
+                        if (auto r = consume_nargs(opt, i, args, name, 1); !r) return r;
+                    }
                 }
                 continue;
             }
@@ -2331,6 +3000,9 @@ private:
                         if (exact->is_count_option())
                             return std::unexpected(ParseError::unexpected_value(name, inlval, this));
                         if (auto r = exact->parse(inlval, name, this); !r) return r;
+                        if (exact->nargs_max_ != 0) {
+                            if (auto r = consume_nargs(exact, i, args, name, 1); !r) return r;
+                        }
                         continue;
                     }
                 }
@@ -2345,7 +3017,10 @@ private:
                 } else {
                     if (++i >= args.size())
                         return std::unexpected(ParseError::missing_value(arg, this));
-                    if (auto r = exact->parse(args[i], arg, this); !r) return r;
+                    if (auto r = exact->parse(token_text(args[i]), arg, this); !r) return r;
+                    if (exact->nargs_max_ != 0) {
+                        if (auto r = consume_nargs(exact, i, args, arg, 1); !r) return r;
+                    }
                 }
                 continue;
             }
@@ -2359,6 +3034,10 @@ private:
                     if (sopt == "-h") return std::unexpected(ParseError::help_requested(this));
                     if (sopt == "-V" && has_version)
                         return std::unexpected(ParseError::version_requested(this));
+                    if (allow_extras_) {
+                        remaining_args_.emplace_back(arg);
+                        break;
+                    }
                     return std::unexpected(ParseError::unknown(sopt, suggest(sopt), this));
                 }
 
@@ -2381,9 +3060,12 @@ private:
                     } else {
                         if (++i >= args.size())
                             return std::unexpected(ParseError::missing_value(sopt, this));
-                        val = args[i];
+                        val = token_text(args[i]);
                     }
                     if (auto r = opt->parse(val, sopt, this); !r) return r;
+                    if (opt->nargs_max_ != 0) {
+                        if (auto r = consume_nargs(opt, i, args, sopt, 1); !r) return r;
+                    }
                     break;
                 }
             }
@@ -2393,28 +3075,54 @@ private:
     }
 
     [[nodiscard]] ParseResult finalize(bool subcommand_active) {
-        // 1. Apply environment fallbacks, then defaults, then enforce
-        //    required options.  These are independent per option, so a single
-        //    pass replaces three separate traversals.
+        // Load config lazily: by this point any --config CLI value has been
+        // parsed, and child finalization can reach the root data.
+        App* root = root_app();
+        if (!root->config_file_.empty()
+            || (root->config_option_ != nullptr && root->config_option_->value)) {
+            if (auto r = root->ensure_config_loaded(); !r) return r;
+        }
+        const detail::ConfigData::Section* config_section = nullptr;
+        if (!root->config_data_.sections.empty()) {
+            const auto key = config_section_key();
+            if (const auto it = root->config_data_.sections.find(key);
+                it != root->config_data_.sections.end())
+                config_section = &it->second;
+        }
+
+        // 1. Apply environment fallbacks, then config values, then defaults,
+        //    then enforce required options.  These are independent per
+        //    option, so a single pass replaces four traversals.
         for (auto& opt : options_) {
-            if (!opt->is_set_ && !opt->env_var.empty()) {
+            if (opt->is_set_) continue;
+            if (!opt->env_var.empty() && !opt->from_env_ && !opt->from_config_) {
                 if (const char* v = std::getenv(opt->env_var.c_str())) {
                     if (auto r = opt->parse_env(v, this); !r) return r;
                 }
             }
-            if (!opt->is_set_ && !opt->from_env_ && opt->has_default_)
+            if (!opt->from_env_ && config_section) {
+                if (auto r = apply_config_option(opt.get(), *config_section); !r)
+                    return r;
+            }
+            if (!opt->from_env_ && !opt->from_config_ && opt->has_default_)
                 opt->apply_default();
-            if (opt->required_ && !opt->is_set_ && !opt->from_env_ && !opt->has_default_)
+            if (opt->required_ && !opt->from_env_ && !opt->from_config_
+                && !opt->has_default_)
                 return std::unexpected(ParseError::missing_required(opt->display_name(), this));
         }
 
         for (auto& pos : positionals_) {
-            if (!pos->is_set_ && !pos->env_var.empty()) {
+            if (pos->is_set_) continue;
+            if (!pos->env_var.empty() && !pos->from_env_ && !pos->from_config_) {
                 if (const char* v = std::getenv(pos->env_var.c_str())) {
                     if (auto r = pos->parse_env(v, this); !r) return r;
                 }
             }
-            if (!pos->is_set_ && !pos->from_env_ && pos->has_default_)
+            if (!pos->from_env_ && !pos->from_config_ && config_section) {
+                if (auto r = apply_config_positional(pos.get(), *config_section); !r)
+                    return r;
+            }
+            if (!pos->from_env_ && !pos->from_config_ && pos->has_default_)
                 pos->apply_default();
         }
         if (!subcommand_active) {
@@ -2422,7 +3130,7 @@ private:
                 // Match options: a configured default satisfies required() even
                 // when required() is applied after default_val().
                 if (pos->required_ && !pos->is_set_ && !pos->from_env_
-                    && !pos->has_default_)
+                    && !pos->from_config_ && !pos->has_default_)
                     return std::unexpected(ParseError::missing_positional(pos->name, this));
             }
             if (require_subcommand_ && !subcommands_.empty())
@@ -2430,11 +3138,11 @@ private:
         }
 
         // 2. Mutex group constraints.  Values supplied through the environment
-        // count as explicit choices; defaults do not.
+        // or a config file count as explicit choices; defaults do not.
         for (const auto& group : mutex_resolved_) {
             std::string first_set;
             for (auto* opt : group) {
-                if (opt->is_set_ || opt->from_env_) {
+                if (opt->is_set_ || opt->from_env_ || opt->from_config_) {
                     if (!first_set.empty())
                         return std::unexpected(ParseError::mutually_exclusive(
                             first_set, opt->display_name(), this));
@@ -2447,18 +3155,36 @@ private:
         for (const auto& group : require_resolved_) {
             std::string_view any_set;
             for (auto* opt : group) {
-                if (opt->is_set_ || opt->from_env_) {
+                if (opt->is_set_ || opt->from_env_ || opt->from_config_) {
                     any_set = opt->display_name();
                     break;
                 }
             }
             if (!any_set.empty()) {
                 for (auto* opt : group) {
-                    if (!opt->is_set_ && !opt->from_env_)
+                    if (!opt->is_set_ && !opt->from_env_ && !opt->from_config_)
                         return std::unexpected(ParseError::requires_option(
                             any_set, opt->display_name(), this));
                 }
             }
+        }
+
+        // 3b. Require-at-least-one groups
+        for (const auto& group : require_one_resolved_) {
+            bool any_set = false;
+            std::string names;
+            for (auto* opt : group) {
+                if (opt->is_set_ || opt->from_env_ || opt->from_config_) {
+                    any_set = true;
+                    break;
+                }
+            }
+            if (any_set) continue;
+            for (auto* opt : group) {
+                if (!names.empty()) names += ", ";
+                names += opt->display_name();
+            }
+            return std::unexpected(ParseError::missing_one_of(names, this));
         }
 
         // 4. Run whole-value validators and post-parse transforms
@@ -2474,6 +3200,37 @@ private:
 
     [[nodiscard]] detail::OptionBase* find_opt(std::string_view n) const noexcept {
         return registry_.find(n);
+    }
+
+    struct PrefixMatch {
+        detail::OptionBase* option = nullptr;
+        std::string         names;
+        bool                ambiguous = false;
+    };
+
+    /// Resolve an unambiguous `--long` prefix.  Only called on the error-ish
+    /// path when an exact lookup failed and allow_abbrev() is enabled.
+    [[nodiscard]] PrefixMatch resolve_prefix(std::string_view name) const {
+        PrefixMatch match;
+        if (name.size() <= 2 || !name.starts_with("--")) return match;
+        std::vector<detail::OptionBase*> found;
+        for (const auto& opt : options_) {
+            for (const auto& n : opt->names) {
+                if (n.size() > 2 && n.starts_with("--") && n.starts_with(name)) {
+                    if (!std::ranges::contains(found, opt.get())) {
+                        found.push_back(opt.get());
+                        if (!match.names.empty()) match.names += ", ";
+                        match.names += n;
+                    }
+                    break;
+                }
+            }
+        }
+        if (found.size() == 1)
+            match.option = found.front();
+        else if (found.size() > 1)
+            match.ambiguous = true;
+        return match;
     }
 
     [[nodiscard]] App* find_command(std::string_view n) const noexcept {
@@ -2520,6 +3277,32 @@ private:
         return best;
     }
 
+    [[nodiscard]] std::string suggest_command(std::string_view token) const {
+        if (token.size() > 128) return {};
+        auto distance = [token](std::string_view candidate) -> size_t {
+            const size_t diff = token.size() > candidate.size()
+                ? token.size() - candidate.size()
+                : candidate.size() - token.size();
+            if (diff > 3) return SIZE_MAX;
+            return detail::edit_distance(token, candidate);
+        };
+        std::string best;
+        size_t best_d = SIZE_MAX;
+        for (const auto& sub : subcommands_) {
+            if (sub->hidden_) continue;
+            auto consider = [&](std::string_view name) {
+                const auto d = distance(name);
+                if (d < best_d && d <= 3) {
+                    best_d = d;
+                    best.assign(name);
+                }
+            };
+            consider(sub->name_);
+            for (const auto& alias : sub->aliases_) consider(alias);
+        }
+        return best;
+    }
+
     [[nodiscard]] std::string_view effective_version() const noexcept {
         for (const App* p = this; p; p = p->parent_)
             if (!p->version_.empty()) return p->version_;
@@ -2561,7 +3344,8 @@ private:
 
         size_t col = 0;
         auto measure = [&](std::string_view sn, std::string_view ln,
-                           std::string_view meta, bool is_flag, bool neg) {
+                           std::string_view meta, bool is_flag, bool neg,
+                           bool spread) {
             size_t w = 2;
             if (!sn.empty()) w += sn.size();
             if (!sn.empty() && !ln.empty()) w += 2;
@@ -2571,22 +3355,23 @@ private:
                 else
                     w += ln.size();
             }
-            if (!is_flag && !meta.empty()) w += 3 + meta.size();
+            if (!is_flag && !meta.empty()) w += 3 + meta.size() + (spread ? 3 : 0);
             col = std::max(col, w);
         };
         for (const auto& o : options_)
             if (!o->hidden_)
-                measure(o->short_name(), o->long_name(), o->meta, o->is_flag_, o->negatable_);
+                measure(o->short_name(), o->long_name(), o->meta, o->is_flag_,
+                        o->negatable_, o->nargs_max_ != 0);
         if (show_help_short || show_help_long)
             measure(show_help_short ? "-h" : "", show_help_long ? "--help" : "",
-                    {}, true, false);
+                    {}, true, false, false);
         if (show_ver_short || show_ver_long)
             measure(show_ver_short ? "-V" : "", show_ver_long ? "--version" : "",
-                    {}, true, false);
+                    {}, true, false, false);
         col = std::max(col + 2, size_t(30));
 
         auto row = [&](std::string_view sn, std::string_view ln, std::string_view meta,
-                       bool is_flag, bool neg, std::string_view help, bool req,
+                       bool is_flag, bool neg, bool spread, std::string_view help, bool req,
                        std::string_view def, std::string_view choices_s,
                        std::string_view env_v) {
             std::string lhs = "  ";
@@ -2598,8 +3383,10 @@ private:
                 else
                     lhs += ln;
             }
-            if (!is_flag && !meta.empty())
+            if (!is_flag && !meta.empty()) {
                 lhs += std::format(" <{}>", meta);
+                if (spread) lhs += "...";
+            }
             out += std::format("{}{:<{}}{}", X::bcyn(), lhs, col, X::rst());
             out += help;
             if (req)                 out += std::format("  {}[required]{}", X::bred(), X::rst());
@@ -2621,18 +3408,18 @@ private:
             for (const auto& o : options_) {
                 if (o->hidden_ || o->section_ != sec) continue;
                 row(o->short_name(), o->long_name(), o->meta,
-                    o->is_flag_, o->negatable_, o->help_text, o->required_,
-                    o->default_str(), o->choices_str(), o->env_var);
+                    o->is_flag_, o->negatable_, o->nargs_max_ != 0, o->help_text,
+                    o->required_, o->default_str(), o->choices_str(), o->env_var);
             }
             if (sec.empty()) {
                 if (show_help_short || show_help_long)
                     row(show_help_short ? "-h" : "",
                         show_help_long ? "--help" : "",
-                        {}, true, false, "Print help and exit", false, {}, {}, {});
+                        {}, true, false, false, "Print help and exit", false, {}, {}, {});
                 if (show_ver_short || show_ver_long)
                     row(show_ver_short ? "-V" : "",
                         show_ver_long ? "--version" : "",
-                        {}, true, false, "Print version and exit", false, {}, {}, {});
+                        {}, true, false, false, "Print version and exit", false, {}, {}, {});
             }
         }
     }
