@@ -105,6 +105,13 @@ TEST_CASE("path options convert from the token text") {
     CHECK(output->string() == "/tmp/build");
 }
 
+TEST_CASE("path options preserve spaces in values") {
+    cli::App app("t");
+    auto output = app.add<std::filesystem::path>("--output");
+    REQUIRE(app.parse({"--output", "Hello World.txt"}));
+    CHECK(*output == std::filesystem::path("Hello World.txt"));
+}
+
 TEST_CASE("floating-point options parse decimal text") {
     cli::App app("t");
     auto ratio = app.add<double>("--ratio");
@@ -273,6 +280,60 @@ TEST_CASE("a custom meta name is used in help") {
     cli::App app("tool");
     (void)app.add<std::string>("--output").meta("DIR");
     CHECK(contains(app.help_text(), "<DIR>"));
+}
+
+TEST_CASE("quoted delimiter-separated values may contain the delimiter") {
+    cli::App app("t");
+    auto items = app.add<std::vector<std::string>>("--items").delimiter(',');
+
+    REQUIRE(app.parse({"--items", R"(a,"b,c",d)"}));
+    REQUIRE(items->size() == 3);
+    CHECK((*items)[0] == "a");
+    CHECK((*items)[1] == "b,c");
+    CHECK((*items)[2] == "d");
+}
+
+TEST_CASE("single quotes protect delimiters and may wrap the whole value") {
+    cli::App app("t");
+    auto items = app.add<std::vector<std::string>>("--items").delimiter(',');
+
+    REQUIRE(app.parse({"--items", "'x,y',z"}));
+    REQUIRE(items->size() == 2);
+    CHECK((*items)[0] == "x,y");
+    CHECK((*items)[1] == "z");
+
+    REQUIRE(app.parse({"--items", R"("only,one")"}));
+    REQUIRE(items->size() == 1);
+    CHECK((*items)[0] == "only,one");
+}
+
+TEST_CASE("quotes that do not wrap a whole element stay literal") {
+    cli::App app("t");
+    auto items = app.add<std::vector<std::string>>("--items").delimiter(',');
+
+    REQUIRE(app.parse({"--items", "it's,fine"}));
+    REQUIRE(items->size() == 2);
+    CHECK((*items)[0] == "it's");
+
+    REQUIRE(app.parse({"--items", R"("unterminated,x)"}));
+    REQUIRE(items->size() == 2);
+    CHECK((*items)[0] == R"("unterminated)");
+    CHECK((*items)[1] == "x");
+
+    REQUIRE(app.parse({"--items", R"("a"b,c)"}));
+    REQUIRE(items->size() == 2);
+    CHECK((*items)[0] == R"("a"b)");
+}
+
+TEST_CASE("quoted empty elements and adjacent delimiters are preserved") {
+    cli::App app("t");
+    auto items = app.add<std::vector<std::string>>("--items").delimiter(',');
+
+    REQUIRE(app.parse({"--items", R"(a,"",b,,)"}));
+    REQUIRE(items->size() == 5);
+    CHECK((*items)[1] == "");
+    CHECK((*items)[3] == "");
+    CHECK((*items)[4] == "");
 }
 
 TEST_SUITE_END();

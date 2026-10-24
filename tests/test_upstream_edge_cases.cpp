@@ -80,6 +80,18 @@ TEST_CASE("cxxopts: double dash '--' followed by option-like tokens") {
     CHECK((*pos)[2] == "-v");
 }
 
+TEST_CASE("CLI11/cxxopts: option-like extras after '--' are retained verbatim") {
+    cli::App app("t");
+    app.allow_extras();
+    auto verbose = app.add_flag("--verbose");
+    REQUIRE(app.parse({"--verbose", "--", "--foo", "-bar"}));
+    CHECK(*verbose);
+    const auto& rest = app.remaining_args();
+    REQUIRE(rest.size() == 2);
+    CHECK(rest[0] == "--foo");
+    CHECK(rest[1] == "-bar");
+}
+
 // ── 3. Zero / Null arguments (CLI11) ─────────────────────────────────────────
 
 TEST_CASE("CLI11: parse with argc = 0 and null argv") {
@@ -125,6 +137,52 @@ TEST_CASE("argparse: short option with equals and value") {
     CHECK(*s == "hello");
 }
 
+TEST_CASE("cxxopts: short attached values keep every '=' in the value") {
+    {
+        cli::App app("t");
+        auto s = app.add<std::string>("-o");
+        REQUIRE(app.parse({"-o==*hi_$&"}));
+        CHECK(*s == "=*hi_$&");
+    }
+    {
+        cli::App app("t");
+        auto s = app.add<std::string>("-o");
+        REQUIRE(app.parse({"-oDEBUG=1"}));
+        CHECK(*s == "DEBUG=1");
+    }
+    {
+        cli::App app("t");
+        auto b = app.add_flag("-b");
+        auto c = app.add<std::string>("-c");
+        REQUIRE(app.parse({"-bcfoo=something"}));
+        CHECK(*b);
+        CHECK(*c == "foo=something");
+    }
+}
+
+TEST_CASE("cxxopts: long inline value may itself start with '='") {
+    cli::App app("t");
+    auto x = app.add<std::string>("--x");
+    REQUIRE(app.parse({"--x==a=b"}));
+    CHECK(*x == "=a=b");
+}
+
+TEST_CASE("cxxopts: short boolean flags accept explicit true/false/1/0") {
+    cli::App app("t");
+    auto b = app.add_flag("-b");
+    REQUIRE(app.parse({"-b=true"}));
+    CHECK(*b);
+    REQUIRE(app.parse({"-b=false"}));
+    CHECK(!*b);
+    REQUIRE(app.parse({"-b=1"}));
+    CHECK(*b);
+    REQUIRE(app.parse({"-b=0"}));
+    CHECK(!*b);
+    auto bad = app.parse({"-b=bogus"});
+    REQUIRE(!bad);
+    CHECK(bad.error().kind == cli::ParseError::Kind::InvalidValue);
+}
+
 // ── 5. Empty and whitespace string values (cxxopts & CLI11) ──────────────────
 
 TEST_CASE("CLI11/argparse: empty string passed as option value") {
@@ -165,6 +223,56 @@ TEST_CASE("CLI11: value is literally '--help'") {
     CHECK(*msg == "--help");
 }
 
+TEST_CASE("CLI11/argparse/cxxopts: bare '--' cannot satisfy an option value") {
+    // The sentinel ends option parsing; it is not a value.  argparse reports
+    // "expected one argument", CLI11 and cxxopts likewise reject the token.
+    {
+        cli::App app("t");
+        (void)app.add<std::string>("--msg");
+        auto res = app.parse({"--msg", "--"});
+        REQUIRE(!res);
+        CHECK(res.error().kind == cli::ParseError::Kind::MissingValue);
+    }
+    {
+        cli::App app("t");
+        (void)app.add<std::string>("-msg");
+        auto res = app.parse({"-msg", "--"});
+        REQUIRE(!res);
+        CHECK(res.error().kind == cli::ParseError::Kind::MissingValue);
+    }
+    {
+        cli::App app("t");
+        (void)app.add<std::string>("-m");
+        auto res = app.parse({"-m", "--"});
+        REQUIRE(!res);
+        CHECK(res.error().kind == cli::ParseError::Kind::MissingValue);
+    }
+}
+
+TEST_CASE("CLI11/argparse: inline '=' still allows a literal '--' value") {
+    {
+        cli::App app("t");
+        auto msg = app.add<std::string>("--msg");
+        REQUIRE(app.parse({"--msg=--"}));
+        CHECK(*msg == "--");
+    }
+    {
+        cli::App app("t");
+        auto msg = app.add<std::string>("-m");
+        REQUIRE(app.parse({"-m=--"}));
+        CHECK(*msg == "--");
+    }
+}
+
+TEST_CASE("argparse: bare '--' is not a value even with allow_extras") {
+    cli::App app("t");
+    app.allow_extras();
+    (void)app.add<std::string>("--msg");
+    auto res = app.parse({"--msg", "--"});
+    REQUIRE(!res);
+    CHECK(res.error().kind == cli::ParseError::Kind::MissingValue);
+}
+
 // ── 7. Negative numbers (argparse & CLI11) ───────────────────────────────────
 
 TEST_CASE("argparse: negative integer as positional") {
@@ -181,6 +289,27 @@ TEST_CASE("argparse: negative float as positional") {
     CHECK(*pos == doctest::Approx(-3.14159));
 }
 
+TEST_CASE("argparse: negative integers and floats into vector positionals") {
+    {
+        cli::App app("t");
+        auto nums = app.add_positional<std::vector<int>>("number");
+        REQUIRE(app.parse({"-1", "-2", "3"}));
+        REQUIRE(nums->size() == 3);
+        CHECK((*nums)[0] == -1);
+        CHECK((*nums)[1] == -2);
+        CHECK((*nums)[2] == 3);
+    }
+    {
+        cli::App app("t");
+        auto nums = app.add_positional<std::vector<double>>("number");
+        REQUIRE(app.parse({"-1.001", "-2.002", "3.003"}));
+        REQUIRE(nums->size() == 3);
+        CHECK((*nums)[0] == doctest::Approx(-1.001));
+        CHECK((*nums)[1] == doctest::Approx(-2.002));
+        CHECK((*nums)[2] == doctest::Approx(3.003));
+    }
+}
+
 TEST_CASE("argparse: registered short option '-1' beats negative positional") {
     cli::App app("t");
     auto f = app.add_flag("-1");
@@ -195,6 +324,48 @@ TEST_CASE("CLI11: short option with attached negative value") {
     auto n = app.add<int>("-n");
     REQUIRE(app.parse({"-n-42"}));
     CHECK(*n == -42);
+}
+
+TEST_CASE("argparse: negative-number grammar accepts decimal and exponent forms") {
+    // Adapted from argparse's test_negative_numbers.cpp.  Leading-zero forms
+    // such as -00 are accepted too, matching C++ integer parsing (cxxopts).
+    const char* valid[] = {
+        "-0", "-00", "-003", "-9", "-92180",
+        "-0.", "-8.", "-200.", "-003.", "-.0927",
+        "-1e32", "-1e+32", "-00e-0",
+        "-18.e0", "-18.e+92", "-0.e-92",
+        "-.023e0", "-.2e+92", "-.71564e-92",
+        "-02.023e4000", "-3.239e+76", "-238237.0e-2",
+        "-0x10", "-0b101",
+    };
+    for (const char* text : valid) {
+        cli::App app("t");
+        auto value = app.add_positional<std::string>("value");
+        CAPTURE(text);
+        REQUIRE(app.parse({text}));
+        CHECK(*value == text);
+    }
+}
+
+TEST_CASE("argparse: malformed negative-number forms stay option-like") {
+    // Adapted from argparse's test_negative_numbers.cpp.  A token that merely
+    // resembles a number must not be silently treated as a positional.
+    const char* invalid[] = {
+        "-.", "-e", "-.e", "-e32", "-e+7", "-e-1", "-0e", "-13e",
+        "-13.e", "-.283e", "-.e3", "-.e+3", "-.e-3",
+        "-3.14e", "-2.17e+", "-13.6e-", "-13.6e+-23", "-3.6e23+",
+        "-3.6e2e9", "-3.6.3", "-+42", "-0x27.8p1",
+        "-3.8p1", "-0x1e+2", "-inf", "-INFINITY", "-nan", "-NAN",
+        "-1abc", "-0xZZ", "-0b102", "-1.2.3",
+    };
+    for (const char* text : invalid) {
+        cli::App app("t");
+        (void)app.add_positional<std::string>("value");
+        CAPTURE(text);
+        auto r = app.parse({text});
+        REQUIRE(!r);
+        CHECK(r.error().kind == cli::ParseError::Kind::UnknownOption);
+    }
 }
 
 // ── 8. Number formats & base (cxxopts & CLI11) ───────────────────────────────
@@ -303,6 +474,135 @@ TEST_CASE("CLI11: short flag grouping with value at end with equals") {
     CHECK(*f == "output.bin");
 }
 
+TEST_CASE("CLI11: several short flags may be grouped in one token") {
+    cli::App app("t");
+    auto a = app.add_flag("-a");
+    auto b = app.add_flag("-b");
+    auto c = app.add_flag("-c");
+    REQUIRE(app.parse({"-abc"}));
+    CHECK(*a == true);
+    CHECK(*b == true);
+    CHECK(*c == true);
+}
+
+TEST_CASE("cxxopts: unknown suffix of a short group is forwarded as one token") {
+    cli::App app("t");
+    app.allow_extras();
+    auto verbose = app.add_count("-v");
+    REQUIRE(app.parse({"-vvq"}));
+    CHECK(*verbose == 2u);
+    const auto& rest = app.remaining_args();
+    REQUIRE(rest.size() == 1);
+    CHECK(rest[0] == "-q");
+}
+
+TEST_CASE("CLI11: registered single-dash long name beats short grouping") {
+    cli::App app("t");
+    auto v       = app.add_flag("-v");
+    auto verbose = app.add_flag("-verbose");
+    REQUIRE(app.parse({"-verbose"}));
+    CHECK(*verbose == true);
+    CHECK(*v == false);
+}
+
+// ── 10b. Compound short arguments and nargs (argparse) ──────────────────────
+
+TEST_CASE("argparse: compound flags followed by a multi-value option") {
+    cli::App app("t");
+    auto a = app.add_flag("-a");
+    auto b = app.add_flag("-b");
+    auto c = app.add<std::vector<double>>("-c").nargs(2);
+    auto files = app.add<std::vector<std::string>>("--input_files").nargs(3);
+
+    REQUIRE(app.parse({"-abc", "3.14", "2.718",
+                       "--input_files", "a.txt", "b.txt", "c.txt"}));
+    CHECK(*a);
+    CHECK(*b);
+    REQUIRE(c->size() == 2);
+    CHECK((*c)[0] == doctest::Approx(3.14));
+    CHECK((*c)[1] == doctest::Approx(2.718));
+    REQUIRE(files->size() == 3);
+    CHECK((*files)[0] == "a.txt");
+    CHECK((*files)[1] == "b.txt");
+    CHECK((*files)[2] == "c.txt");
+}
+
+TEST_CASE("argparse: inline equals counts as the first nargs value") {
+    cli::App app("t");
+    auto values = app.add<std::vector<std::string>>("--long").nargs(2);
+    REQUIRE(app.parse({"--long=value1", "value2"}));
+    REQUIRE(values->size() == 2);
+    CHECK((*values)[0] == "value1");
+    CHECK((*values)[1] == "value2");
+}
+
+TEST_CASE("argparse: a remaining-style option consumes negative numbers") {
+    cli::App app("t");
+    auto values = app.add<std::vector<int>>("-i").nargs_at_least(1);
+    REQUIRE(app.parse({"-i", "-42", "8", "100", "300"}));
+    REQUIRE(values->size() == 4);
+    CHECK((*values)[0] == -42);
+    CHECK((*values)[1] == 8);
+    CHECK((*values)[2] == 100);
+    CHECK((*values)[3] == 300);
+}
+
+TEST_CASE("argparse: two remaining-style options split at the next option") {
+    cli::App app("t");
+    auto numbers = app.add<std::vector<int>>("-i").nargs_at_least(1);
+    auto words   = app.add<std::vector<std::string>>("-s").nargs_at_least(1);
+    REQUIRE(app.parse({"-i", "-42", "8", "100", "300",
+                       "-s", "ok", "this", "works"}));
+    REQUIRE(numbers->size() == 4);
+    CHECK((*numbers)[0] == -42);
+    CHECK((*numbers)[3] == 300);
+    REQUIRE(words->size() == 3);
+    CHECK((*words)[0] == "ok");
+    CHECK((*words)[1] == "this");
+    CHECK((*words)[2] == "works");
+}
+
+TEST_CASE("cxxopts: arbitrary option names and short attached values") {
+    // Adapted from cxxopts' "Option names as arbitrary characters" tests.
+    cli::App app("t");
+    auto hash     = app.add<std::string>("-#");
+    auto dollars  = app.add<std::string>("--$$$");
+    auto dot      = app.add<std::string>("-.");
+    auto at       = app.add_flag("-@");
+    auto colon    = app.add_flag("-:");
+    auto question = app.add_flag("-?");
+    auto bracket  = app.add_flag("-[");
+    auto brace    = app.add_flag("-}");
+    auto star     = app.add_flag("-*");
+    auto tilde    = app.add_flag("-~");
+    auto bang     = app.add_flag("-!");
+
+    REQUIRE(app.parse({"-#", "abc", "--$$$=@#$$", "-.=..", "-@:?[}*~!"}));
+    CHECK(*hash == "abc");
+    CHECK(*dollars == "@#$$");
+    CHECK(*dot == "..");
+    CHECK(*at);
+    CHECK(*colon);
+    CHECK(*question);
+    CHECK(*bracket);
+    CHECK(*brace);
+    CHECK(*star);
+    CHECK(*tilde);
+    CHECK(*bang);
+}
+
+TEST_CASE("cxxopts: long names may contain hyphens and underscores") {
+    // Adapted from cxxopts' "Arbitrary chars and spaces" case: the trimmed
+    // "ab-cd" and "ab_cd" spellings are addressable from argv.
+    cli::App app("t");
+    auto dashed = app.add<std::string>("--ab-cd");
+    auto scored = app.add<std::string>("--ab_cd");
+
+    REQUIRE(app.parse({"--ab-cd", "xyz", "--ab_cd={}()"}));
+    CHECK(*dashed == "xyz");
+    CHECK(*scored == "{}()");
+}
+
 // ── 11. Interleaved positionals and flags (CLI11 & argparse) ─────────────────
 
 TEST_CASE("CLI11: options and positionals interleaved") {
@@ -318,6 +618,38 @@ TEST_CASE("CLI11: options and positionals interleaved") {
     CHECK(*p2 == "file2.txt");
 }
 
+TEST_CASE("CLI11: a lone '-' is positional regardless of option order") {
+    {
+        cli::App app("t");
+        auto l     = app.add_flag("-l");
+        auto input = app.add_positional<std::string>("input");
+        REQUIRE(app.parse({"-", "-l"}));
+        CHECK(*input == "-");
+        CHECK(*l == true);
+    }
+    {
+        cli::App app("t");
+        auto l     = app.add_flag("-l");
+        auto input = app.add_positional<std::string>("input");
+        REQUIRE(app.parse({"-l", "-"}));
+        CHECK(*input == "-");
+        CHECK(*l == true);
+    }
+}
+
+TEST_CASE("cxxopts: known options interleaved with extras preserve extras order") {
+    cli::App app("t");
+    app.allow_extras();
+    auto output = app.add<std::string>("--output");
+    REQUIRE(app.parse({"--extra", "before", "--output", "out.txt", "tail"}));
+    CHECK(*output == "out.txt");
+    const auto& rest = app.remaining_args();
+    REQUIRE(rest.size() == 3);
+    CHECK(rest[0] == "--extra");
+    CHECK(rest[1] == "before");
+    CHECK(rest[2] == "tail");
+}
+
 // ── 12. Repeated scalar options take last (CLI11 TakeLastOpt) ────────────────
 
 TEST_CASE("CLI11: repeated scalar option keeps the last value") {
@@ -327,7 +659,27 @@ TEST_CASE("CLI11: repeated scalar option keeps the last value") {
     CHECK(*port == 8080);
 }
 
-// ── 13. Subcommand scoping & help bypass (CLI11 SubcommandTest) ──────────────
+// ── 13. Abbreviation resolution (CLI11) ─────────────────────────────────────
+
+TEST_CASE("CLI11: long option abbreviations accept inline values") {
+    cli::App app("t");
+    app.allow_abbrev();
+    auto verbose = app.add<std::string>("--verbose");
+    REQUIRE(app.parse({"--verb=yes"}));
+    CHECK(*verbose == "yes");
+}
+
+TEST_CASE("CLI11: an exact option name wins over a shorter abbreviation") {
+    cli::App app("t");
+    app.allow_abbrev();
+    auto exact  = app.add_flag("--ver");
+    auto longer = app.add_flag("--verbose");
+    REQUIRE(app.parse({"--ver"}));
+    CHECK(*exact == true);
+    CHECK(*longer == false);
+}
+
+// ── 14. Subcommand scoping & help bypass (CLI11 SubcommandTest) ──────────────
 
 TEST_CASE("CLI11: child --help bypasses parent required options") {
     cli::App app("t");

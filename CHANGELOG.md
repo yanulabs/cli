@@ -14,16 +14,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   next option
 - **INI config files** — `config_file(path, required)` and `config_option()`
   load root and `[command.path]` sections, quoted values, arrays, and
-  negatable flags; precedence is CLI > environment > config > default
+  negatable flags; section headers may be quoted or use TOML `[[section]]`
+  syntax, `[default]` addresses the root command, quoted keys and UTF-8 BOMs
+  are accepted, and bare flags may carry inline comments; precedence is
+  CLI > environment > config > default
 - **Response files** — `response_files()` expands `@file` with shell-like
-  quoting, comments, nested includes (8 levels), `@@` escaping, a 4 MiB size
-  cap, and dedicated `ResponseFileError` diagnostics
+  quoting, comments, nested includes (8 levels), `@@` escaping, UTF-8 BOM
+  tolerance, a 4 MiB size cap, and dedicated `ResponseFileError` diagnostics
 - **Option aliases** — `.alias("--colour")` on options, flags, and counts
 - **Long-option abbreviation** — opt-in `allow_abbrev()` with unique-prefix
-  resolution and `AmbiguousOption` errors
+  resolution and `AmbiguousOption` errors; the root setting is inherited by
+  subcommands, and inherited global options participate in resolution
+- **Global options** — `.global()` makes an option usable before or after
+  any descendant subcommand, including required and negatable options
 - **Extra-argument collection** — `allow_extras()` plus `remaining_args()`
   for wrapper/forwarding tools; unknown options and surplus positionals are
-  preserved instead of failing
+  preserved instead of failing, extras before a verb do not block subcommand
+  dispatch, unknown short-group suffixes are forwarded intact, and extras
+  accepted inside a subcommand are inherited through the root policy and
+  aggregated onto the root in command-line order
+- **Quoted delimiter elements** — `.delimiter(...)` values such as
+  `a,"b,c",d` keep delimiters inside quoted elements
+- **Single-letter booleans** — `t`/`f` and `y`/`n` are accepted alongside
+  the existing boolean spellings
 - **Hidden subcommands** — `.hidden()` verbs remain dispatchable but are
   excluded from help and Bash/Fish/Zsh completion output
 - **Unknown-command diagnostics** — misspelled commands return
@@ -53,11 +66,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `tool sub --version` works
 - **Default validation** — defaults are checked against `range()`,
   `choices()`, and custom validators
-- **Domain-scoped test suite** — 416 test cases across 18 doctest suites
+- **Domain-scoped test suite** — 520 test cases across 19 doctest suites
   (`api`, `completion`, `constraints`, `custom_types`, `environment`,
   `errors`, `extensions`, `flags`, `groups`, `help`, `lifecycle`, `lookup`,
-  `options`, `positionals`, `robustness`, `subcommands`, `tokens`, `values`),
-  each registered as its own CTest entry and runnable via `--test-suite=NAME`
+  `options`, `positionals`, `robustness`, `subcommands`, `tokens`,
+  `upstream_edge_cases`, `values`), each registered as its own CTest entry
+  and runnable via `--test-suite=NAME`
+- **Upstream-derived regression cases** — attributed tests adapted from
+  CLI11 (BSD-3-Clause), cxxopts (MIT), and argparse (MIT) cover `--`
+  handling, negative-number grammar, arbitrary option names, values that
+  look like options, empty tokens, subcommand extras, and config sections
 - **Process-level `parse_or_exit()` tests** — separate driver verifies help,
   version, error exit codes, nested help/version scoping, and callback
   dispatch without terminating the unit-test process
@@ -77,6 +95,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Integer parsing now accepts signs and `0x` / `0b` prefixes, handles
   `INT_MIN`, rejects negative values for unsigned types, and reports overflow
 - Float parsing accepts a leading `+`
+- Negative-number detection now matches a complete decimal, hexadecimal, or
+  binary literal, so near-misses such as `-1abc`, `-0xZZ`, `-1e`, and
+  `-1.2.3` are reported as unknown options instead of being passed as
+  positionals
+- The `--` end-of-options marker is no longer accepted as a would-be option
+  value (`--file --` reports a missing value); an inline spelling such as
+  `--file=--` still supplies the literal marker
+- A dash followed by whitespace (`- text`) is treated as a positional value
+  rather than an option-looking token
 - Subcommand parse errors (including `--help` / `--version`) are returned
   directly instead of being masked by parent finalization
 - Subcommands are only dispatched before the first positional token, removing

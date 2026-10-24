@@ -274,4 +274,41 @@ TEST_CASE("vector<bool> values parse and split like other element types") {
     CHECK((*flags)[3] == false);
 }
 
+TEST_CASE("boolean options accept explicit numeric forms") {
+    cli::App app("t");
+    auto off  = app.add<bool>("--bool");
+    auto on   = app.add<bool>("--debug");
+    auto one  = app.add<bool>("--verbose");
+    auto zero = app.add<bool>("--dry-run");
+
+    REQUIRE(app.parse({"--bool=false", "--debug=true", "--verbose=1", "--dry-run=0"}));
+    CHECK(!*off);
+    CHECK(*on);
+    CHECK(*one);
+    CHECK(!*zero);
+}
+
+TEST_CASE("single-letter boolean spellings are accepted case-insensitively") {
+    const std::pair<std::string_view, bool> cases[] = {
+        {"t", true},  {"T", true},  {"y", true},  {"Y", true},
+        {"f", false}, {"F", false}, {"n", false}, {"N", false},
+    };
+    for (const auto& [text, expected] : cases) {
+        cli::App app("t");
+        auto value = app.add<bool>("--value");
+        REQUIRE(app.parse({"--value", text}));
+        CAPTURE(text);
+        CHECK(*value == expected);
+    }
+}
+
+TEST_CASE("longer near-miss boolean spellings are still rejected") {
+    for (const char* text : {"tr", "ye", "nope", "ff", ""}) {
+        cli::App app("t");
+        auto value = app.add<bool>("--value");
+        CAPTURE(text);
+        CHECK(!app.parse({"--value", text}));
+    }
+}
+
 TEST_SUITE_END();

@@ -297,4 +297,15 @@ TEST_CASE("environment state does not leak between parses") {
     CHECK(!jobs.is_set());
 }
 
+TEST_CASE("quoted delimiter-separated environment values may contain the delimiter") {
+    ScopedEnv env("CLI_TEST_QUOTED_ITEMS", R"(a,"b,c",d)");
+    cli::App app("t");
+    auto items = app.add<std::vector<std::string>>("--items")
+                     .delimiter(',').env("CLI_TEST_QUOTED_ITEMS");
+
+    REQUIRE(app.parse({}));
+    REQUIRE(items->size() == 3);
+    CHECK((*items)[1] == "b,c");
+}
+
 TEST_SUITE_END();

@@ -260,6 +260,10 @@ inline size_t edit_distance(std::string_view a, std::string_view b) noexcept {
     return row[n];
 }
 
+inline bool is_space(char c) noexcept {
+    return std::isspace(static_cast<unsigned char>(c)) != 0;
+}
+
 inline bool has_outer_whitespace(std::string_view sv) noexcept {
     return !sv.empty()
         && (std::isspace(static_cast<unsigned char>(sv.front())) != 0 ||
@@ -280,11 +284,44 @@ inline bool ascii_iequals(std::string_view a, std::string_view b) noexcept {
 
 inline bool looks_like_negative_number(std::string_view sv) noexcept {
     if (sv.size() < 2 || sv[0] != '-') return false;
-    const auto c1 = static_cast<unsigned char>(sv[1]);
-    if (std::isdigit(c1)) return true;
-    if (sv[1] == '.' && sv.size() >= 3 && std::isdigit(static_cast<unsigned char>(sv[2])))
-        return true;
-    return false;
+    const std::string_view t = sv.substr(1);
+
+    auto all_of = [](std::string_view s, auto pred) noexcept {
+        return std::ranges::all_of(s, [&](char c) {
+            return pred(static_cast<unsigned char>(c));
+        });
+    };
+
+    // Prefixed integer literals: -0xFF and -0b101.
+    if (t.size() > 2 && t[0] == '0' && (t[1] == 'x' || t[1] == 'X'))
+        return all_of(t.substr(2), [](unsigned char c) { return std::isxdigit(c) != 0; });
+    if (t.size() > 2 && t[0] == '0' && (t[1] == 'b' || t[1] == 'B'))
+        return all_of(t.substr(2), [](unsigned char c) { return c == '0' || c == '1'; });
+
+    // Decimal integer or floating-point literal, including exponent form.
+    // The whole token must match: `-1abc`, `-1.2.3`, `-1e`, and `-.` are
+    // option-like, not numbers, and must fall through to option parsing.
+    size_t i = 0;
+    bool   digits = false;
+    auto take_digits = [&] {
+        const size_t start = i;
+        while (i < t.size() && std::isdigit(static_cast<unsigned char>(t[i]))) ++i;
+        if (i != start) digits = true;
+    };
+    take_digits();
+    if (i < t.size() && t[i] == '.') {
+        ++i;
+        take_digits();
+    }
+    if (!digits) return false;
+    if (i < t.size() && (t[i] == 'e' || t[i] == 'E')) {
+        ++i;
+        if (i < t.size() && (t[i] == '+' || t[i] == '-')) ++i;
+        const size_t exp_start = i;
+        while (i < t.size() && std::isdigit(static_cast<unsigned char>(t[i]))) ++i;
+        if (i == exp_start) return false;
+    }
+    return i == t.size();
 }
 
 // ── Type traits & ADL extensibility concepts ───────────────────────────────
@@ -379,11 +416,13 @@ template<typename T>
 
     } else if constexpr (std::is_same_v<T, bool>) {
         if (ascii_iequals(sv, "true")  || sv == "1" ||
-            ascii_iequals(sv, "yes")   || ascii_iequals(sv, "on"))  return true;
+            ascii_iequals(sv, "yes")   || ascii_iequals(sv, "on")  ||
+            ascii_iequals(sv, "t")     || ascii_iequals(sv, "y"))   return true;
         if (ascii_iequals(sv, "false") || sv == "0" ||
-            ascii_iequals(sv, "no")    || ascii_iequals(sv, "off")) return false;
+            ascii_iequals(sv, "no")    || ascii_iequals(sv, "off") ||
+            ascii_iequals(sv, "f")     || ascii_iequals(sv, "n"))   return false;
         return std::unexpected(
-            std::format("'{}' is not a valid boolean — use true/false/1/0/yes/no/on/off", sv));
+            std::format("'{}' is not a valid boolean — use true/false/t/f/1/0/yes/no/y/n/on/off", sv));
 
     } else if constexpr (std::is_integral_v<T>) {
         if (sv.empty())
@@ -571,6 +610,43 @@ inline void validate_env_name(std::string_view name) {
 
 // Owned-key hash map: registration is cold, lookup is hot.  Copying the name
 // keeps keys valid even if an option's `names` vector reallocates later.
+/// Split `sv` on `delim`, invoking `fn(token)` for each piece.  A token that
+/// begins with a single or double quote and ends with the matching quote
+/// (immediately before a delimiter or the end of input) is unwrapped and may
+/// contain delimiters: `a,"b,c",d` yields `a`, `b,c`, `d`.  Quotes elsewhere
+/// in a token (such as an apostrophe in `it's`) stay literal.  No allocation.
+template<typename F>
+[[nodiscard]] ParseResult for_each_delimited(std::string_view sv, char delim, F&& fn) {
+    size_t start = 0;
+    while (start <= sv.size()) {
+        std::string_view tok;
+        size_t next = std::string_view::npos;
+        bool quoted = false;
+        if (start < sv.size() && (sv[start] == '"' || sv[start] == '\'')) {
+            const char q = sv[start];
+            for (size_t j = sv.find(q, start + 1); j != std::string_view::npos;
+                 j = sv.find(q, j + 1)) {
+                if (j + 1 == sv.size() || sv[j + 1] == delim) {
+                    tok    = sv.substr(start + 1, j - start - 1);
+                    next   = (j + 1 == sv.size()) ? std::string_view::npos : j + 2;
+                    quoted = true;
+                    break;
+                }
+            }
+        }
+        if (!quoted) {
+            const auto pos = sv.find(delim, start);
+            tok  = (pos == std::string_view::npos) ? sv.substr(start)
+                                                   : sv.substr(start, pos - start);
+            next = (pos == std::string_view::npos) ? pos : pos + 1;
+        }
+        if (auto r = fn(tok); !r) return r;
+        if (next == std::string_view::npos) break;
+        start = next;
+    }
+    return {};
+}
+
 struct OptionRegistry {
     std::unordered_map<std::string, OptionBase*, StringHash, std::equal_to<>> by_name;
     // One-character short options are by far the most common token shape.
@@ -630,6 +706,7 @@ struct OptionBase {
     bool                     from_env_  = false;
     bool                     from_config_ = false;
     bool                     hidden_    = false;
+    bool                     global_    = false;
     std::string              section_;
     bool                     negatable_ = false;
     char                     delimiter_ = '\0';
@@ -740,16 +817,7 @@ struct OptionImpl final : OptionBase {
     ParseResult parse(std::string_view sv, std::string_view opt, const App* app) override {
         if constexpr (is_vec_v<T>) {
             if (delimiter_ != '\0') {
-                size_t start = 0;
-                while (start <= sv.size()) {
-                    const auto pos = sv.find(delimiter_, start);
-                    const auto tok = (pos == std::string_view::npos)
-                        ? sv.substr(start)
-                        : sv.substr(start, pos - start);
-                    if (auto r = parse_one(tok, opt, app); !r) return r;
-                    if (pos == std::string_view::npos) break;
-                    start = pos + 1;
-                }
+                if (auto r = detail::for_each_delimited(sv, delimiter_, [&](std::string_view tok) { return parse_one(tok, opt, app); }); !r) return r;
                 is_set_ = true;
                 return {};
             }
@@ -795,16 +863,7 @@ struct OptionImpl final : OptionBase {
                 from_env_ = true;
                 return {};
             }
-            size_t start = 0;
-            while (start <= sv.size()) {
-                const auto pos = sv.find(delim, start);
-                const auto tok = (pos == std::string_view::npos)
-                    ? sv.substr(start)
-                    : sv.substr(start, pos - start);
-                if (auto r = parse_one(tok, env_var, app); !r) return r;
-                if (pos == std::string_view::npos) break;
-                start = pos + 1;
-            }
+            if (auto r = detail::for_each_delimited(sv, delim, [&](std::string_view tok) { return parse_one(tok, env_var, app); }); !r) return r;
         } else {
             if (auto r = parse_one(sv, env_var, app); !r) return r;
         }
@@ -995,16 +1054,7 @@ struct PositionalImpl final : PositionalBase {
     ParseResult parse(std::string_view sv, const App* app) override {
         if constexpr (is_vec_v<T>) {
             if (delimiter_ != '\0') {
-                size_t start = 0;
-                while (start <= sv.size()) {
-                    const auto pos = sv.find(delimiter_, start);
-                    const auto tok = (pos == std::string_view::npos)
-                        ? sv.substr(start)
-                        : sv.substr(start, pos - start);
-                    if (auto r = parse_one(tok, label, app); !r) return r;
-                    if (pos == std::string_view::npos) break;
-                    start = pos + 1;
-                }
+                if (auto r = detail::for_each_delimited(sv, delimiter_, [&](std::string_view tok) { return parse_one(tok, label, app); }); !r) return r;
                 is_set_ = true;
                 return {};
             }
@@ -1023,16 +1073,7 @@ struct PositionalImpl final : PositionalBase {
                 return {};
             }
             const char delim = (delimiter_ != '\0') ? delimiter_ : ',';
-            size_t start = 0;
-            while (start <= sv.size()) {
-                const auto pos = sv.find(delim, start);
-                const auto tok = (pos == std::string_view::npos)
-                    ? sv.substr(start)
-                    : sv.substr(start, pos - start);
-                if (auto r = parse_one(tok, env_label, app); !r) return r;
-                if (pos == std::string_view::npos) break;
-                start = pos + 1;
-            }
+            if (auto r = detail::for_each_delimited(sv, delim, [&](std::string_view tok) { return parse_one(tok, env_label, app); }); !r) return r;
         } else {
             if (auto r = parse_one(sv, env_label, app); !r) return r;
         }
@@ -1173,6 +1214,9 @@ parse_config(std::string_view text) {
     ConfigData data;
     std::string section;
     size_t line_no = 0;
+    // Files written on Windows often start with a UTF-8 byte-order mark; it is
+    // not part of the first key.
+    if (text.starts_with("\xEF\xBB\xBF")) text.remove_prefix(3);
     while (!text.empty()) {
         ++line_no;
         const auto nl = text.find('\n');
@@ -1184,27 +1228,48 @@ parse_config(std::string_view text) {
         if (line.empty() || line.front() == '#' || line.front() == ';')
             continue;
         if (line.front() == '[') {
-            const auto close = line.find(']');
-            if (close == std::string_view::npos)
-                return std::unexpected(
-                    std::format("line {}: unterminated section header", line_no));
-            section = std::string(trim_view(line.substr(1, close - 1)));
-            if (section.empty())
+            // A comment may follow the closing bracket, and section names may
+            // be quoted (TOML/CLI11) or use TOML's [[table]] spelling.  Only
+            // strip a comment when the line does not already end in ']', so
+            // hashes inside `[section # name]` stay part of the name.  A bare
+            // "[" left after removing a comment is not a section at all.
+            if (!line.ends_with(']')) {
+                line = trim_view(strip_inline_comment(line));
+                if (line.empty() || line == "[") continue;
+            }
+            std::string_view name;
+            if (line.size() >= 4 && line.starts_with("[[") && line.ends_with("]]"))
+                name = line.substr(2, line.size() - 4);
+            else {
+                const auto close = line.find(']');
+                if (close == std::string_view::npos)
+                    return std::unexpected(
+                        std::format("line {}: unterminated section header", line_no));
+                name = line.substr(1, close - 1);
+            }
+            std::string section_name(trim_view(name));
+            strip_matching_quotes(section_name);
+            if (section_name.empty())
                 return std::unexpected(
                     std::format("line {}: empty section name", line_no));
+            // CLI11 reserves [default] for the root command's own options.
+            section = ascii_iequals(section_name, "default")
+                ? std::string{}
+                : std::move(section_name);
             continue;
         }
         const auto eq = line.find('=');
         std::string key;
         std::string value;
         if (eq == std::string_view::npos) {
-            key   = std::string(trim_view(line));
+            key   = std::string(trim_view(strip_inline_comment(line)));
             value = "true";
         } else {
             key   = std::string(trim_view(line.substr(0, eq)));
             auto raw_value = trim_view(line.substr(eq + 1));
             value = std::string(trim_view(strip_inline_comment(raw_value)));
         }
+        strip_matching_quotes(key);
         if (key.empty())
             return std::unexpected(
                 std::format("line {}: missing key", line_no));
@@ -1262,6 +1327,7 @@ config_value_for(const ConfigData::Section& section,
 
 [[nodiscard]] inline std::expected<std::vector<std::string>, std::string>
 tokenize_response_file(std::string_view text) {
+    if (text.starts_with("\xEF\xBB\xBF")) text.remove_prefix(3);
     std::vector<std::string> tokens;
     std::string current;
     bool started = false;
@@ -1418,6 +1484,13 @@ public:
         return std::forward<decltype(self)>(self);
     }
 
+    /// Make this option recognised in every descendant subcommand too, so
+    /// `tool build --verbose` works as well as `tool --verbose build`.
+    auto&& global(this auto&& self, bool g = true) {
+        self.p_->global_ = g;
+        return std::forward<decltype(self)>(self);
+    }
+
     auto&& env(this auto&& self, std::string_view var) {
         detail::validate_env_name(var);
         self.p_->env_var = std::string(var);
@@ -1558,6 +1631,13 @@ public:
         self.p_->hidden_ = h;
         return std::forward<decltype(self)>(self);
     }
+
+    /// Make this option recognised in every descendant subcommand too, so
+    /// `tool build --verbose` works as well as `tool --verbose build`.
+    auto&& global(this auto&& self, bool g = true) {
+        self.p_->global_ = g;
+        return std::forward<decltype(self)>(self);
+    }
     auto&& env(this auto&& self, std::string_view v) {
         detail::validate_env_name(v);
         self.p_->env_var = std::string(v);
@@ -1615,6 +1695,13 @@ public:
     }
     auto&& hidden(this auto&& self, bool h = true) {
         self.p_->hidden_ = h;
+        return std::forward<decltype(self)>(self);
+    }
+
+    /// Make this option recognised in every descendant subcommand too, so
+    /// `tool build --verbose` works as well as `tool --verbose build`.
+    auto&& global(this auto&& self, bool g = true) {
+        self.p_->global_ = g;
         return std::forward<decltype(self)>(self);
     }
     auto&& env(this auto&& self, std::string_view v) {
@@ -2845,12 +2932,12 @@ private:
             }
 
             // ── Built-in --help / -h (unless user registered their own -h/--help)
-            if (!end_opts && (arg == "--help" || arg == "-h") && !find_opt(arg))
+            if (!end_opts && (arg == "--help" || arg == "-h") && !find_opt_inherited(arg))
                 return std::unexpected(ParseError::help_requested(this));
 
             // ── Built-in --version / -V (unless user registered their own -V/--version)
             if (!end_opts && has_version
-                && (arg == "--version" || arg == "-V") && !find_opt(arg))
+                && (arg == "--version" || arg == "-V") && !find_opt_inherited(arg))
                 return std::unexpected(ParseError::version_requested(this));
 
             // ── Subcommand dispatch (only before any positional argument)
@@ -2863,6 +2950,14 @@ private:
                     // finalizing the parent here would mask the real error.
                     auto sub_res = sub->do_parse(args.subspan(i + 1));
                     if (!sub_res) return sub_res;
+                    // Extras accepted by the child (through its own policy or
+                    // an inherited one) become part of the root's ordered
+                    // stream.  Nested commands have already aggregated into
+                    // `sub`, so one append per level preserves token order.
+                    if (sub->extras_enabled())
+                        remaining_args_.insert(remaining_args_.end(),
+                                               sub->remaining_args_.begin(),
+                                               sub->remaining_args_.end());
                     if (auto r = finalize(/*subcommand_active=*/true); !r)
                         return r;
                     return {};
@@ -2870,16 +2965,19 @@ private:
             }
 
             // ── Positional argument (including single '-' stdin/stdout token)
-            if (end_opts || !arg.starts_with('-') || arg == "-") {
-                const bool first_positional = !saw_positional;
-                saw_positional = true;
+            // A dash followed by whitespace ("- text") cannot name an option.
+            if (end_opts || !arg.starts_with('-') || arg == "-"
+                || (arg.size() > 1 && detail::is_space(arg[1]))) {
                 if (pos_idx < positionals_.size()) {
+                    saw_positional = true;
                     auto& pos = positionals_[pos_idx];
                     if (auto r = pos->parse(arg, this); !r) return r;
                     if (!pos->variadic_) ++pos_idx;
-                } else if (allow_extras_) {
+                } else if (extras_enabled()) {
+                    // Extras are forwarded, not interpreted as positionals, so
+                    // a later token can still select a subcommand.
                     remaining_args_.emplace_back(arg);
-                } else if (has_subcommands && first_positional && !end_opts) {
+                } else if (has_subcommands && !saw_positional && !end_opts) {
                     return std::unexpected(ParseError::unknown_command(
                         arg, suggest_command(arg), this));
                 } else {
@@ -2896,18 +2994,17 @@ private:
                 // true for an inline spelling such as `-1abc=5`.
                 const auto eq = arg.find('=');
                 const bool has_registered_prefix =
-                    eq != std::string_view::npos && find_opt(arg.substr(0, eq)) != nullptr;
-                if (!find_opt(std::string_view(short_name, 2)) &&
-                    !find_opt(arg) && !has_registered_prefix) {
-                    const bool first_positional = !saw_positional;
-                    saw_positional = true;
+                    eq != std::string_view::npos && find_opt_inherited(arg.substr(0, eq)) != nullptr;
+                if (!find_opt_inherited(std::string_view(short_name, 2)) &&
+                    !find_opt_inherited(arg) && !has_registered_prefix) {
                     if (pos_idx < positionals_.size()) {
+                        saw_positional = true;
                         auto& pos = positionals_[pos_idx];
                         if (auto r = pos->parse(arg, this); !r) return r;
                         if (!pos->variadic_) ++pos_idx;
-                    } else if (allow_extras_) {
+                    } else if (extras_enabled()) {
                         remaining_args_.emplace_back(arg);
-                    } else if (has_subcommands && first_positional) {
+                    } else if (has_subcommands && !saw_positional) {
                         return std::unexpected(ParseError::unknown_command(
                             arg, suggest_command(arg), this));
                     } else {
@@ -2925,7 +3022,7 @@ private:
                 const auto inlval = has_eq ? arg.substr(eq + 1) : std::string_view{};
 
                 // An exact option name wins over the --no-FLAG interpretation.
-                auto* opt = find_opt(name);
+                auto* opt = find_opt_inherited(name);
                 if (!opt && !has_eq && name.starts_with("--no-")) {
                     // Build "--" + name.substr(5) on the stack for the common
                     // case; long names fall back to an owned string.
@@ -2936,19 +3033,19 @@ private:
                         buf[0] = '-';
                         buf[1] = '-';
                         std::ranges::copy(positive, buf + 2);
-                        nopt = find_opt(std::string_view(buf, positive.size() + 2));
+                        nopt = find_opt_inherited(std::string_view(buf, positive.size() + 2));
                     } else {
                         std::string full;
                         full.reserve(positive.size() + 2);
                         full.append("--").append(positive);
-                        nopt = find_opt(full);
+                        nopt = find_opt_inherited(full);
                     }
                     if (nopt && nopt->is_flag_ && nopt->negatable_) {
                         if (auto r = nopt->set_negated(this); !r) return r;
                         continue;
                     }
                 }
-                if (!opt && allow_abbrev_) {
+                if (!opt && abbrev_enabled()) {
                     auto match = resolve_prefix(name);
                     if (match.option != nullptr) {
                         opt = match.option;
@@ -2958,7 +3055,7 @@ private:
                     }
                 }
                 if (!opt) {
-                    if (allow_extras_) {
+                    if (extras_enabled()) {
                         remaining_args_.emplace_back(arg);
                         continue;
                     }
@@ -2979,7 +3076,7 @@ private:
                         if (auto r = consume_nargs(opt, i, args, name, 1); !r) return r;
                     }
                 } else {
-                    if (++i >= args.size())
+                    if (++i >= args.size() || token_text(args[i]) == "--")
                         return std::unexpected(ParseError::missing_value(name, this));
                     if (auto r = opt->parse(token_text(args[i]), name, this); !r) return r;
                     if (opt->nargs_max_ != 0) {
@@ -2995,7 +3092,7 @@ private:
                 const auto eq = arg.find('=');
                 if (eq != std::string_view::npos) {
                     const auto name = arg.substr(0, eq);
-                    if (auto* exact = find_opt(name)) {
+                    if (auto* exact = find_opt_inherited(name)) {
                         const auto inlval = arg.substr(eq + 1);
                         if (exact->is_count_option())
                             return std::unexpected(ParseError::unexpected_value(name, inlval, this));
@@ -3011,11 +3108,11 @@ private:
             // A registered single-dash name longer than one character (for
             // example `-verbose`) is matched as a whole token before falling
             // back to short-flag grouping.
-            if (auto* exact = find_opt(arg)) {
+            if (auto* exact = find_opt_inherited(arg)) {
                 if (exact->is_flag_) {
                     if (auto r = exact->set_implicit(this); !r) return r;
                 } else {
-                    if (++i >= args.size())
+                    if (++i >= args.size() || token_text(args[i]) == "--")
                         return std::unexpected(ParseError::missing_value(arg, this));
                     if (auto r = exact->parse(token_text(args[i]), arg, this); !r) return r;
                     if (exact->nargs_max_ != 0) {
@@ -3029,13 +3126,17 @@ private:
             for (size_t ch = 1; ch < arg.size(); ++ch) {
                 const char short_name[2] = {'-', arg[ch]};
                 const std::string_view sopt(short_name, 2);
-                auto* opt = find_opt(sopt);
+                auto* opt = find_opt_inherited(sopt);
                 if (!opt) {
                     if (sopt == "-h") return std::unexpected(ParseError::help_requested(this));
                     if (sopt == "-V" && has_version)
                         return std::unexpected(ParseError::version_requested(this));
-                    if (allow_extras_) {
-                        remaining_args_.emplace_back(arg);
+                    if (extras_enabled()) {
+                        // Preserve only the unparsed suffix so a wrapper can
+                        // forward `-q` from `-vq` after consuming `-v`.
+                        std::string suffix(1, '-');
+                        suffix.append(arg.substr(ch));
+                        remaining_args_.emplace_back(std::move(suffix));
                         break;
                     }
                     return std::unexpected(ParseError::unknown(sopt, suggest(sopt), this));
@@ -3058,7 +3159,7 @@ private:
                         if (!val.empty() && val.front() == '=')
                             val.remove_prefix(1);
                     } else {
-                        if (++i >= args.size())
+                        if (++i >= args.size() || token_text(args[i]) == "--")
                             return std::unexpected(ParseError::missing_value(sopt, this));
                         val = token_text(args[i]);
                     }
@@ -3202,6 +3303,33 @@ private:
         return registry_.find(n);
     }
 
+    /// Abbreviation is a parser policy, so a root setting applies to every
+    /// descendant command unless no ancestor enabled it.
+    [[nodiscard]] bool abbrev_enabled() const noexcept {
+        for (const App* a = this; a != nullptr; a = a->parent_)
+            if (a->allow_abbrev_) return true;
+        return false;
+    }
+
+    /// Extras forwarding is likewise a parser policy: wrappers that call
+    /// `allow_extras()` on the root expect unknown tokens after a subcommand
+    /// to be forwarded instead of rejected (argparse's parse_known_args).
+    [[nodiscard]] bool extras_enabled() const noexcept {
+        for (const App* a = this; a != nullptr; a = a->parent_)
+            if (a->allow_extras_) return true;
+        return false;
+    }
+
+    /// Own options first, then `.global()` options declared on ancestors.
+    [[nodiscard]] detail::OptionBase* find_opt_inherited(std::string_view n) const noexcept {
+        if (auto* own = registry_.find(n)) return own;
+        for (const App* a = parent_; a != nullptr; a = a->parent_) {
+            auto* o = a->registry_.find(n);
+            if (o != nullptr && o->global_) return o;
+        }
+        return nullptr;
+    }
+
     struct PrefixMatch {
         detail::OptionBase* option = nullptr;
         std::string         names;
@@ -3214,18 +3342,23 @@ private:
         PrefixMatch match;
         if (name.size() <= 2 || !name.starts_with("--")) return match;
         std::vector<detail::OptionBase*> found;
-        for (const auto& opt : options_) {
+        auto consider = [&](detail::OptionBase* opt) {
             for (const auto& n : opt->names) {
                 if (n.size() > 2 && n.starts_with("--") && n.starts_with(name)) {
-                    if (!std::ranges::contains(found, opt.get())) {
-                        found.push_back(opt.get());
+                    if (!std::ranges::contains(found, opt)) {
+                        found.push_back(opt);
                         if (!match.names.empty()) match.names += ", ";
                         match.names += n;
                     }
                     break;
                 }
             }
-        }
+        };
+        for (const auto& opt : options_) consider(opt.get());
+        // Inherited `.global()` options participate in abbreviation too.
+        for (const App* a = parent_; a != nullptr; a = a->parent_)
+            for (const auto& opt : a->options_)
+                if (opt->global_) consider(opt.get());
         if (found.size() == 1)
             match.option = found.front();
         else if (found.size() > 1)

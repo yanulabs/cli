@@ -294,4 +294,25 @@ TEST_CASE("negative numeric tokens with no positional are unexpected arguments")
     CHECK(real.error().kind == cli::ParseError::Kind::TooManyPositionals);
 }
 
+TEST_CASE("a dash followed by whitespace is a positional value, not an option") {
+    cli::App app("t");
+    auto text = app.add_positional<std::string>("text");
+
+    REQUIRE(app.parse({"- reality"}));
+    CHECK(*text == "- reality");
+
+    REQUIRE(app.parse({"-\ttab"}));
+    CHECK(*text == "-\ttab");
+
+    REQUIRE(app.parse({"- "}));
+    CHECK(*text == "- ");
+}
+
+TEST_CASE("a dash followed by whitespace is still rejected without a positional") {
+    cli::App app("t");
+    auto r = app.parse({"- reality"});
+    REQUIRE(!r);
+    CHECK(r.error().kind == cli::ParseError::Kind::TooManyPositionals);
+}
+
 TEST_SUITE_END();

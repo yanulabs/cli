@@ -227,4 +227,13 @@ TEST_CASE("a positional parse error reports the positional name") {
     CHECK(contains(r.error().message, "<count>"));
 }
 
+TEST_CASE("quoted delimiter-separated positional values may contain the delimiter") {
+    cli::App app("t");
+    auto items = app.add_positional<std::vector<std::string>>("items").delimiter(',');
+
+    REQUIRE(app.parse({R"(a,"b,c",d)"}));
+    REQUIRE(items->size() == 3);
+    CHECK((*items)[1] == "b,c");
+}
+
 TEST_SUITE_END();

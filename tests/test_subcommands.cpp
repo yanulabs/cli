@@ -386,4 +386,259 @@ TEST_CASE("require_subcommand is scoped to the command that declares it") {
     CHECK(remote.active_subcommand() == &add);
 }
 
+TEST_CASE("a global root flag is accepted before and after a subcommand") {
+    cli::App app("t");
+    auto verbose = app.add_flag("--verbose").short_name("-v").global();
+    (void)app.subcommand("build", "");
+
+    REQUIRE(app.parse({"--verbose", "build"}));
+    CHECK(*verbose);
+
+    REQUIRE(app.parse({"build", "--verbose"}));
+    CHECK(*verbose);
+
+    REQUIRE(app.parse({"build", "-v"}));
+    CHECK(*verbose);
+
+    REQUIRE(app.parse({"build"}));
+    CHECK(!*verbose);
+}
+
+TEST_CASE("a global value option is inherited by nested subcommands") {
+    cli::App app("t");
+    auto cfg = app.add<std::string>("--config").global();
+    auto& remote = app.subcommand("remote", "");
+    (void)remote.subcommand("add", "");
+
+    REQUIRE(app.parse({"remote", "add", "--config", "x.ini"}));
+    CHECK(*cfg == "x.ini");
+
+    REQUIRE(app.parse({"remote", "add", "--config=y.ini"}));
+    CHECK(*cfg == "y.ini");
+}
+
+TEST_CASE("non-global root options are still rejected after a subcommand") {
+    cli::App app("t");
+    (void)app.add_flag("--verbose");
+    (void)app.subcommand("build", "");
+
+    auto r = app.parse({"build", "--verbose"});
+    REQUIRE(!r);
+    CHECK(r.error().kind == cli::ParseError::Kind::UnknownOption);
+}
+
+TEST_CASE("a subcommand option shadows a global option of the same name") {
+    cli::App app("t");
+    auto root = app.add<std::string>("--name").default_val("root").global();
+    auto& sub = app.subcommand("run", "");
+    auto own  = sub.add<std::string>("--name").default_val("sub");
+
+    REQUIRE(app.parse({"run", "--name", "custom"}));
+    CHECK(*own == "custom");
+    CHECK(*root == "root");
+}
+
+TEST_CASE("a required global option is enforced and satisfiable after the verb") {
+    cli::App app("t");
+    (void)app.add<std::string>("--token").required().global();
+    (void)app.subcommand("push", "");
+
+    auto missing = app.parse({"push"});
+    REQUIRE(!missing);
+    CHECK(missing.error().kind == cli::ParseError::Kind::MissingRequired);
+
+    CHECK(app.parse({"push", "--token", "abc"}));
+}
+
+TEST_CASE("global counts and negatable flags work after a subcommand") {
+    cli::App app("t");
+    auto level = app.add_count("--verbose").short_name("-v").global();
+    auto color = app.add_flag("--color").negatable().default_val(true).global();
+    (void)app.subcommand("build", "");
+
+    REQUIRE(app.parse({"build", "-vv", "--no-color"}));
+    CHECK(*level == 2u);
+    CHECK(!*color);
+}
+
+TEST_CASE("a global user --help or --version option wins over the built-in in children") {
+    cli::App app("tool", "desc", "1.0.0");
+    auto help    = app.add_flag("--help").global();
+    auto version = app.add_flag("--version").global();
+    (void)app.subcommand("build", "");
+
+    REQUIRE(app.parse({"build", "--help"}));
+    CHECK(*help);
+    CHECK(!*version);
+
+    REQUIRE(app.parse({"build", "--version"}));
+    CHECK(*version);
+}
+
+TEST_CASE("CLI11: a root allow_abbrev setting applies inside a subcommand") {
+    cli::App app("t");
+    app.allow_abbrev();
+    auto cfg = app.add<std::string>("--config").global();
+    (void)app.subcommand("build", "");
+
+    REQUIRE(app.parse({"build", "--conf", "x.ini"}));
+    CHECK(*cfg == "x.ini");
+}
+
+TEST_CASE("CLI11: abbreviations consider inherited globals and local options together") {
+    cli::App app("t");
+    app.allow_abbrev();
+    (void)app.add_flag("--verbose").global();
+    auto& sub = app.subcommand("build", "");
+    (void)sub.add_flag("--versioned");
+
+    auto r = app.parse({"build", "--ver"});
+    REQUIRE(!r);
+    CHECK(r.error().kind == cli::ParseError::Kind::AmbiguousOption);
+    CHECK(contains(r.error().message, "--verbose"));
+    CHECK(contains(r.error().message, "--versioned"));
+}
+
+TEST_CASE("CLI11 SubComExtras: extras before a subcommand do not block dispatch") {
+    cli::App app("tool");
+    app.allow_extras();
+    auto& run = app.subcommand("run", "");
+    auto known = run.add_flag("--known");
+
+    REQUIRE(app.parse({"--extra", "x", "run", "--known"}));
+    CHECK(*known);
+    const auto& rest = app.remaining_args();
+    REQUIRE(rest.size() == 2);
+    CHECK(rest[0] == "--extra");
+    CHECK(rest[1] == "x");
+}
+
+TEST_CASE("argparse parse_known_args: extras after a subcommand are inherited") {
+    cli::App app("tool");
+    app.allow_extras();
+    auto count = app.add<int>("--count").global();
+    auto& run = app.subcommand("run", "");
+    auto known = run.add_flag("--known");
+
+    REQUIRE(app.parse({"run", "--extra", "value", "--count", "3", "--known", "-q"}));
+    CHECK(*count == 3);
+    CHECK(*known);
+    const auto& rest = app.remaining_args();
+    REQUIRE(rest.size() == 3);
+    CHECK(rest[0] == "--extra");
+    CHECK(rest[1] == "value");
+    CHECK(rest[2] == "-q");
+    // The child still exposes the tokens it forwarded itself.
+    CHECK(run.remaining_args() == rest);
+}
+
+TEST_CASE("argparse parse_known_args: root sees extras in command-line order") {
+    cli::App app("tool");
+    app.allow_extras();
+    auto& run = app.subcommand("run", "");
+    auto known = run.add_flag("--known");
+
+    REQUIRE(app.parse({"--before", "run", "--after", "--known"}));
+    CHECK(*known);
+    const auto& rest = app.remaining_args();
+    REQUIRE(rest.size() == 2);
+    CHECK(rest[0] == "--before");
+    CHECK(rest[1] == "--after");
+}
+
+TEST_CASE("argparse parse_known_args: nested subcommand extras reach the root") {
+    cli::App app("tool");
+    app.allow_extras();
+    auto& mid  = app.subcommand("mid", "");
+    auto& leaf = mid.subcommand("leaf", "");
+    auto known = leaf.add_flag("--known");
+
+    REQUIRE(app.parse({"mid", "leaf", "--deep", "x", "--known"}));
+    CHECK(*known);
+    const auto& rest = app.remaining_args();
+    REQUIRE(rest.size() == 2);
+    CHECK(rest[0] == "--deep");
+    CHECK(rest[1] == "x");
+}
+
+TEST_CASE("argparse parse_known_args: extras at every nesting level keep their order") {
+    cli::App app("tool");
+    app.allow_extras();
+    auto& run  = app.subcommand("run", "");
+    auto& leaf = run.subcommand("leaf", "");
+    auto known = leaf.add<std::string>("--known");
+
+    REQUIRE(app.parse({"--parent", "P", "run", "--child", "C",
+                       "leaf", "--known", "K", "--leaf", "L"}));
+    CHECK(*known == "K");
+    const auto& rest = app.remaining_args();
+    REQUIRE(rest.size() == 6);
+    CHECK(rest[0] == "--parent");
+    CHECK(rest[1] == "P");
+    CHECK(rest[2] == "--child");
+    CHECK(rest[3] == "C");
+    CHECK(rest[4] == "--leaf");
+    CHECK(rest[5] == "L");
+}
+
+TEST_CASE("argparse parse_known_args: unknown compound option is forwarded whole") {
+    cli::App app("tool");
+    app.allow_extras();
+    auto& run = app.subcommand("run", "");
+
+    REQUIRE(app.parse({"-xy", "run", "tail"}));
+    CHECK(app.active_subcommand() == &run);
+    const auto& rest = app.remaining_args();
+    REQUIRE(rest.size() == 2);
+    CHECK(rest[0] == "-xy");
+    CHECK(rest[1] == "tail");
+}
+
+TEST_CASE("argparse parse_known_args: extras survive both argc/argv levels") {
+    cli::App app("tool");
+    app.allow_extras();
+    auto& run = app.subcommand("run", "");
+
+    const char* argv[] = {"tool", "--parent", "run", "--child"};
+    REQUIRE(app.parse(4, argv));
+    const auto& rest = app.remaining_args();
+    REQUIRE(rest.size() == 2);
+    CHECK(rest[0] == "--parent");
+    CHECK(rest[1] == "--child");
+}
+
+TEST_CASE("argparse parse_known_args: extras do not hide child errors") {
+    cli::App app("tool");
+    app.allow_extras();
+    auto& run = app.subcommand("run", "");
+    (void)run.add<int>("--count");
+
+    auto res = app.parse({"--unknown", "run", "--count", "not-a-number", "--extra"});
+    REQUIRE(!res);
+    CHECK(res.error().kind == cli::ParseError::Kind::InvalidValue);
+}
+
+TEST_CASE("argparse parse_known_args: aggregated extras are cleared by the next parse") {
+    cli::App app("tool");
+    app.allow_extras();
+    auto& run = app.subcommand("run", "");
+
+    REQUIRE(app.parse({"run", "--extra", "value"}));
+    REQUIRE(app.remaining_args().size() == 2);
+
+    REQUIRE(app.parse({"run"}));
+    CHECK(app.remaining_args().empty());
+    CHECK(run.remaining_args().empty());
+}
+
+TEST_CASE("without root allow_extras a child still rejects unknown options") {
+    cli::App app("tool");
+    auto& run = app.subcommand("run", "");
+    (void)run.add_flag("--known");
+
+    auto res = app.parse({"run", "--nope"});
+    REQUIRE(!res);
+    CHECK(res.error().kind == cli::ParseError::Kind::UnknownOption);
+}
+
 TEST_SUITE_END();

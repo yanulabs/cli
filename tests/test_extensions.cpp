@@ -180,6 +180,47 @@ TEST_CASE("allow_extras collects unknown options and surplus positionals") {
     CHECK(rest[3] == "tail");
 }
 
+TEST_CASE("argparse parse_known_args: unknown options do not consume positionals") {
+    cli::App app("t");
+    app.allow_extras();
+    auto foo = app.add_flag("--foo");
+    auto bar = app.add_positional<std::string>("bar");
+
+    REQUIRE(app.parse({"--foo", "--badger", "BAR", "spam"}));
+    CHECK(*foo);
+    CHECK(*bar == "BAR");
+    const auto& rest = app.remaining_args();
+    REQUIRE(rest.size() == 2);
+    CHECK(rest[0] == "--badger");
+    CHECK(rest[1] == "spam");
+}
+
+TEST_CASE("argparse parse_known_args: unknown compound option stays whole") {
+    cli::App app("t");
+    app.allow_extras();
+    auto foo = app.add_flag("--foo");
+    auto bar = app.add_positional<std::string>("bar");
+
+    REQUIRE(app.parse({"-jc", "BAR"}));
+    CHECK(!*foo);
+    CHECK(*bar == "BAR");
+    const auto& rest = app.remaining_args();
+    REQUIRE(rest.size() == 1);
+    CHECK(rest[0] == "-jc");
+}
+
+TEST_CASE("argparse parse_known_args: extras do not satisfy require_one_of") {
+    cli::App app("t");
+    app.allow_extras();
+    (void)app.add_flag("--first");
+    (void)app.add_flag("--second");
+    app.require_one_of({"--first", "--second"});
+
+    auto res = app.parse({"--unknown", "value"});
+    REQUIRE(!res);
+    CHECK(res.error().kind == cli::ParseError::Kind::MissingRequired);
+}
+
 TEST_CASE("extras are cleared by the next parse") {
     cli::App app("t");
     app.allow_extras();
@@ -286,6 +327,145 @@ path = dir#fragment ; another comment
     REQUIRE(app.parse({}));
     CHECK(*name == "hello world");
     CHECK(*path == "dir#fragment");
+}
+
+TEST_CASE("config bare flags may carry an inline comment") {
+    TempFile cfg("bare-flag", R"(
+verbose # enable verbose output
+cache ; use the cache
+)");
+    cli::App app("tool");
+    app.config_file(cfg.path());
+    auto verbose = app.add_flag("--verbose");
+    auto cache   = app.add_flag("--cache");
+
+    REQUIRE(app.parse({}));
+    CHECK(*verbose);
+    CHECK(*cache);
+}
+
+TEST_CASE("CLI11: config section headers may be quoted or use TOML brackets") {
+    TempFile quoted("quoted-section", R"(
+val = 1
+["subcom"] # quoted section
+val = 2
+)");
+    cli::App app("tool");
+    app.config_file(quoted.path());
+    auto root_val = app.add<unsigned>("--val").default_val(0u);
+    auto& sub = app.subcommand("subcom", "");
+    auto sub_val = sub.add<unsigned>("--val").default_val(0u);
+
+    REQUIRE(app.parse({"subcom"}));
+    CHECK(*root_val == 1u);
+    CHECK(*sub_val == 2u);
+}
+
+TEST_CASE("CLI11: config section headers ignore trailing comments") {
+    TempFile cfg("section-comment", R"(
+[default]
+val = 1
+[subcom] # a comment about the subcommand
+val = 2
+["other"] ; another comment
+val = 3
+)");
+    cli::App app("tool");
+    app.config_file(cfg.path());
+    auto root_val  = app.add<unsigned>("--val").default_val(0u);
+    auto& sub      = app.subcommand("subcom", "");
+    auto sub_val   = sub.add<unsigned>("--val").default_val(0u);
+    auto& other    = app.subcommand("other", "");
+    auto other_val = other.add<unsigned>("--val").default_val(0u);
+
+    REQUIRE(app.parse({"subcom"}));
+    CHECK(*root_val == 1u);
+    CHECK(*sub_val == 2u);
+
+    REQUIRE(app.parse({"other"}));
+    CHECK(*other_val == 3u);
+}
+
+TEST_CASE("CLI11: config section comments respect quoted section names") {
+    TempFile cfg("quoted-comment", R"(
+val = 1
+[ # not a section
+["subcom"] # a 'quoted' comment
+val = 2
+)");
+    cli::App app("tool");
+    app.config_file(cfg.path());
+    auto root_val = app.add<unsigned>("--val").default_val(0u);
+    auto& sub     = app.subcommand("subcom", "");
+    auto sub_val  = sub.add<unsigned>("--val").default_val(0u);
+
+    REQUIRE(app.parse({"subcom"}));
+    CHECK(*root_val == 1u);
+    CHECK(*sub_val == 2u);
+}
+
+TEST_CASE("CLI11: config files written with CRLF line endings parse") {
+    TempFile cfg("crlf",
+                 "[default]\r\n"
+                 "val = 4\r\n"
+                 "[subcom]\r\n"
+                 "val = 5\r\n");
+    cli::App app("tool");
+    app.config_file(cfg.path());
+    auto root_val = app.add<unsigned>("--val").default_val(0u);
+    auto& sub     = app.subcommand("subcom", "");
+    auto sub_val  = sub.add<unsigned>("--val").default_val(0u);
+
+    REQUIRE(app.parse({"subcom"}));
+    CHECK(*root_val == 4u);
+    CHECK(*sub_val == 5u);
+}
+
+TEST_CASE("CLI11: TOML double-bracket sections select subcommands") {
+    TempFile cfg("toml-section", "val = 1\n[[subcom]]\nval = 2\n");
+    cli::App app("tool");
+    app.config_file(cfg.path());
+    auto root_val = app.add<unsigned>("--val").default_val(0u);
+    auto& sub = app.subcommand("subcom", "");
+    auto sub_val = sub.add<unsigned>("--val").default_val(0u);
+
+    REQUIRE(app.parse({"subcom"}));
+    CHECK(*root_val == 1u);
+    CHECK(*sub_val == 2u);
+}
+
+TEST_CASE("CLI11: the [default] section configures the root command") {
+    TempFile cfg("default-section", "[default]\nval = 3\n");
+    cli::App app("tool");
+    app.config_file(cfg.path());
+    auto val = app.add<unsigned>("--val").default_val(0u);
+
+    REQUIRE(app.parse({}));
+    CHECK(*val == 3u);
+}
+
+TEST_CASE("config files tolerate a UTF-8 byte-order mark") {
+    TempFile cfg("bom", "\xEF\xBB\xBFval = 4\n");
+    cli::App app("tool");
+    app.config_file(cfg.path());
+    auto val = app.add<unsigned>("--val").default_val(0u);
+
+    REQUIRE(app.parse({}));
+    CHECK(*val == 4u);
+}
+
+TEST_CASE("config keys may be quoted") {
+    TempFile cfg("quoted-key", R"("val" = 5
+'section-name' = quoted
+)");
+    cli::App app("tool");
+    app.config_file(cfg.path());
+    auto val = app.add<unsigned>("--val").default_val(0u);
+    auto section = app.add<std::string>("--section-name");
+
+    REQUIRE(app.parse({}));
+    CHECK(*val == 5u);
+    CHECK(*section == "quoted");
 }
 
 TEST_CASE("config values sit below CLI and environment but above defaults") {
@@ -537,6 +717,16 @@ TEST_CASE("double-at escapes a literal at-token") {
 
     REQUIRE(app.parse({"@@literal"}));
     CHECK(*file == "@literal");
+}
+
+TEST_CASE("response files tolerate a UTF-8 byte-order mark") {
+    TempFile args("bom-response", "\xEF\xBB\xBF--name ok\n");
+    cli::App app("tool");
+    app.response_files();
+    auto name = app.add<std::string>("--name");
+
+    REQUIRE(app.parse({"@" + args.path()}));
+    CHECK(*name == "ok");
 }
 
 TEST_CASE("missing response files are reported") {

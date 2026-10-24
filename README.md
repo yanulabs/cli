@@ -19,11 +19,12 @@
 | **Custom types** | ADL `cli_parse()` / `cli_format()` hooks — no registration boilerplate |
 | **Constraints** | `.range()`, `.choices()`, `.validate(fn, desc)` on options *and* positionals |
 | **Env-var fallback** | `.env("VAR")` on options *and* positionals |
-| **Delimited values** | `.delimiter(',')` — `--items=a,b,c` for `vector<T>` |
+| **Delimited values** | `.delimiter(',')` — `--items=a,b,c` for `vector<T>`; quoted elements may contain the delimiter |
 | **Arity control** | `.nargs(2)`, `.nargs(1,3)`, `.nargs_at_least(1)` — one flag, many tokens |
 | **Config files** | `config_file()` + `config_option()` — INI sections, arrays, subcommands |
 | **Response files** | `response_files()` — `@args.txt` with quotes, comments, nesting |
 | **Option aliases** | `.alias("--colour")` adds extra spellings to any option/flag/count |
+| **Global options** | `.global()` options work before or after any subcommand |
 | **Long-option abbreviation** | `allow_abbrev()` accepts unique prefixes such as `--verb` |
 | **Extra arguments** | `allow_extras()` + `remaining_args()` for wrapper/forwarding tools |
 | **Hidden commands** | `subcommand(...).hidden()` — dispatchable but absent from help/completion |
@@ -133,6 +134,7 @@ Option<T>    app.add<T>("--long").short_name("-s").help("...").default_val(v);
 Flag         app.add_flag("--verbose").short_name("-v").help("...");
 Count        app.add_count("--verbose").short_name("-v").help("...");
 Positional<T> app.add_positional<T>("name").help("...");
+// .global() on an option makes it visible to every descendant subcommand
 
 // Subcommands
 App&          app.subcommand("name", "desc").alias("n");
@@ -327,8 +329,11 @@ target = release
 Precedence is **command line > environment > config > default**. Sections map
 to command paths (`[remote.add]` for nested commands), values may be quoted,
 and array syntax `[a, b, "c,d"]` populates vector options and positionals.
-Missing optional files are ignored; `config_file(path, true)` makes them
-mandatory. Malformed files return `ParseError::Kind::ConfigError`.
+Section headers may be quoted (`["build"]`) or use TOML's double-bracket
+spelling (`[[build]]`); `[default]` configures the root command, and a UTF-8
+BOM at the start of the file is ignored. Missing optional files are ignored;
+`config_file(path, true)` makes them mandatory. Malformed files return
+`ParseError::Kind::ConfigError`.
 
 ### Response files
 
@@ -351,7 +356,11 @@ for (const auto& token : app.remaining_args()) { /* forward it */ }
 ```
 
 Unknown options and surplus positionals are collected instead of rejected.
-The `--` marker itself is not included.
+Forwarded tokens before a subcommand do not prevent that subcommand from being
+dispatched, so wrapper tools can mix their own arguments with a verb. Because
+`allow_extras()` is a parser policy, it applies inside subcommands too, and
+the root's `remaining_args()` contains the child's extras appended in
+command-line order. The `--` marker itself is not included.
 
 ### Abbreviations and aliases
 
@@ -363,7 +372,9 @@ auto color = app.add<std::string>("--color")
 ```
 
 Abbreviation is opt-in and only resolves unique long-option prefixes;
-ambiguous prefixes return `ParseError::Kind::AmbiguousOption`.
+ambiguous prefixes return `ParseError::Kind::AmbiguousOption`. The root's
+setting is inherited by subcommands, and inherited `.global()` options take
+part in prefix resolution.
 
 ### Require-one-of groups and hidden commands
 
@@ -450,7 +461,7 @@ app.zsh_completion(std::cout);  // writes #compdef-style function
 cmake -B build
 cmake --build build
 
-# Run everything (18 domain suites, aggregate run, process-level exit tests)
+# Run everything (19 domain suites, aggregate run, process-level exit tests)
 ctest --test-dir build --output-on-failure
 
 # Inspect or run one domain
@@ -470,11 +481,11 @@ cmake --build build-fuzz --target fuzz_parse
 ```
 
 Tests are split by domain (`flags`, `options`, `positionals`, `values`,
-`tokens`, `constraints`, `groups`, `environment`, `extensions`,
-`subcommands`, `errors`, `help`, `completion`, `lookup`, `lifecycle`,
-`custom_types`, `robustness`, `api`). Each domain is a doctest suite, so
-failures are attributable to one area and the whole suite can still be run at
-once. The fuzz target is opt-in and requires Clang with a libFuzzer runtime
+`tokens`, `upstream_edge_cases`, `constraints`, `groups`, `environment`,
+`extensions`, `subcommands`, `errors`, `help`, `completion`, `lookup`,
+`lifecycle`, `custom_types`, `robustness`, `api`). Each domain is a doctest
+suite, so failures are attributable to one area and the whole suite can still
+be run at once. The fuzz target is opt-in and requires Clang with a libFuzzer runtime
 (Linux CI uses Clang 19); `CLI_FUZZER_SANITIZERS` controls the sanitizer set
 (default `address,undefined`).
 
