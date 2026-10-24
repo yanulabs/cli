@@ -13,12 +13,19 @@ option(CLI_BUILD_EXAMPLES "Build example programs"   ON)
 option(CLI_BUILD_TESTS    "Build the test suite"     ON)
 option(CLI_BUILD_FUZZERS  "Build libFuzzer targets"  OFF)
 option(CLI_BUILD_BENCHMARKS "Build throughput benchmarks" OFF)
+option(CLI_BUILD_COMPARATIVE_BENCHMARKS
+    "Build head-to-head benchmarks against CLI11 and cxxopts" OFF)
 set(CLI_FUZZER_SANITIZERS "address,undefined" CACHE STRING
     "Comma-separated sanitizers combined with the libFuzzer runtime")
 option(CLI_INSTALL        "Generate install targets" ON)
 
 if(CLI_BUILD_FUZZERS AND NOT CLI_BUILD_TESTS)
     message(FATAL_ERROR "CLI_BUILD_FUZZERS requires CLI_BUILD_TESTS=ON")
+endif()
+
+if(CLI_BUILD_COMPARATIVE_BENCHMARKS AND NOT CLI_BUILD_BENCHMARKS)
+    message(FATAL_ERROR
+        "CLI_BUILD_COMPARATIVE_BENCHMARKS requires CLI_BUILD_BENCHMARKS=ON")
 endif()
 
 # ── Interface library (header-only) ──────────────────────────────────────────

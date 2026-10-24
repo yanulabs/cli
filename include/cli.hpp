@@ -14,6 +14,7 @@
 //  · Constraints: .range() · .choices() · .validate(fn, desc) on Options & Positionals
 //  · Multi-value delimiter splitting: .delimiter(',') for --items=a,b,c
 //  · Fixed/range/at-least arity: .nargs(2) · .nargs(1,3) · .nargs_at_least(1)
+//    on vector options and positionals
 //  · Mutually exclusive groups:  mutex_group({"--verbose","--quiet"})
 //  · Required-together groups:   require_together({"--output","--format"})
 //  · Require-at-least-one groups: require_one_of({"--json","--yaml"})
@@ -143,6 +144,18 @@ struct ParseError {
     static ParseError missing_positional(std::string_view name, const App* app = nullptr) {
         return { Kind::MissingRequired,
                  std::format("required argument <{}> was not provided", name), app };
+    }
+    static ParseError not_enough_values(std::string_view name, size_t expected,
+                                        size_t got, const App* app = nullptr) {
+        return { Kind::MissingValue,
+                 std::format("argument <{}> requires at least {} value{} (got {})",
+                             name, expected, expected == 1 ? "" : "s", got), app };
+    }
+    static ParseError too_many_values(std::string_view name, size_t expected,
+                                      size_t got, const App* app = nullptr) {
+        return { Kind::UnexpectedValue,
+                 std::format("argument <{}> accepts at most {} value{} (got {})",
+                             name, expected, expected == 1 ? "" : "s", got), app };
     }
     static ParseError missing_subcommand(std::string_view app_name, const App* app = nullptr) {
         return { Kind::MissingSubcommand,
@@ -761,6 +774,29 @@ struct OptionBase {
     }
 };
 
+/// An option together with the spellings that remain visible on this command
+/// after applying name-level shadowing.  A local alias can shadow just one
+/// spelling of an inherited `.global()` option without hiding the rest.
+struct VisibleOption {
+    OptionBase*                   option = nullptr;
+    std::vector<std::string_view> names;
+
+    [[nodiscard]] std::string_view short_name() const noexcept {
+        for (const auto& n : names)
+            if (n.size() >= 2 && n[0] == '-' && n[1] != '-') return n;
+        return {};
+    }
+    [[nodiscard]] std::string_view long_name() const noexcept {
+        for (const auto& n : names)
+            if (n.size() >= 3 && n[0] == '-' && n[1] == '-') return n;
+        return {};
+    }
+    [[nodiscard]] std::string_view display_name() const noexcept {
+        auto ln = long_name();
+        return ln.empty() ? short_name() : ln;
+    }
+};
+
 inline void append_option_name(OptionBase* option, std::string_view name) {
     validate_option_name(name);
     option->registry_->ensure_available(name);
@@ -1006,9 +1042,21 @@ struct PositionalBase {
     bool        from_env_ = false;
     bool        from_config_ = false;
     bool        variadic_ = false;
+    // Values consumed by one positional slot.  A scalar accepts exactly one,
+    // while a vector defaults to zero-or-more and may be bounded with nargs().
+    size_t      nargs_min_ = 1;
+    size_t      nargs_max_ = 1;
+    size_t      parsed_count_ = 0;
     char        delimiter_ = '\0';
     bool        has_default_     = false;
     bool        needs_finalize_  = false;
+
+    /// A positional whose upper bound differs from its lower bound consumes a
+    /// variable number of tokens, so no following positional could be reached
+    /// reliably.  Exact arities are safe to place in the middle.
+    [[nodiscard]] bool variable_arity() const noexcept { return nargs_max_ != nargs_min_; }
+    /// Whether help should render the `...` repetition marker.
+    [[nodiscard]] bool repeated() const noexcept { return variadic_ && nargs_max_ != 1; }
 
     virtual ~PositionalBase() = default;
     virtual ParseResult parse(std::string_view v, const App* app)     = 0;
@@ -1018,7 +1066,12 @@ struct PositionalBase {
     virtual void        apply_default()                               = 0;
     virtual std::string default_str() const                           = 0;
     virtual std::string choices_str() const                           = 0;
-    virtual void        reset() noexcept { is_set_ = false; from_env_ = false; from_config_ = false; }
+    virtual void        reset() noexcept {
+        is_set_ = false;
+        from_env_ = false;
+        from_config_ = false;
+        parsed_count_ = 0;
+    }
 };
 
 template<typename T>
@@ -1034,6 +1087,13 @@ struct PositionalImpl final : PositionalBase {
     std::function<T(T)>           transform_;
     bool                          needs_check_ = false;
 
+    PositionalImpl() {
+        if constexpr (is_vec_v<T>) {
+            nargs_min_ = 0;
+            nargs_max_ = static_cast<size_t>(-1);
+        }
+    }
+
     ParseResult parse_one(std::string_view sv, std::string_view error_label,
                           const App* app) {
         if constexpr (is_vec_v<T>) {
@@ -1048,6 +1108,7 @@ struct PositionalImpl final : PositionalBase {
             if (auto c = check_one(*r, error_label, sv, app); !c) return c;
             value = std::move(*r);
         }
+        ++parsed_count_;
         return {};
     }
 
@@ -1332,38 +1393,68 @@ tokenize_response_file(std::string_view text) {
     std::string current;
     bool started = false;
     char quote   = '\0';
-    bool escaped = false;
     bool comment = false;
-    for (char c : text) {
+
+    // Backslash is an escape only for characters that are otherwise special
+    // in this mini-language.  This keeps Windows paths (`C:\dir\file`) and
+    // literal sequences such as `\d` intact while still allowing `\ `, `\"`,
+    // `\\`, and `\#`.
+    auto escapable = [](char c) {
+        return c == '\\' || c == '"' || c == '\'' || c == '#'
+            || std::isspace(static_cast<unsigned char>(c)) != 0;
+    };
+
+    for (size_t i = 0; i < text.size(); ++i) {
+        const char c = text[i];
         if (comment) {
             if (c == '\n') comment = false;
             continue;
         }
-        if (escaped) {
+        if (quote == '\'') {
+            // Single quotes are fully literal, matching POSIX shells.
+            if (c == '\'') quote = '\0';
+            else           current += c;
+            started = true;
+            continue;
+        }
+        if (quote == '"') {
+            if (c == '"') {
+                quote   = '\0';
+                started = true;
+                continue;
+            }
+            if (c == '\\') {
+                if (i + 1 >= text.size())
+                    return std::unexpected("unterminated quote or escape");
+                const char next = text[++i];
+                if (escapable(next)) current += next;
+                else {
+                    current += '\\';
+                    current += next;
+                }
+                started = true;
+                continue;
+            }
             current += c;
             started = true;
-            escaped = false;
             continue;
         }
-        if (quote != '\0') {
-            if (c == quote) quote = '\0';
-            else if (c == '\\' && quote == '"') escaped = true;
-            else current += c;
-            started = true;
-            continue;
-        }
-        if (c == '\\') {
-            escaped = true;
+        // Unquoted text.
+        if (c == '#' && !started) {
+            comment = true;
+        } else if (c == '\\') {
+            if (i + 1 >= text.size())
+                return std::unexpected("unterminated quote or escape");
+            const char next = text[++i];
+            if (escapable(next)) current += next;
+            else {
+                current += '\\';
+                current += next;
+            }
             started = true;
         } else if (c == '"' || c == '\'') {
             quote   = c;
             started = true;
-        } else if (c == '#') {
-            if (!started) {
-                comment = true;
-            } else {
-                current += c;
-            }
         } else if (std::isspace(static_cast<unsigned char>(c))) {
             if (started) {
                 tokens.push_back(std::move(current));
@@ -1375,7 +1466,7 @@ tokenize_response_file(std::string_view text) {
             started = true;
         }
     }
-    if (escaped || quote != '\0')
+    if (quote != '\0')
         return std::unexpected("unterminated quote or escape");
     if (started) tokens.push_back(std::move(current));
     return tokens;
@@ -1383,15 +1474,23 @@ tokenize_response_file(std::string_view text) {
 
 inline std::expected<std::vector<std::string>, ParseError>
 expand_response_tokens(std::span<const std::string_view> args,
-                       const App* app, unsigned depth = 0) {
+                       const App* app, unsigned depth, size_t& budget) {
     std::vector<std::string> expanded;
     expanded.reserve(args.size());
     for (const auto token : args) {
         if (token.size() < 2 || token.front() != '@') {
+            if (budget == 0)
+                return std::unexpected(ParseError::response_file(
+                    "<arguments>", "expansion exceeds 1000000 tokens", app));
+            --budget;
             expanded.emplace_back(token);
             continue;
         }
         if (token[1] == '@') { // escape: @@name expands to @name
+            if (budget == 0)
+                return std::unexpected(ParseError::response_file(
+                    "<arguments>", "expansion exceeds 1000000 tokens", app));
+            --budget;
             expanded.emplace_back(token.substr(1));
             continue;
         }
@@ -1423,11 +1522,20 @@ expand_response_tokens(std::span<const std::string_view> args,
         std::vector<std::string_view> views;
         views.reserve(tokens->size());
         for (const auto& t : *tokens) views.emplace_back(t);
-        auto nested = expand_response_tokens(views, app, depth + 1);
+        auto nested = expand_response_tokens(views, app, depth + 1, budget);
         if (!nested) return nested;
         for (auto& t : *nested) expanded.push_back(std::move(t));
     }
     return expanded;
+}
+
+inline std::expected<std::vector<std::string>, ParseError>
+expand_response_tokens(std::span<const std::string_view> args,
+                       const App* app, unsigned depth = 0) {
+    // Bound total expansion so a hostile or accidentally recursive file
+    // cannot consume unbounded memory even within the nesting limit.
+    size_t budget = 1'000'000;
+    return expand_response_tokens(args, app, depth, budget);
 }
 
 } // namespace detail
@@ -1815,6 +1923,37 @@ public:
         return std::forward<decltype(self)>(self);
     }
 
+    /// Consume exactly `n` tokens for this positional.  Unlike the default
+    /// vector behaviour, a fixed arity keeps following positionals reachable.
+    auto&& nargs(this auto&& self, size_t n) requires detail::is_vec_v<T> {
+        if (n == 0)
+            throw std::invalid_argument("cli: nargs() requires at least one value");
+        self.p_->nargs_min_ = n;
+        self.p_->nargs_max_ = n;
+        return std::forward<decltype(self)>(self);
+    }
+
+    /// Consume between `lo` and `hi` tokens for this positional.  A ranged
+    /// positional has variable arity and must therefore be registered last.
+    auto&& nargs(this auto&& self, size_t lo, size_t hi) requires detail::is_vec_v<T> {
+        if (lo == 0 || hi < lo)
+            throw std::invalid_argument(
+                "cli: nargs(lo, hi) requires 1 <= lo <= hi");
+        self.p_->nargs_min_ = lo;
+        self.p_->nargs_max_ = hi;
+        return std::forward<decltype(self)>(self);
+    }
+
+    /// Consume at least `lo` tokens (up to the end of the positional run).
+    auto&& nargs_at_least(this auto&& self, size_t lo) requires detail::is_vec_v<T> {
+        if (lo == 0)
+            throw std::invalid_argument(
+                "cli: nargs_at_least() requires at least one value");
+        self.p_->nargs_min_ = lo;
+        self.p_->nargs_max_ = static_cast<size_t>(-1);
+        return std::forward<decltype(self)>(self);
+    }
+
     [[nodiscard]] std::optional<T>&       get()       noexcept { return p_->value; }
     [[nodiscard]] const std::optional<T>& get() const noexcept { return p_->value; }
     [[nodiscard]] T&        operator*()       { return *p_->value; }
@@ -1929,7 +2068,10 @@ public:
     };
 
     [[nodiscard]] Lookup operator[](std::string_view name) const noexcept {
-        return Lookup{find_opt(name)};
+        // Lookup follows the same reachability rules as parsing: inherited
+        // `.global()` options are visible on descendants, ordinary parent
+        // options are not.
+        return Lookup{find_opt_inherited(name)};
     }
 
     // ── App metadata builder ──────────────────────────────────────────────
@@ -1986,10 +2128,10 @@ public:
     [[nodiscard]] Positional<T> positional(std::string_view name, std::string_view help) {
         detail::validate_positional_name(name);
         if (std::ranges::any_of(positionals_, [](const auto& p) {
-                return p->variadic_;
+                return p->variable_arity();
             })) {
             throw std::invalid_argument(
-                "cli: a variadic positional must be the last positional");
+                "cli: a variable-arity positional must be the last positional");
         }
         auto impl       = std::make_unique<detail::PositionalImpl<T>>();
         impl->name      = std::string(name);
@@ -2030,10 +2172,10 @@ public:
         // at registration time instead of silently leaving the later
         // positional unsatisfiable.
         if (std::ranges::any_of(positionals_, [](const auto& p) {
-                return p->variadic_;
+                return p->variable_arity();
             })) {
             throw std::invalid_argument(
-                "cli: a variadic positional must be the last positional");
+                "cli: a variable-arity positional must be the last positional");
         }
 
         auto impl       = std::make_unique<detail::PositionalImpl<T>>();
@@ -2150,7 +2292,7 @@ public:
         if (config_option_ != nullptr)
             throw std::invalid_argument("cli: config_option() already registered");
         auto opt = add<std::string>(name);
-        opt.help("Read defaults from an INI-style config file").meta("FILE");
+        opt.help("Read defaults from an INI-style config file").meta("FILE").global();
         config_option_ = opt.p_;
         return *this;
     }
@@ -2220,6 +2362,8 @@ public:
         for (auto& pos : positionals_) pos->reset();
         remaining_args_.clear();
         config_loaded_ = false;
+        config_loaded_path_.clear();
+        config_data_ = {};
         active_sub_ = nullptr;
         for (auto& sub : subcommands_) sub->reset();
     }
@@ -2250,8 +2394,18 @@ public:
 
     // ── Parse ─────────────────────────────────────────────────────────────
 
+    /// Reset the whole invocation tree.  Parsing a subcommand directly still
+    /// shares inherited globals and root-level config/response-file policy
+    /// with its ancestors, so stale state anywhere in that tree would make
+    /// repeated parses observationally different from parsing through the
+    /// root.
+    void reset_for_parse() noexcept {
+        if (parent_ != nullptr) root_app()->reset();
+        else                    reset();
+    }
+
     [[nodiscard]] ParseResult parse(int argc, const char* const* argv) {
-        reset();
+        reset_for_parse();
         // Treat a null argv as an empty command line rather than constructing
         // a non-empty span over a null pointer.
         std::span<const char* const> raw;
@@ -2259,27 +2413,30 @@ public:
             raw = std::span<const char* const>(argv, static_cast<size_t>(argc));
         // Skip argv[0] without copying the remaining pointers into a vector.
         return run_parse(raw.size() > 1 ? raw.subspan(1)
-                                        : std::span<const char* const>{});
+                                        : std::span<const char* const>{},
+                         /*invocation_root=*/true);
     }
 
     [[nodiscard]] ParseResult parse(std::span<const std::string_view> args) {
-        reset();
-        return run_parse(args);
+        reset_for_parse();
+        return run_parse(args, /*invocation_root=*/true);
     }
 
     [[nodiscard]] ParseResult parse(std::initializer_list<std::string_view> args) {
-        reset();
-        return run_parse(std::span<const std::string_view>(args.begin(), args.size()));
+        reset_for_parse();
+        return run_parse(std::span<const std::string_view>(args.begin(), args.size()),
+                         /*invocation_root=*/true);
     }
 
     /// Convenience overload for callers that already own a vector of strings.
     template<typename Allocator>
     [[nodiscard]] ParseResult parse(const std::vector<std::string, Allocator>& args) {
-        reset();
+        reset_for_parse();
         std::vector<std::string_view> tokens;
         tokens.reserve(args.size());
         for (const auto& a : args) tokens.emplace_back(a);
-        return run_parse(std::span<const std::string_view>(tokens));
+        return run_parse(std::span<const std::string_view>(tokens),
+                         /*invocation_root=*/true);
     }
 
     void parse_or_exit(int argc, const char* const* argv) {
@@ -2336,7 +2493,7 @@ public:
         if (!subcommands_.empty())
             out += require_subcommand_ ? " <COMMAND>" : " [COMMAND]";
         for (const auto& pos : positionals_) {
-            if (pos->variadic_)
+            if (pos->repeated())
                 out += pos->required_
                     ? std::format(" <{}...>", pos->name)
                     : std::format(" [{}...]", pos->name);
@@ -2355,12 +2512,12 @@ public:
             out += std::format("{}ARGUMENTS{}\n", X::byel(), X::rst());
             size_t pos_col = 0;
             for (const auto& pos : positionals_) {
-                const size_t w = 3 + pos->name.size() + (pos->variadic_ ? 3 : 0);
+                const size_t w = 3 + pos->name.size() + (pos->repeated() ? 3 : 0);
                 pos_col = std::max(pos_col, w);
             }
             pos_col = std::max(pos_col + 2, size_t(30));
             for (const auto& pos : positionals_) {
-                const auto body = std::format("{}{}", pos->name, pos->variadic_ ? "..." : "");
+                const auto body = std::format("{}{}", pos->name, pos->repeated() ? "..." : "");
                 const std::string lhs = pos->required_
                     ? std::format("  <{}>", body)
                     : std::format("  [{}]", body);
@@ -2470,20 +2627,19 @@ public:
                "    local cur prev opts subs\n"
                "    cur=\"${COMP_WORDS[COMP_CWORD]}\"\n"
                "    opts=\"";
-        for (const auto& opt : options_) {
+        for (const auto& visible : visible_options()) {
+            const auto* opt = visible.option;
             if (opt->hidden_) continue;
-            for (const auto& n : opt->names) out << dq_escape(n) << " ";
-            if (opt->negatable_) {
-                auto ln = opt->long_name();
-                if (ln.starts_with("--"))
-                    out << dq_escape("--no-" + std::string(ln.substr(2))) << " ";
-            }
+            for (const auto& n : visible.names) out << dq_escape(n) << " ";
+            if (negated_spelling_visible(visible))
+                out << dq_escape("--no-" + std::string(visible.long_name().substr(2)))
+                    << " ";
         }
-        if (!find_opt("-h"))      out << "-h ";
-        if (!find_opt("--help"))  out << "--help ";
+        if (!find_opt_inherited("-h"))      out << "-h ";
+        if (!find_opt_inherited("--help"))  out << "--help ";
         if (!effective_version().empty()) {
-            if (!find_opt("-V"))        out << "-V ";
-            if (!find_opt("--version")) out << "--version ";
+            if (!find_opt_inherited("-V"))        out << "-V ";
+            if (!find_opt_inherited("--version")) out << "--version ";
         }
         out << "\"\n    subs=\"";
         for (const auto& s : subcommands_) {
@@ -2515,11 +2671,13 @@ public:
             return std::string("'") + fish_esc(s) + "'";
         };
 
-        for (const auto& opt : options_) {
+        for (const auto& visible : visible_options()) {
+            const auto* opt = visible.option;
             if (opt->hidden_) continue;
+            const auto sn = visible.short_name();
+            const auto ln = visible.long_name();
+            if (sn.empty() && ln.empty()) continue;
             out << "complete -c " << fish_word(name_);
-            auto sn = opt->short_name();
-            auto ln = opt->long_name();
             if (!sn.empty()) {
                 // Fish distinguishes classic one-letter shorts (-v) from
                 // old-style single-dash long options (-verbose).
@@ -2541,20 +2699,20 @@ public:
                 out << " -d '" << fish_esc(opt->help_text) << "'";
             out << "\n";
 
-            if (opt->negatable_ && !ln.empty() && ln.starts_with("--")) {
+            if (negated_spelling_visible(visible)) {
                 out << "complete -c " << fish_word(name_) << " -l "
                     << fish_word("no-" + std::string(ln.substr(2))) << " -f";
                 out << " -d 'Disable --" << fish_esc(ln.substr(2)) << "'\n";
             }
         }
-        if (!find_opt("-h"))
+        if (!find_opt_inherited("-h"))
             out << "complete -c " << fish_word(name_) << " -s h -f -d 'Print help'\n";
-        if (!find_opt("--help"))
+        if (!find_opt_inherited("--help"))
             out << "complete -c " << fish_word(name_) << " -l help -f -d 'Print help'\n";
         if (!effective_version().empty()) {
-            if (!find_opt("-V"))
+            if (!find_opt_inherited("-V"))
                 out << "complete -c " << fish_word(name_) << " -s V -f -d 'Print version'\n";
-            if (!find_opt("--version"))
+            if (!find_opt_inherited("--version"))
                 out << "complete -c " << fish_word(name_) << " -l version -f -d 'Print version'\n";
         }
 
@@ -2618,9 +2776,10 @@ public:
             return zsh_esc(action);
         };
 
-        auto emit_spec = [&](const detail::OptionBase& opt) {
-            const auto sn = opt.short_name();
-            const auto ln = opt.long_name();
+        auto emit_spec = [&](const detail::VisibleOption& visible) {
+            const auto& opt    = *visible.option;
+            const auto  sn     = visible.short_name();
+            const auto  ln     = visible.long_name();
             if (sn.empty() && ln.empty()) return;
             const auto sn_esc = zsh_esc(sn);
             const auto ln_esc = zsh_esc(ln);
@@ -2645,28 +2804,28 @@ public:
             }
             out << "        " << spec << "\n";
 
-            if (opt.negatable_ && !ln.empty() && ln.starts_with("--")) {
+            if (negated_spelling_visible(visible)) {
                 out << "        '--no-" << zsh_esc(ln.substr(2)) << "[Disable --"
                     << zsh_esc(ln.substr(2)) << "]'\n";
             }
         };
 
-        for (const auto& opt : options_) {
-            if (opt->hidden_) continue;
-            emit_spec(*opt);
+        for (const auto& visible : visible_options()) {
+            if (visible.option->hidden_) continue;
+            emit_spec(visible);
         }
-        if (!find_opt("-h") && !find_opt("--help")) {
+        if (!find_opt_inherited("-h") && !find_opt_inherited("--help")) {
             out << "        '(-h --help)'{-h,--help}'[Print help]'\n";
         } else {
-            if (!find_opt("-h"))     out << "        '-h[Print help]'\n";
-            if (!find_opt("--help")) out << "        '--help[Print help]'\n";
+            if (!find_opt_inherited("-h"))     out << "        '-h[Print help]'\n";
+            if (!find_opt_inherited("--help")) out << "        '--help[Print help]'\n";
         }
         if (!effective_version().empty()) {
-            if (!find_opt("-V") && !find_opt("--version")) {
+            if (!find_opt_inherited("-V") && !find_opt_inherited("--version")) {
                 out << "        '(-V --version)'{-V,--version}'[Print version]'\n";
             } else {
-                if (!find_opt("-V"))        out << "        '-V[Print version]'\n";
-                if (!find_opt("--version")) out << "        '--version[Print version]'\n";
+                if (!find_opt_inherited("-V"))        out << "        '-V[Print version]'\n";
+                if (!find_opt_inherited("--version")) out << "        '--version[Print version]'\n";
             }
         }
         out << "    )\n\n";
@@ -2896,9 +3055,14 @@ private:
 
     /// Expand response files (when enabled) and dispatch to the parser.
     template<typename Token>
-    [[nodiscard]] ParseResult run_parse(std::span<const Token> tokens) {
-        if (!response_files_ || tokens.empty())
-            return do_parse(tokens);
+    [[nodiscard]] ParseResult run_parse(std::span<const Token> tokens,
+                                        bool invocation_root) {
+        // response_files() is configured on the root command, but parsing a
+        // subcommand directly should still honor it.
+        const App* policy = this;
+        while (policy->parent_ != nullptr) policy = policy->parent_;
+        if (!policy->response_files_ || tokens.empty())
+            return do_parse(tokens, invocation_root);
         std::vector<std::string_view> views;
         views.reserve(tokens.size());
         for (const auto& token : tokens)
@@ -2909,11 +3073,13 @@ private:
         expanded_views.reserve(expanded->size());
         for (const auto& token : *expanded)
             expanded_views.emplace_back(token);
-        return do_parse(std::span<const std::string_view>(expanded_views));
+        return do_parse(std::span<const std::string_view>(expanded_views),
+                        invocation_root);
     }
 
     template<typename Token>
-    [[nodiscard]] ParseResult do_parse(std::span<const Token> args) {
+    [[nodiscard]] ParseResult do_parse(std::span<const Token> args,
+                                       bool invocation_root) {
         validate_group_references();
         bool   end_opts       = false;
         bool   saw_positional = false;
@@ -2948,7 +3114,8 @@ private:
                     // Parse child first so `tool sub --help` succeeds even if parent has required options.
                     // Any child failure (including --help / --version) is returned as-is;
                     // finalizing the parent here would mask the real error.
-                    auto sub_res = sub->do_parse(args.subspan(i + 1));
+                    auto sub_res = sub->do_parse(args.subspan(i + 1),
+                                                 /*invocation_root=*/false);
                     if (!sub_res) return sub_res;
                     // Extras accepted by the child (through its own policy or
                     // an inherited one) become part of the root's ordered
@@ -2958,9 +3125,7 @@ private:
                         remaining_args_.insert(remaining_args_.end(),
                                                sub->remaining_args_.begin(),
                                                sub->remaining_args_.end());
-                    if (auto r = finalize(/*subcommand_active=*/true); !r)
-                        return r;
-                    return {};
+                    return finish(/*subcommand_active=*/true, invocation_root);
                 }
             }
 
@@ -2972,7 +3137,7 @@ private:
                     saw_positional = true;
                     auto& pos = positionals_[pos_idx];
                     if (auto r = pos->parse(arg, this); !r) return r;
-                    if (!pos->variadic_) ++pos_idx;
+                    if (pos->parsed_count_ >= pos->nargs_max_) ++pos_idx;
                 } else if (extras_enabled()) {
                     // Extras are forwarded, not interpreted as positionals, so
                     // a later token can still select a subcommand.
@@ -3001,7 +3166,7 @@ private:
                         saw_positional = true;
                         auto& pos = positionals_[pos_idx];
                         if (auto r = pos->parse(arg, this); !r) return r;
-                        if (!pos->variadic_) ++pos_idx;
+                        if (pos->parsed_count_ >= pos->nargs_max_) ++pos_idx;
                     } else if (extras_enabled()) {
                         remaining_args_.emplace_back(arg);
                     } else if (has_subcommands && !saw_positional) {
@@ -3172,7 +3337,32 @@ private:
             }
         }
 
-        return finalize(/*subcommand_active=*/false);
+        return finish(/*subcommand_active=*/false, invocation_root);
+    }
+
+    /// Finalize this command, then any ancestors when this command was the
+    /// entry point of a direct `sub.parse(...)` call.  Those ancestors still
+    /// own inherited globals, so their defaults, validators, transforms and
+    /// required checks must run exactly as they would for
+    /// `root.parse({"sub", ...})`.
+    [[nodiscard]] ParseResult finish(bool subcommand_active, bool invocation_root) {
+        if (auto r = finalize(subcommand_active); !r) return r;
+        if (!invocation_root) return {};
+        App* descendant = this;
+        for (App* ancestor = parent_; ancestor != nullptr; ancestor = ancestor->parent_) {
+            // A successful direct parse must leave the same observable tree as
+            // `root.parse({"sub", ...})`: each ancestor records the command
+            // that was selected beneath it and receives the aggregated extras.
+            ancestor->active_sub_ = descendant;
+            if (descendant->extras_enabled())
+                ancestor->remaining_args_.insert(ancestor->remaining_args_.end(),
+                                                 descendant->remaining_args_.begin(),
+                                                 descendant->remaining_args_.end());
+            if (auto r = ancestor->finalize(/*subcommand_active=*/true); !r)
+                return r;
+            descendant = ancestor;
+        }
+        return {};
     }
 
     [[nodiscard]] ParseResult finalize(bool subcommand_active) {
@@ -3213,7 +3403,15 @@ private:
         }
 
         for (auto& pos : positionals_) {
-            if (pos->is_set_) continue;
+            if (pos->is_set_) {
+                if (pos->parsed_count_ < pos->nargs_min_)
+                    return std::unexpected(ParseError::not_enough_values(
+                        pos->name, pos->nargs_min_, pos->parsed_count_, this));
+                if (pos->parsed_count_ > pos->nargs_max_)
+                    return std::unexpected(ParseError::too_many_values(
+                        pos->name, pos->nargs_max_, pos->parsed_count_, this));
+                continue;
+            }
             if (!pos->env_var.empty() && !pos->from_env_ && !pos->from_config_) {
                 if (const char* v = std::getenv(pos->env_var.c_str())) {
                     if (auto r = pos->parse_env(v, this); !r) return r;
@@ -3225,6 +3423,16 @@ private:
             }
             if (!pos->from_env_ && !pos->from_config_ && pos->has_default_)
                 pos->apply_default();
+            // An explicitly supplied positional may still be short of a
+            // configured arity, even when it is not required overall.
+            if (pos->from_env_ || pos->from_config_) {
+                if (pos->parsed_count_ < pos->nargs_min_)
+                    return std::unexpected(ParseError::not_enough_values(
+                        pos->name, pos->nargs_min_, pos->parsed_count_, this));
+                if (pos->parsed_count_ > pos->nargs_max_)
+                    return std::unexpected(ParseError::too_many_values(
+                        pos->name, pos->nargs_max_, pos->parsed_count_, this));
+            }
         }
         if (!subcommand_active) {
             for (const auto& pos : positionals_) {
@@ -3238,8 +3446,19 @@ private:
                 return std::unexpected(ParseError::missing_subcommand(full_name(), this));
         }
 
-        // 2. Mutex group constraints.  Values supplied through the environment
-        // or a config file count as explicit choices; defaults do not.
+        // 2. Run whole-value validators and post-parse transforms before
+        //    structural group checks.  This matches libraries that validate a
+        //    value as it is consumed, so an invalid value is reported even when
+        //    the same invocation also violates a mutex/require group.
+        for (auto& opt : options_)
+            if (opt->needs_finalize_)
+                if (auto r = opt->validate_and_finalize(this); !r) return r;
+        for (auto& pos : positionals_)
+            if (pos->needs_finalize_)
+                if (auto r = pos->validate_and_finalize(this); !r) return r;
+
+        // 3. Mutex group constraints.  Values supplied through the environment
+        //    or a config file count as explicit choices; defaults do not.
         for (const auto& group : mutex_resolved_) {
             std::string first_set;
             for (auto* opt : group) {
@@ -3252,7 +3471,7 @@ private:
             }
         }
 
-        // 3. Require-together constraints
+        // 4. Require-together constraints
         for (const auto& group : require_resolved_) {
             std::string_view any_set;
             for (auto* opt : group) {
@@ -3270,7 +3489,7 @@ private:
             }
         }
 
-        // 3b. Require-at-least-one groups
+        // 5. Require-at-least-one groups
         for (const auto& group : require_one_resolved_) {
             bool any_set = false;
             std::string names;
@@ -3287,14 +3506,6 @@ private:
             }
             return std::unexpected(ParseError::missing_one_of(names, this));
         }
-
-        // 4. Run whole-value validators and post-parse transforms
-        for (auto& opt : options_)
-            if (opt->needs_finalize_)
-                if (auto r = opt->validate_and_finalize(this); !r) return r;
-        for (auto& pos : positionals_)
-            if (pos->needs_finalize_)
-                if (auto r = pos->validate_and_finalize(this); !r) return r;
 
         return {};
     }
@@ -3342,23 +3553,21 @@ private:
         PrefixMatch match;
         if (name.size() <= 2 || !name.starts_with("--")) return match;
         std::vector<detail::OptionBase*> found;
-        auto consider = [&](detail::OptionBase* opt) {
-            for (const auto& n : opt->names) {
+        // Only visible spellings participate: a local alias that shadows an
+        // inherited global spelling must not make an otherwise unique
+        // abbreviation look ambiguous.
+        for (const auto& visible : visible_options()) {
+            for (const auto& n : visible.names) {
                 if (n.size() > 2 && n.starts_with("--") && n.starts_with(name)) {
-                    if (!std::ranges::contains(found, opt)) {
-                        found.push_back(opt);
+                    if (!std::ranges::contains(found, visible.option)) {
+                        found.push_back(visible.option);
                         if (!match.names.empty()) match.names += ", ";
                         match.names += n;
                     }
                     break;
                 }
             }
-        };
-        for (const auto& opt : options_) consider(opt.get());
-        // Inherited `.global()` options participate in abbreviation too.
-        for (const App* a = parent_; a != nullptr; a = a->parent_)
-            for (const auto& opt : a->options_)
-                if (opt->global_) consider(opt.get());
+        }
         if (found.size() == 1)
             match.option = found.front();
         else if (found.size() > 1)
@@ -3392,19 +3601,17 @@ private:
         };
         std::string best;
         size_t best_d = SIZE_MAX;
-        for (const auto& o : options_) {
-            if (o->hidden_) continue;
-            for (const auto& n : o->names) {
+        for (const auto& visible : visible_options()) {
+            if (visible.option->hidden_) continue;
+            for (const auto& n : visible.names) {
                 const auto d = distance(strip(n));
                 if (d < best_d && d <= 3) { best_d = d; best = n; }
             }
-            if (o->negatable_) {
-                auto ln = o->long_name();
-                if (ln.starts_with("--")) {
-                    auto neg = std::string("--no-") + std::string(ln.substr(2));
-                    const auto d = distance(strip(neg));
-                    if (d < best_d && d <= 3) { best_d = d; best = neg; }
-                }
+            if (negated_spelling_visible(visible)) {
+                auto ln = visible.long_name();
+                auto neg = std::string("--no-") + std::string(ln.substr(2));
+                const auto d = distance(strip(neg));
+                if (d < best_d && d <= 3) { best_d = d; best = neg; }
             }
         }
         return best;
@@ -3446,25 +3653,65 @@ private:
         return parent_ ? (parent_->full_name() + " " + name_) : name_;
     }
 
+    /// Options this command can actually parse: its own declarations plus
+    /// unshadowed inherited `.global()` options (nearest ancestor first).
+    /// Shadowing is name-by-name, matching find_opt_inherited()'s lookup
+    /// order: a local `-v` hides only an inherited `-v`, not its `--verbose`
+    /// spelling.
+    [[nodiscard]] std::vector<detail::VisibleOption> visible_options() const {
+        std::vector<detail::VisibleOption> out;
+        out.reserve(options_.size());
+        std::vector<std::string_view> claimed;
+        auto add = [&](detail::OptionBase* option) {
+            detail::VisibleOption visible{option, {}};
+            for (const auto& name : option->names) {
+                if (std::ranges::contains(claimed, name)) continue;
+                visible.names.emplace_back(name);
+                claimed.emplace_back(name);
+            }
+            if (!visible.names.empty()) out.push_back(std::move(visible));
+        };
+        for (const auto& o : options_) add(o.get());
+        for (const App* a = parent_; a != nullptr; a = a->parent_)
+            for (const auto& o : a->options_)
+                if (o->global_) add(o.get());
+        return out;
+    }
+
+    /// Whether `--no-<visible-long>` still denotes this flag's negation.
+    /// A local option with that exact spelling takes precedence, so it must
+    /// suppress the generated completion/help spelling too.
+    [[nodiscard]] bool negated_spelling_visible(
+        const detail::VisibleOption& visible) const {
+        const auto ln = visible.long_name();
+        if (!visible.option->negatable_ || !ln.starts_with("--")) return false;
+        std::string negated;
+        negated.reserve(ln.size() + 3);
+        negated.append("--no-").append(ln.substr(2));
+        return find_opt_inherited(negated) == nullptr;
+    }
+
     void render_option_list(std::string& out) const {
         using X = detail::C;
+        const auto visible_opts = visible_options();
 
         // Built-ins step aside name-by-name when the user registered a custom
-        // option with the same spelling.
-        const bool show_help_short = find_opt("-h") == nullptr;
-        const bool show_help_long  = find_opt("--help") == nullptr;
+        // option with the same spelling, including an inherited global one.
+        const bool show_help_short = find_opt_inherited("-h") == nullptr;
+        const bool show_help_long  = find_opt_inherited("--help") == nullptr;
         const bool has_version     = !effective_version().empty();
-        const bool show_ver_short  = has_version && find_opt("-V") == nullptr;
-        const bool show_ver_long   = has_version && find_opt("--version") == nullptr;
+        const bool show_ver_short  = has_version && find_opt_inherited("-V") == nullptr;
+        const bool show_ver_long   = has_version && find_opt_inherited("--version") == nullptr;
 
         std::vector<std::string> section_order;
-        for (const auto& o : options_) {
+        for (const auto& entry : visible_opts) {
+            const auto* o = entry.option;
             if (o->hidden_) continue;
             if (!std::ranges::contains(section_order, o->section_))
                 section_order.push_back(o->section_);
         }
-        const bool has_unnamed = std::ranges::any_of(options_, [](const auto& o) {
-            return !o->hidden_ && o->section_.empty();
+        const bool has_unnamed = std::ranges::any_of(visible_opts, [](const auto& entry) {
+            return !entry.option->hidden_ && entry.option->section_.empty();
         });
         const bool has_builtin = show_help_short || show_help_long
                               || show_ver_short || show_ver_long;
@@ -3491,10 +3738,11 @@ private:
             if (!is_flag && !meta.empty()) w += 3 + meta.size() + (spread ? 3 : 0);
             col = std::max(col, w);
         };
-        for (const auto& o : options_)
-            if (!o->hidden_)
-                measure(o->short_name(), o->long_name(), o->meta, o->is_flag_,
-                        o->negatable_, o->nargs_max_ != 0);
+        for (const auto& entry : visible_opts)
+            if (!entry.option->hidden_)
+                measure(entry.short_name(), entry.long_name(), entry.option->meta,
+                        entry.option->is_flag_, negated_spelling_visible(entry),
+                        entry.option->nargs_max_ != 0);
         if (show_help_short || show_help_long)
             measure(show_help_short ? "-h" : "", show_help_long ? "--help" : "",
                     {}, true, false, false);
@@ -3538,11 +3786,13 @@ private:
                 else
                     out += std::format("{}  Other Options{}:\n", X::bld(), X::rst());
             }
-            for (const auto& o : options_) {
+            for (const auto& entry : visible_opts) {
+                const auto* o = entry.option;
                 if (o->hidden_ || o->section_ != sec) continue;
-                row(o->short_name(), o->long_name(), o->meta,
-                    o->is_flag_, o->negatable_, o->nargs_max_ != 0, o->help_text,
-                    o->required_, o->default_str(), o->choices_str(), o->env_var);
+                row(entry.short_name(), entry.long_name(), o->meta,
+                    o->is_flag_, negated_spelling_visible(entry), o->nargs_max_ != 0,
+                    o->help_text, o->required_, o->default_str(), o->choices_str(),
+                    o->env_var);
             }
             if (sec.empty()) {
                 if (show_help_short || show_help_long)

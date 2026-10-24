@@ -314,6 +314,23 @@ file = out.bin
     CHECK(app.is_subcommand("build"));
 }
 
+TEST_CASE("config files load when a subcommand is parsed directly") {
+    TempFile cfg("direct-config", R"(
+jobs = 9
+[build]
+target = release
+)");
+    cli::App app("tool");
+    app.config_file(cfg.path());
+    auto jobs = app.add<unsigned>("--jobs").default_val(1u);
+    auto& build  = app.subcommand("build", "");
+    auto  target = build.add<std::string>("--target").default_val("debug");
+
+    REQUIRE(build.parse({}));
+    CHECK(*jobs == 9u);
+    CHECK(*target == "release");
+}
+
 TEST_CASE("config files support inline comments and hashes in values") {
     TempFile cfg("comments", R"(
 name = hello world # trailing comment
@@ -540,6 +557,34 @@ TEST_CASE("a config option selects the file for one invocation") {
     CHECK(app["--config"].as<std::string>() == cfg.path());
 }
 
+TEST_CASE("a config option does not leak into the next invocation") {
+    TempFile cfg("selected-once", "jobs = 12\n");
+    cli::App app("tool");
+    app.config_option();
+    auto jobs = app.add<unsigned>("--jobs").default_val(1u);
+
+    REQUIRE(app.parse({"--config", cfg.path()}));
+    CHECK(*jobs == 12u);
+
+    REQUIRE(app.parse({}));
+    CHECK(*jobs == 1u);
+    CHECK(!app.has_option("--config"));
+}
+
+TEST_CASE("a config option works after a subcommand") {
+    TempFile cfg("selected-child", "jobs = 7\n[build]\ntarget = release\n");
+    cli::App app("tool");
+    app.config_option();
+    auto jobs = app.add<unsigned>("--jobs").default_val(1u);
+    auto& build = app.subcommand("build", "");
+    auto target = build.add<std::string>("--target").default_val("debug");
+
+    REQUIRE(app.parse({"build", "--config", cfg.path()}));
+    CHECK(*jobs == 7u);
+    CHECK(*target == "release");
+    CHECK(app.is_subcommand("build"));
+}
+
 TEST_CASE("a required config file must exist") {
     cli::App app("tool");
     app.config_file("/definitely/not/a/real/cli-config-file.ini", true);
@@ -694,6 +739,48 @@ TEST_CASE("response files expand shell-like tokens") {
     CHECK(*verbose);
     CHECK(*name == "hello world");
     CHECK(*count == 3);
+}
+
+TEST_CASE("response files expand when a subcommand is parsed directly") {
+    TempFile args("sub-response", "--target release\n");
+    cli::App app("tool");
+    app.response_files();
+    auto& build  = app.subcommand("build", "");
+    auto  target = build.add<std::string>("--target");
+
+    REQUIRE(build.parse({"@" + args.path()}));
+    CHECK(*target == "release");
+}
+
+TEST_CASE("response files preserve backslashes in paths and literals") {
+    TempFile args("backslash-response", R"(--path C:\dir\file.txt
+--pattern \d+\.\d+
+--quoted "C:\Program Files\tool"
+)");
+    cli::App app("tool");
+    app.response_files();
+    auto path    = app.add<std::string>("--path");
+    auto pattern = app.add<std::string>("--pattern");
+    auto quoted  = app.add<std::string>("--quoted");
+
+    REQUIRE(app.parse({"@" + args.path()}));
+    CHECK(*path == R"(C:\dir\file.txt)");
+    CHECK(*pattern == R"(\d+\.\d+)");
+    CHECK(*quoted == R"(C:\Program Files\tool)");
+}
+
+TEST_CASE("response files still honor backslash escapes") {
+    TempFile args("escape-response", "a\\ b \"c\\\"d\" e\\\\f\n");
+    cli::App app("tool");
+    app.response_files();
+    auto first  = app.add_positional<std::string>("first");
+    auto second = app.add_positional<std::string>("second");
+    auto third  = app.add_positional<std::string>("third");
+
+    REQUIRE(app.parse({"@" + args.path()}));
+    CHECK(*first == "a b");
+    CHECK(*second == "c\"d");
+    CHECK(*third == R"(e\f)");
 }
 
 TEST_CASE("response files support comments and nested files") {

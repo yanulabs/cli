@@ -68,6 +68,8 @@ jobs:
       - name: Configure
         run: >
           cmake -S . -B build
+          -DCMAKE_BUILD_TYPE=${{ matrix.build_type }}
+          -DCMAKE_CXX_FLAGS="/W4 /permissive- /utf-8"
           -DCLI_BUILD_EXAMPLES=ON
           -DCLI_BUILD_TESTS=ON
           -DCLI_INSTALL=OFF
@@ -98,6 +100,55 @@ jobs:
           -DCLI_INSTALL=OFF
           -DCMAKE_CXX_FLAGS="-fsanitize=address,undefined -fno-omit-frame-pointer"
           -DCMAKE_EXE_LINKER_FLAGS="-fsanitize=address,undefined"
+      - name: Build
+        run: cmake --build build --parallel
+      - name: Test
+        run: ctest --test-dir build --output-on-failure
+
+  stl-debug:
+    name: libstdc++ debug mode
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install GCC 14
+        run: sudo apt-get update && sudo apt-get install -y g++-14
+      - name: Configure
+        env:
+          CC: gcc-14
+          CXX: g++-14
+        run: >
+          cmake -S . -B build
+          -DCMAKE_BUILD_TYPE=Debug
+          -DCMAKE_CXX_FLAGS="-D_GLIBCXX_DEBUG -D_GLIBCXX_ASSERTIONS"
+          -DCLI_BUILD_EXAMPLES=ON
+          -DCLI_BUILD_TESTS=ON
+          -DCLI_INSTALL=OFF
+      - name: Build
+        run: cmake --build build --parallel
+      - name: Test
+        run: ctest --test-dir build --output-on-failure
+
+  libcxx:
+    name: Clang + libc++ hardened
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Clang 19 and libc++
+        run: |
+          wget -q https://apt.llvm.org/llvm.sh
+          chmod +x llvm.sh
+          sudo ./llvm.sh 19
+          sudo apt-get install -y libc++-19-dev libc++abi-19-dev
+      - name: Configure
+        run: >
+          cmake -S . -B build
+          -DCMAKE_BUILD_TYPE=Debug
+          -DCMAKE_CXX_COMPILER=clang++-19
+          -DCMAKE_CXX_FLAGS="-stdlib=libc++ -D_LIBCPP_HARDENING_MODE=_LIBCPP_HARDENING_MODE_DEBUG"
+          -DCMAKE_EXE_LINKER_FLAGS="-stdlib=libc++"
+          -DCLI_BUILD_EXAMPLES=ON
+          -DCLI_BUILD_TESTS=ON
+          -DCLI_INSTALL=OFF
       - name: Build
         run: cmake --build build --parallel
       - name: Test
@@ -151,11 +202,17 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
-      - name: Install GCC 14
-        run: sudo apt-get update && sudo apt-get install -y g++-14
-      - name: Compile all translation units
+      - name: Install GCC 14 and Clang 18
+        run: sudo apt-get update && sudo apt-get install -y g++-14 clang-18
+      - name: Compile all translation units (GCC)
         run: >
           g++-14 -std=c++23 -Iinclude -Itests
+          -Wall -Wextra -Wpedantic -Wshadow -Wconversion -Wsign-conversion
+          -Werror -fno-rtti -fsyntax-only tests/*.cpp
+          examples/*.cpp
+      - name: Compile all translation units (Clang)
+        run: >
+          clang++-18 -std=c++23 -Iinclude -Itests
           -Wall -Wextra -Wpedantic -Wshadow -Wconversion -Wsign-conversion
           -Werror -fno-rtti -fsyntax-only tests/*.cpp
           examples/*.cpp
@@ -183,6 +240,30 @@ jobs:
           cmake --build build --target bench_parse --parallel
           ./build/bench/bench_parse 50000
 
+  comparative-benchmarks:
+    name: comparative benchmark (CLI11 + cxxopts)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install GCC 14
+        run: sudo apt-get update && sudo apt-get install -y g++-14
+      - name: Configure
+        env:
+          CC: gcc-14
+          CXX: g++-14
+        run: >
+          cmake -S . -B build
+          -DCMAKE_BUILD_TYPE=Release
+          -DCLI_BUILD_EXAMPLES=OFF
+          -DCLI_BUILD_TESTS=OFF
+          -DCLI_BUILD_BENCHMARKS=ON
+          -DCLI_BUILD_COMPARATIVE_BENCHMARKS=ON
+          -DCLI_INSTALL=OFF
+      - name: Build and run
+        run: |
+          cmake --build build --target bench_compare --parallel
+          ./build/bench/bench_compare 200000
+
   fuzz:
     name: libFuzzer smoke
     runs-on: ubuntu-24.04
@@ -207,4 +288,7 @@ jobs:
       - name: Build fuzz target
         run: cmake --build build --target fuzz_parse --parallel
       - name: Fuzz
-        run: ./build/tests/fuzz_parse -runs=100000 -max_len=4096 -timeout=5 -print_final_stats=1
+        run: |
+          cp -r tests/fuzz_corpus "$RUNNER_TEMP/corpus"
+          ./build/tests/fuzz_parse "$RUNNER_TEMP/corpus" \
+            -runs=200000 -max_len=4096 -timeout=5 -print_final_stats=1

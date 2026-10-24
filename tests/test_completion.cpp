@@ -144,6 +144,40 @@ TEST_CASE("bash completion suppresses built-ins per occupied spelling") {
     CHECK(count_occurrences(both_out.str(), "--version ") == 1);
 }
 
+TEST_CASE("subcommand completion includes inherited globals and suppresses built-ins") {
+    cli::App app("tool", "desc", "1.0.0");
+    (void)app.add_flag("--verbose").global();
+    (void)app.add_flag("-h").global();
+    (void)app.add_flag("--help").global();
+    (void)app.add_flag("-V").global();
+    (void)app.add_flag("--version").global();
+    auto& sub = app.subcommand("build", "");
+
+    std::ostringstream bash;
+    sub.bash_completion(bash);
+    CHECK(count_occurrences(bash.str(), "--verbose ") == 1);
+    CHECK(count_occurrences(bash.str(), "-h ") == 1);
+    CHECK(count_occurrences(bash.str(), "--help ") == 1);
+    CHECK(count_occurrences(bash.str(), "-V ") == 1);
+    CHECK(count_occurrences(bash.str(), "--version ") == 1);
+
+    std::ostringstream fish;
+    sub.fish_completion(fish);
+    CHECK(count_occurrences(fish.str(), "-l verbose") == 1);
+    CHECK(count_occurrences(fish.str(), "-s h ") == 1);
+    CHECK(count_occurrences(fish.str(), "-l help") == 1);
+    CHECK(count_occurrences(fish.str(), "-s V ") == 1);
+    CHECK(count_occurrences(fish.str(), "-l version") == 1);
+
+    std::ostringstream zsh;
+    sub.zsh_completion(zsh);
+    CHECK(count_occurrences(zsh.str(), "'--verbose'") == 1);
+    CHECK(count_occurrences(zsh.str(), "'-h'") == 1);
+    CHECK(count_occurrences(zsh.str(), "'--help'") == 1);
+    CHECK(count_occurrences(zsh.str(), "'-V'") == 1);
+    CHECK(count_occurrences(zsh.str(), "'--version'") == 1);
+}
+
 TEST_CASE("fish completion marks flags and value-taking options correctly") {
     cli::App app("tool");
     (void)app.add_flag("--verbose").short_name("-v").help("Verbose");
@@ -355,6 +389,31 @@ TEST_CASE("completions work for an app with no user options") {
     std::ostringstream zsh;
     app.zsh_completion(zsh);
     CHECK(contains(zsh.str(), "{-h,--help}"));
+}
+
+TEST_CASE("shadowing one inherited spelling keeps other completion spellings") {
+    cli::App app("tool");
+    (void)app.add_flag("--verbose")
+        .short_name("-v")
+        .help("Root verbose")
+        .global();
+    auto& sub = app.subcommand("build", "");
+    (void)sub.add_flag("-v").help("Sub short v");
+
+    std::ostringstream bash;
+    sub.bash_completion(bash);
+    CHECK(count_occurrences(bash.str(), "--verbose ") == 1);
+    CHECK(count_occurrences(bash.str(), "-v ") == 1);
+
+    std::ostringstream fish;
+    sub.fish_completion(fish);
+    CHECK(count_occurrences(fish.str(), "-l verbose") == 1);
+    CHECK(count_occurrences(fish.str(), "-s v ") == 1);
+
+    std::ostringstream zsh;
+    sub.zsh_completion(zsh);
+    CHECK(contains(zsh.str(), "'--verbose[Root verbose]'"));
+    CHECK(contains(zsh.str(), "'-v[Sub short v]'"));
 }
 
 TEST_SUITE_END();

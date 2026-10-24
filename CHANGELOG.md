@@ -12,6 +12,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `.nargs_at_least(N)` let one vector-option occurrence consume several
   tokens; exact arities keep dash-prefixed values, ranged arities stop at the
   next option
+- **Variable-arity positionals** — the same `.nargs(N)`, `.nargs(lo, hi)`,
+  and `.nargs_at_least(N)` controls on vector positionals; fixed arities keep
+  following positional slots reachable, while variable-arity positionals must
+  still be registered last
+- **Inherited globals in help and completion** — `.global()` options are now
+  listed in descendant help and Bash/Fish/Zsh completion, and a global custom
+  `-h`/`--help`/`-V`/`--version` correctly suppresses the corresponding
+  built-in rows; shadowing is name-by-name, so a local `-v` hides only the
+  inherited `-v` while `--verbose` remains available
 - **INI config files** — `config_file(path, required)` and `config_option()`
   load root and `[command.path]` sections, quoted values, arrays, and
   negatable flags; section headers may be quoted or use TOML `[[section]]`
@@ -46,6 +55,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **`parse(std::vector<std::string>)`** convenience overload
 - **Throughput benchmark target** (`CLI_BUILD_BENCHMARKS=ON`) covering flags,
   typed options, mixed schemas, and subcommands
+- **Comparative benchmark target** (`CLI_BUILD_COMPARATIVE_BENCHMARKS=ON`)
+  measuring the same workloads head-to-head against CLI11 and cxxopts
 - **`config` example** demonstrating config files, response files, nargs, and
   extras
 - **Custom value types via ADL** — `cli_parse(std::string_view)` and
@@ -66,7 +77,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `tool sub --version` works
 - **Default validation** — defaults are checked against `range()`,
   `choices()`, and custom validators
-- **Domain-scoped test suite** — 520 test cases across 19 doctest suites
+- **Domain-scoped test suite** — 551 test cases across 19 doctest suites
   (`api`, `completion`, `constraints`, `custom_types`, `environment`,
   `errors`, `extensions`, `flags`, `groups`, `help`, `lifecycle`, `lookup`,
   `options`, `positionals`, `robustness`, `subcommands`, `tokens`,
@@ -84,12 +95,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   48-level nested commands, and a 256-option flat schema
 - **libFuzzer harness** (`CLI_BUILD_FUZZERS=ON`) — NUL-separated argument
   streams exercise options, positionals, counts, constraints, groups,
-  subcommands, help/version control flow, and reset determinism
+  inherited globals, config files, response files, fixed-arity positionals,
+  subcommands, help/version control flow, duplicate-parse determinism, and
+  direct child parsing; a checked-in seed corpus is used by CI
 - **CI matrix** — GCC/Clang/macOS/Windows builds, ASan+UBSan, strict
-  warnings with `-fno-rtti`, a 100k-run fuzz smoke test, and an installed
+  warnings with `-fno-rtti`, a 200k-run fuzz smoke test, and an installed
   `find_package` consumer build
 
 ### Fixed
+- `App::reset()` now clears the loaded config path and data, so a later parse
+  cannot reuse a previous parse's configuration
+- `config_option()` registers `--config` as a global option, so
+  `tool build --config file.ini` works for subcommands
+- Response-file expansion honors the root `response_files()` policy even when
+  a subcommand is parsed directly, preserves backslashes before ordinary
+  characters (Windows paths and regex literals), and caps expansion at one
+  million tokens
+- Parsing a subcommand directly now resets the whole invocation tree, applies
+  root config and response-file policy, finalizes every ancestor's inherited
+  globals, records the active command chain, and aggregates extras on
+  ancestors — matching `root.parse({"sub", ...})`
 - Custom-type support no longer fails to compile due to unqualified ADL
   `cli_parse` / `cli_format` requires-expressions
 - Integer parsing now accepts signs and `0x` / `0b` prefixes, handles
@@ -140,6 +165,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   than the edit threshold, avoiding pathological work for huge tokens
 - Shell completion generation now produces valid function identifiers and
   quotes unusual command/option names in Bash, Fish, and Zsh output
+- Unknown-option suggestions include inherited `.global()` options, so a typo
+  after a subcommand can point at a parent-defined flag
+- Subcommand lookup (`operator[]`, `has_option()`, `has_flag()`) resolves
+  inherited global options while still hiding ordinary parent options
 - Defaults and fallbacks accept explicitly convertible arguments (for example
   `std::string_view` for `std::string`/`std::filesystem::path`), vector
   defaults accept initializer lists, and `nullptr_t` is rejected at compile
@@ -151,6 +180,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (`[default: , two]`, `[|auto]`) instead of silently dropping them
 
 ### Changed
+- Whole-value validators and transforms run before mutex/require group checks,
+  so an invalid value is reported ahead of a structural group conflict
 - `parse(argc, argv)` no longer copies the token list into a temporary vector;
   subcommand recursion parses the original pointer span
 - One-character short options are resolved through a direct 128-slot ASCII

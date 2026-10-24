@@ -404,6 +404,19 @@ TEST_CASE("a global root flag is accepted before and after a subcommand") {
     CHECK(!*verbose);
 }
 
+TEST_CASE("lookup on a subcommand finds inherited global options") {
+    cli::App app("t");
+    (void)app.add_flag("--verbose").global();
+    (void)app.add_flag("--root-only");
+    auto& build = app.subcommand("build", "");
+
+    REQUIRE(app.parse({"build", "--verbose"}));
+    CHECK(build["--verbose"].as<bool>());
+    CHECK(build.has_option("--verbose"));
+    CHECK(!build["--root-only"].found());
+    CHECK(!build.has_option("--root-only"));
+}
+
 TEST_CASE("a global value option is inherited by nested subcommands") {
     cli::App app("t");
     auto cfg = app.add<std::string>("--config").global();
@@ -459,6 +472,17 @@ TEST_CASE("global counts and negatable flags work after a subcommand") {
     REQUIRE(app.parse({"build", "-vv", "--no-color"}));
     CHECK(*level == 2u);
     CHECK(!*color);
+}
+
+TEST_CASE("typo suggestions include inherited global options") {
+    cli::App app("t");
+    (void)app.add_flag("--verbose").global();
+    (void)app.subcommand("build", "");
+
+    auto r = app.parse({"build", "--verbos"});
+    REQUIRE(!r);
+    CHECK(r.error().kind == cli::ParseError::Kind::UnknownOption);
+    CHECK(contains(r.error().message, "--verbose"));
 }
 
 TEST_CASE("a global user --help or --version option wins over the built-in in children") {
@@ -597,7 +621,7 @@ TEST_CASE("argparse parse_known_args: unknown compound option is forwarded whole
 TEST_CASE("argparse parse_known_args: extras survive both argc/argv levels") {
     cli::App app("tool");
     app.allow_extras();
-    auto& run = app.subcommand("run", "");
+    (void)app.subcommand("run", "");
 
     const char* argv[] = {"tool", "--parent", "run", "--child"};
     REQUIRE(app.parse(4, argv));
@@ -639,6 +663,127 @@ TEST_CASE("without root allow_extras a child still rejects unknown options") {
     auto res = app.parse({"run", "--nope"});
     REQUIRE(!res);
     CHECK(res.error().kind == cli::ParseError::Kind::UnknownOption);
+}
+
+TEST_CASE("a local spelling shadows only the same inherited spelling") {
+    cli::App app("t");
+    auto root_verbose = app.add_flag("--verbose").short_name("-v").global();
+    auto& build = app.subcommand("build", "");
+    auto local_v = build.add_flag("-v");
+
+    REQUIRE(app.parse({"build", "--verbose"}));
+    CHECK(*root_verbose);
+    CHECK(!*local_v);
+
+    REQUIRE(app.parse({"build", "-v"}));
+    CHECK(!*root_verbose);
+    CHECK(*local_v);
+}
+
+TEST_CASE("abbreviations ignore an inherited spelling shadowed by a local option") {
+    cli::App app("t");
+    app.allow_abbrev();
+    auto root_verbose = app.add_flag("--verbose").global();
+    auto& build = app.subcommand("build", "");
+    auto local_verbose = build.add_flag("--verbose");
+
+    REQUIRE(app.parse({"build", "--verb"}));
+    CHECK(*local_verbose);
+    CHECK(!*root_verbose);
+}
+
+TEST_CASE("typo suggestions use inherited spellings that remain visible") {
+    cli::App app("t");
+    auto root_verbose = app.add_flag("--verbose").short_name("-v").global();
+    auto& build = app.subcommand("build", "");
+    (void)build.add_flag("-v");
+    (void)root_verbose;
+
+    auto r = app.parse({"build", "--verbos"});
+    REQUIRE(!r);
+    CHECK(r.error().kind == cli::ParseError::Kind::UnknownOption);
+    CHECK(contains(r.error().message, "--verbose"));
+}
+
+TEST_CASE("direct subcommand parsing finalizes inherited globals") {
+    cli::App app("tool");
+    auto jobs = app.add<int>("--jobs")
+                    .default_val(4)
+                    .validate([](int v) { return v % 2 == 0; },
+                              "jobs must be even")
+                    .transform([](int v) { return v * 2; })
+                    .global();
+    auto token = app.add<std::string>("--token").required().global();
+    auto& build = app.subcommand("build", "");
+
+    auto missing = build.parse({});
+    REQUIRE(!missing);
+    CHECK(missing.error().kind == cli::ParseError::Kind::MissingRequired);
+    CHECK(missing.error().context == &app);
+    CHECK(contains(missing.error().message, "--token"));
+
+    auto invalid = build.parse({"--token", "x", "--jobs", "5"});
+    REQUIRE(!invalid);
+    CHECK(invalid.error().kind == cli::ParseError::Kind::ValidationFailed);
+    CHECK(contains(invalid.error().message, "jobs must be even"));
+
+    REQUIRE(build.parse({"--token", "x"}));
+    CHECK(*token == "x");
+    CHECK(*jobs == 8);
+}
+
+TEST_CASE("parsing a nested subcommand directly finalizes every ancestor") {
+    cli::App app("tool");
+    auto root_value = app.add<int>("--root").default_val(1).global();
+    auto& mid = app.subcommand("mid", "");
+    auto mid_value = mid.add<int>("--mid").default_val(2).global();
+    auto& leaf = mid.subcommand("leaf", "");
+
+    REQUIRE(leaf.parse({}));
+    CHECK(*root_value == 1);
+    CHECK(*mid_value == 2);
+}
+
+TEST_CASE("direct subcommand parsing resets stale ancestor state") {
+    cli::App app("tool");
+    auto verbose = app.add_flag("--verbose").global();
+    auto& build = app.subcommand("build", "");
+
+    REQUIRE(app.parse({"build", "--verbose"}));
+    CHECK(*verbose);
+
+    REQUIRE(build.parse({}));
+    CHECK(!*verbose);
+}
+
+TEST_CASE("direct subcommand parsing records the active command chain") {
+    cli::App app("tool");
+    auto& mid  = app.subcommand("mid", "");
+    auto& leaf = mid.subcommand("leaf", "");
+
+    REQUIRE(leaf.parse({}));
+    CHECK(app.active_subcommand() == &mid);
+    CHECK(mid.active_subcommand() == &leaf);
+    CHECK(app.is_subcommand("mid"));
+    CHECK(mid.is_subcommand("leaf"));
+    CHECK(!app.is_subcommand("leaf"));
+}
+
+TEST_CASE("direct subcommand parsing aggregates extras on every ancestor") {
+    cli::App app("tool");
+    app.allow_extras();
+    auto& mid = app.subcommand("mid", "");
+    (void)mid.add_flag("--known");
+    auto& leaf = mid.subcommand("leaf", "");
+
+    REQUIRE(app.parse({"mid", "leaf", "--extra", "value"}));
+    const auto expected = app.remaining_args();
+    REQUIRE(expected.size() == 2);
+
+    REQUIRE(leaf.parse({"--extra", "value"}));
+    CHECK(app.remaining_args() == expected);
+    CHECK(mid.remaining_args() == expected);
+    CHECK(leaf.remaining_args() == expected);
 }
 
 TEST_SUITE_END();

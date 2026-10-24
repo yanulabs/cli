@@ -304,6 +304,50 @@ TEST_CASE("custom version spellings suppress built-in version rows per name") {
     CHECK(!contains(help, "-V, --version"));
 }
 
+TEST_CASE("subcommand help lists inherited global options") {
+    cli::App app("tool", "desc", "1.0.0");
+    (void)app.add_flag("--verbose").help("Verbose output").global();
+    (void)app.add<std::string>("--config").help("Config file").global();
+    auto& build = app.subcommand("build", "Build it");
+    (void)build.add_flag("--local").help("Local switch");
+
+    const auto help = build.help_text();
+    CHECK(contains(help, "--verbose"));
+    CHECK(contains(help, "Verbose output"));
+    CHECK(contains(help, "--config <TEXT>"));
+    CHECK(contains(help, "--local"));
+    CHECK(contains(help, "Local switch"));
+}
+
+TEST_CASE("a local option shadows an inherited global in subcommand help") {
+    cli::App app("tool");
+    (void)app.add<std::string>("--name").help("Root name").global();
+    auto& sub = app.subcommand("run", "");
+    (void)sub.add<std::string>("--name").help("Sub name");
+
+    const auto help = sub.help_text();
+    CHECK(contains(help, "Sub name"));
+    CHECK(!contains(help, "Root name"));
+}
+
+TEST_CASE("inherited global help and version options suppress child built-ins") {
+    cli::App app("tool", "desc", "1.0.0");
+    (void)app.add_flag("-h").help("global short help").global();
+    (void)app.add_flag("--help").help("global long help").global();
+    (void)app.add_flag("-V").help("global short version").global();
+    (void)app.add_flag("--version").help("global long version").global();
+    auto& sub = app.subcommand("build", "");
+    (void)sub.add_flag("--local").help("Local switch");
+
+    const auto help = sub.help_text();
+    CHECK(contains(help, "global short help"));
+    CHECK(contains(help, "global long help"));
+    CHECK(contains(help, "global short version"));
+    CHECK(contains(help, "global long version"));
+    CHECK(!contains(help, "Print help and exit"));
+    CHECK(!contains(help, "Print version and exit"));
+}
+
 TEST_CASE("print_help writes the rendered text to a stream") {
     cli::App app("tool", "description");
     std::ostringstream out;
@@ -348,6 +392,22 @@ TEST_CASE("positional choices appear in arguments") {
 
     const auto help = app.help_text();
     CHECK(contains(help, "[debug|info|warn]"));
+}
+
+TEST_CASE("shadowing one inherited spelling keeps the others in subcommand help") {
+    cli::App app("tool");
+    (void)app.add_flag("--verbose")
+        .short_name("-v")
+        .help("Root verbose")
+        .global();
+    auto& sub = app.subcommand("build", "");
+    (void)sub.add_flag("-v").help("Sub short v");
+
+    const auto help = sub.help_text();
+    CHECK(contains(help, "--verbose"));
+    CHECK(contains(help, "Root verbose"));
+    CHECK(contains(help, "-v"));
+    CHECK(contains(help, "Sub short v"));
 }
 
 TEST_SUITE_END();

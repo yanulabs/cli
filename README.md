@@ -20,11 +20,11 @@
 | **Constraints** | `.range()`, `.choices()`, `.validate(fn, desc)` on options *and* positionals |
 | **Env-var fallback** | `.env("VAR")` on options *and* positionals |
 | **Delimited values** | `.delimiter(',')` — `--items=a,b,c` for `vector<T>`; quoted elements may contain the delimiter |
-| **Arity control** | `.nargs(2)`, `.nargs(1,3)`, `.nargs_at_least(1)` — one flag, many tokens |
+| **Arity control** | `.nargs(2)`, `.nargs(1,3)`, `.nargs_at_least(1)` on vector options *and* positionals |
 | **Config files** | `config_file()` + `config_option()` — INI sections, arrays, subcommands |
 | **Response files** | `response_files()` — `@args.txt` with quotes, comments, nesting |
 | **Option aliases** | `.alias("--colour")` adds extra spellings to any option/flag/count |
-| **Global options** | `.global()` options work before or after any subcommand |
+| **Global options** | `.global()` options work before or after any subcommand and appear in child help/completion |
 | **Long-option abbreviation** | `allow_abbrev()` accepts unique prefixes such as `--verb` |
 | **Extra arguments** | `allow_extras()` + `remaining_args()` for wrapper/forwarding tools |
 | **Hidden commands** | `subcommand(...).hidden()` — dispatchable but absent from help/completion |
@@ -274,6 +274,22 @@ auto& commit = app.subcommand("commit", "Record changes").alias("ci");
 // Both "commit" and "ci" dispatch to the same subcommand
 ```
 
+### Global options
+
+```cpp
+auto verbose = app.add_flag("--verbose").short_name("-v").global();
+auto& build  = app.subcommand("build", "");
+// tool build --verbose and tool --verbose build both work
+```
+
+Globals are inherited by every descendant, participate in abbreviation and
+typo suggestions, and appear in child help/completion. Shadowing is
+name-by-name: a child option named `-v` hides only the inherited `-v`, while
+the global `--verbose` spelling remains functional and documented. Parsing a
+subcommand directly (`build.parse(...)`) uses the same inherited globals and
+root config/response-file policy, and finalizes ancestors just as
+`app.parse({"build", ...})` does.
+
 ### Negatable flags
 
 ```cpp
@@ -309,6 +325,23 @@ auto paths = app.add<std::vector<std::string>>("--path").nargs_at_least(1);
 
 Exact arities consume dash-prefixed values as values; ranged and at-least
 arities stop at the next option so flags are not swallowed.
+
+### Variable arity positionals
+
+Vector positionals accept the same arity controls:
+
+```cpp
+auto pair = app.add_positional<std::vector<int>>("pair").nargs(2);
+auto rest = app.add_positional<std::string>("rest");
+// tool 1 2 label → pair = {1, 2}, rest = "label"
+
+auto all = app.add_positional<std::vector<std::string>>("all").nargs_at_least(1);
+// must be the last positional: consumes every remaining non-option token
+```
+
+Fixed arities may be followed by other positionals. Ranged and at-least
+arities are variable, so they must be registered last; doing otherwise throws
+`std::invalid_argument` at registration time.
 
 ### Config files
 
@@ -474,10 +507,17 @@ cmake -S . -B build-bench -DCMAKE_BUILD_TYPE=Release \
 cmake --build build-bench --target bench_parse
 ./build-bench/bench/bench_parse 500000
 
-# Adversarial fuzzing (Clang + libFuzzer)
+# Head-to-head against CLI11 and cxxopts (fetched at configure time)
+cmake -S . -B build-compare -DCMAKE_BUILD_TYPE=Release \
+      -DCLI_BUILD_TESTS=OFF -DCLI_BUILD_BENCHMARKS=ON \
+      -DCLI_BUILD_COMPARATIVE_BENCHMARKS=ON
+cmake --build build-compare --target bench_compare
+./build-compare/bench/bench_compare 200000
+
+# Adversarial fuzzing (Clang + libFuzzer, checked-in seed corpus)
 cmake -S . -B build-fuzz -DCLI_BUILD_EXAMPLES=OFF -DCLI_BUILD_FUZZERS=ON
 cmake --build build-fuzz --target fuzz_parse
-./build-fuzz/tests/fuzz_parse -max_len=4096 -runs=100000
+./build-fuzz/tests/fuzz_parse tests/fuzz_corpus -max_len=4096 -runs=200000
 ```
 
 Tests are split by domain (`flags`, `options`, `positionals`, `values`,
@@ -496,12 +536,16 @@ reset. On an Apple-silicon laptop (Release, Clang) the suite currently runs at:
 
 | Scenario | ns/parse | parses/sec |
 |---|---:|---:|
-| 8 short flags | ~107 | ~9.3 M |
-| 6 typed options (12 tokens) | ~236 | ~4.2 M |
-| mixed flags/options/vector/positional | ~214 | ~4.7 M |
-| subcommand + options (2 parses) | ~245 | ~4.1 M |
+| 8 short flags | ~158 | ~6.3 M |
+| 6 typed options (12 tokens) | ~255 | ~3.9 M |
+| mixed flags/options/vector/positional | ~244 | ~4.1 M |
+| subcommand + options (2 parses) | ~270 | ~3.7 M |
 
-Numbers vary by machine; run the benchmark target on your own hardware.
+`bench_compare` runs the same schema shapes against CLI11 2.7.2 and cxxopts
+3.3.1. On the same machine cli.hpp is roughly 2.4–8× faster per parse
+(CLI11: ~857/605/346/1160 ns; cxxopts: ~8352/6125/3401 ns, no subcommands).
+
+Numbers vary by machine; run the benchmark targets on your own hardware.
 Hot-path work is allocation-free for `parse(argc, argv)`, one-character short
 options use a direct 128-slot index instead of hashing, and formatting is
 confined to help/error paths.

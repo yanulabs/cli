@@ -1,5 +1,6 @@
 #include "test_support.hpp"
 
+#include <cmath>
 #include <iterator>
 #include <random>
 #include <span>

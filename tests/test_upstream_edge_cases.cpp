@@ -401,8 +401,9 @@ TEST_CASE("CLI11/cxxopts: unsigned integers reject negative values") {
     cli::App app("t");
     auto u = app.add<unsigned>("--u");
     auto res = app.parse({"--u", "-5"});
-    CHECK(!res);
+    REQUIRE(!res);
     CHECK(res.error().kind == cli::ParseError::Kind::InvalidValue);
+    CHECK(!u.is_set());
 }
 
 TEST_CASE("cxxopts: 64-bit integer limits and overflow detection") {
@@ -420,8 +421,9 @@ TEST_CASE("cxxopts: trailing non-digits rejected for integers") {
     cli::App app("t");
     auto n = app.add<int>("--num");
     auto res = app.parse({"--num", "123abc"});
-    CHECK(!res);
+    REQUIRE(!res);
     CHECK(res.error().kind == cli::ParseError::Kind::InvalidValue);
+    CHECK(!n.is_set());
 }
 
 // ── 9. Floating point forms (CLI11 & cxxopts) ────────────────────────────────

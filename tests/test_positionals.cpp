@@ -120,6 +120,102 @@ TEST_CASE("an optional vector positional may be empty") {
     CHECK(!files.is_set());
 }
 
+TEST_CASE("a fixed-arity vector positional keeps following slots reachable") {
+    cli::App app("t");
+    auto nums  = app.add_positional<std::vector<int>>("nums").nargs(2);
+    auto label = app.add_positional<std::string>("label");
+
+    REQUIRE(app.parse({"1", "2", "three"}));
+    REQUIRE(nums->size() == 2);
+    CHECK((*nums)[0] == 1);
+    CHECK((*nums)[1] == 2);
+    CHECK(*label == "three");
+}
+
+TEST_CASE("a fixed-arity vector positional reports too few values") {
+    cli::App app("t");
+    (void)app.add_positional<std::vector<int>>("nums").nargs(2);
+
+    auto r = app.parse({"1"});
+    REQUIRE(!r);
+    CHECK(r.error().kind == cli::ParseError::Kind::MissingValue);
+    CHECK(contains(r.error().message, "<nums>"));
+    CHECK(contains(r.error().message, "at least 2"));
+}
+
+TEST_CASE("a fixed-arity positional rejects delimited overflow") {
+    cli::App app("t");
+    (void)app.add_positional<std::vector<int>>("nums").nargs(2).delimiter(',');
+
+    REQUIRE(app.parse({"1,2"}));
+    auto r = app.parse({"1,2,3"});
+    REQUIRE(!r);
+    CHECK(r.error().kind == cli::ParseError::Kind::UnexpectedValue);
+    CHECK(contains(r.error().message, "at most 2"));
+}
+
+TEST_CASE("a ranged positional consumes up to its upper bound") {
+    cli::App app("t");
+    auto nums    = app.add_positional<std::vector<int>>("nums").nargs(1, 3);
+    auto verbose = app.add_flag("--verbose").short_name("-v");
+
+    REQUIRE(app.parse({"1", "2", "-v"}));
+    REQUIRE(nums->size() == 2);
+    CHECK((*nums)[1] == 2);
+    CHECK(*verbose);
+
+    auto too_many = app.parse({"1", "2", "3", "4"});
+    REQUIRE(!too_many);
+    CHECK(too_many.error().kind == cli::ParseError::Kind::TooManyPositionals);
+}
+
+TEST_CASE("nargs_at_least enforces its lower bound and consumes the rest") {
+    cli::App app("t");
+    auto nums = app.add_positional<std::vector<int>>("nums").nargs_at_least(2);
+
+    REQUIRE(app.parse({"1", "2", "3", "4"}));
+    REQUIRE(nums->size() == 4);
+    CHECK((*nums)[3] == 4);
+
+    auto r = app.parse({"7"});
+    REQUIRE(!r);
+    CHECK(r.error().kind == cli::ParseError::Kind::MissingValue);
+    CHECK(contains(r.error().message, "at least 2"));
+}
+
+TEST_CASE("positional nargs rejects invalid configurations") {
+    cli::App app("t");
+    auto nums = app.add_positional<std::vector<int>>("nums");
+
+    CHECK_THROWS_AS(nums.nargs(0), std::invalid_argument);
+    CHECK_THROWS_AS(nums.nargs(3, 2), std::invalid_argument);
+    CHECK_THROWS_AS(nums.nargs_at_least(0), std::invalid_argument);
+}
+
+TEST_CASE("only variable-arity positionals must be registered last") {
+    cli::App fixed("fixed");
+    (void)fixed.add_positional<std::vector<int>>("nums").nargs(2);
+    (void)fixed.add_positional<std::string>("label");
+
+    cli::App ranged("ranged");
+    (void)ranged.add_positional<std::vector<int>>("nums").nargs(1, 3);
+    REQUIRE_THROWS_AS(
+        (void)ranged.add_positional<std::string>("label"),
+        std::invalid_argument);
+}
+
+TEST_CASE("later parses do not inherit a positional arity count") {
+    cli::App app("t");
+    auto nums  = app.add_positional<std::vector<int>>("nums").nargs(2);
+    auto label = app.add_positional<std::string>("label");
+
+    REQUIRE(app.parse({"1", "2", "first"}));
+    REQUIRE(app.parse({"3", "4", "second"}));
+    REQUIRE(nums->size() == 2);
+    CHECK((*nums)[0] == 3);
+    CHECK(*label == "second");
+}
+
 TEST_CASE("a vector positional can follow scalar positionals") {
     cli::App app("t");
     auto first  = app.add_positional<std::string>("first");

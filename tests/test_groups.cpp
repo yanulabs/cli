@@ -27,6 +27,20 @@ TEST_CASE("mutex group rejects two explicit options") {
     CHECK(r.error().context == &app);
 }
 
+TEST_CASE("value validation is reported before a mutex conflict") {
+    cli::App app("t");
+    auto a = app.add<int>("--a").validate([](int v) { return v > 0; },
+                                         "must be positive");
+    auto b = app.add_flag("--b");
+    app.mutex_group({"--a", "--b"});
+
+    auto r = app.parse({"--a", "-1", "--b"});
+    REQUIRE(!r);
+    CHECK(r.error().kind == cli::ParseError::Kind::ValidationFailed);
+    CHECK(*a == -1);
+    CHECK(*b);
+}
+
 TEST_CASE("mutex groups work with three options") {
     cli::App app("t");
     (void)app.add_flag("--json");

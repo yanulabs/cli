@@ -58,7 +58,7 @@ template<typename Fn>
     return measure("8 short flags", iterations, args.size(), [&] {
         auto r = app.parse(args);
         return static_cast<std::uint64_t>(
-            r && *v && !*q && *f && !*n && *c && *a && *p && *s);
+            r && *v && *q && *f && *n && *c && *a && *p && *s);
     });
 }
 

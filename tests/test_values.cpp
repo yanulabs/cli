@@ -305,7 +305,7 @@ TEST_CASE("single-letter boolean spellings are accepted case-insensitively") {
 TEST_CASE("longer near-miss boolean spellings are still rejected") {
     for (const char* text : {"tr", "ye", "nope", "ff", ""}) {
         cli::App app("t");
-        auto value = app.add<bool>("--value");
+        (void)app.add<bool>("--value");
         CAPTURE(text);
         CHECK(!app.parse({"--value", text}));
     }
