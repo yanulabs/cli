@@ -542,8 +542,9 @@ reset. On an Apple-silicon laptop (Release, Clang) the suite currently runs at:
 | subcommand + options (2 parses) | ~270 | ~3.7 M |
 
 `bench_compare` runs the same schema shapes against CLI11 2.7.2 and cxxopts
-3.3.1. On the same machine cli.hpp is roughly 2.4–8× faster per parse
-(CLI11: ~857/605/346/1160 ns; cxxopts: ~8352/6125/3401 ns, no subcommands).
+3.3.1. Across repeated runs on the same machine, cli.hpp is roughly 2.3–5.5×
+faster per parse than CLI11 and 24–53× faster than cxxopts (CLI11:
+~858/605/346/1160 ns; cxxopts: ~8352/6125/3401 ns, no subcommands).
 
 Numbers vary by machine; run the benchmark targets on your own hardware.
 Hot-path work is allocation-free for `parse(argc, argv)`, one-character short
