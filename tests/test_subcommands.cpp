@@ -692,6 +692,38 @@ TEST_CASE("abbreviations ignore an inherited spelling shadowed by a local option
     CHECK(!*root_verbose);
 }
 
+TEST_CASE("a local alias shadows only the same inherited spelling") {
+    cli::App app("t");
+    auto root_verbose = app.add_flag("--verbose").short_name("-v").global();
+    auto& build = app.subcommand("build", "");
+    auto local  = build.add_flag("--local").alias("-v");
+
+    REQUIRE(app.parse({"build", "--verbose"}));
+    CHECK(*root_verbose);
+    CHECK(!*local);
+
+    REQUIRE(app.parse({"build", "-v"}));
+    CHECK(!*root_verbose);
+    CHECK(*local);
+}
+
+TEST_CASE("the nearest ancestor global wins when spellings collide") {
+    cli::App app("t");
+    auto root_name = app.add<std::string>("--name").default_val("root").global();
+    auto& mid      = app.subcommand("mid", "");
+    auto mid_name  = mid.add<std::string>("--name").default_val("mid").global();
+    auto& leaf     = mid.subcommand("leaf", "");
+
+    REQUIRE(leaf.parse({"--name", "leaf"}));
+    CHECK(*mid_name == "leaf");
+    CHECK(*root_name == "root");
+    CHECK(leaf["--name"].as<std::string>() == "leaf");
+
+    REQUIRE(app.parse({"mid", "leaf", "--name", "again"}));
+    CHECK(*mid_name == "again");
+    CHECK(*root_name == "root");
+}
+
 TEST_CASE("typo suggestions use inherited spellings that remain visible") {
     cli::App app("t");
     auto root_verbose = app.add_flag("--verbose").short_name("-v").global();

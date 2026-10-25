@@ -331,6 +331,27 @@ target = release
     CHECK(*target == "release");
 }
 
+TEST_CASE("direct child parsing loads a config selected by --config") {
+    TempFile cfg("direct-config-option", "jobs = 11\n[build]\ntarget = release\n");
+    cli::App app("tool");
+    app.config_option();
+    auto jobs = app.add<unsigned>("--jobs").default_val(1u);
+    auto& build  = app.subcommand("build", "");
+    auto  target = build.add<std::string>("--target").default_val("debug");
+
+    REQUIRE(build.parse({"--config", cfg.path()}));
+    CHECK(*jobs == 11u);
+    CHECK(*target == "release");
+    CHECK(app.is_subcommand("build"));
+    CHECK(app["--config"].as<std::string>() == cfg.path());
+
+    // A later direct parse must not reuse the path selected previously.
+    REQUIRE(build.parse({}));
+    CHECK(*jobs == 1u);
+    CHECK(*target == "debug");
+    CHECK(!app.has_option("--config"));
+}
+
 TEST_CASE("config files support inline comments and hashes in values") {
     TempFile cfg("comments", R"(
 name = hello world # trailing comment

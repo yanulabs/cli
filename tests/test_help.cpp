@@ -394,6 +394,18 @@ TEST_CASE("positional choices appear in arguments") {
     CHECK(contains(help, "[debug|info|warn]"));
 }
 
+TEST_CASE("the nearest ancestor global wins in subcommand help") {
+    cli::App app("tool");
+    (void)app.add<std::string>("--name").help("Root name").global();
+    auto& mid = app.subcommand("mid", "");
+    (void)mid.add<std::string>("--name").help("Mid name").global();
+    auto& leaf = mid.subcommand("leaf", "");
+
+    const auto help = leaf.help_text();
+    CHECK(contains(help, "Mid name"));
+    CHECK(!contains(help, "Root name"));
+}
+
 TEST_CASE("shadowing one inherited spelling keeps the others in subcommand help") {
     cli::App app("tool");
     (void)app.add_flag("--verbose")

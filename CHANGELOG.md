@@ -77,7 +77,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `tool sub --version` works
 - **Default validation** — defaults are checked against `range()`,
   `choices()`, and custom validators
-- **Domain-scoped test suite** — 551 test cases across 19 doctest suites
+- **Domain-scoped test suite** — 555 test cases across 19 doctest suites
   (`api`, `completion`, `constraints`, `custom_types`, `environment`,
   `errors`, `extensions`, `flags`, `groups`, `help`, `lifecycle`, `lookup`,
   `options`, `positionals`, `robustness`, `subcommands`, `tokens`,
