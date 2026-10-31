@@ -1,0 +1,683 @@
+--- a/include/argparse/argparse.hpp
++++ b/include/argparse/argparse.hpp
+@@ -31,6 +31,13 @@
+ #pragma once
+ 
+ #include <cerrno>
++
++#ifdef ARGPARSE_DIFF_CAPTURE
++#include <cstdint>
++#include <exception>
++#include <fstream>
++#include <mutex>
++#endif
+ 
+ #ifndef ARGPARSE_MODULE_USE_STD_MODULE
+ #include <algorithm>
+@@ -670,11 +677,26 @@
+     implicit_value(true);
+     return *this;
+   }
++
++#ifdef ARGPARSE_DIFF_CAPTURE
++  struct DiffInternalAction {
++    Argument &self;
++    explicit DiffInternalAction(Argument &a) : self(a) {
++      self.m_diff_internal_action = true;
++    }
++    ~DiffInternalAction() { self.m_diff_internal_action = false; }
++  };
++#endif
+ 
+   template <class F, class... Args>
+   auto action(F &&callable, Args &&... bound_args)
+       -> std::enable_if_t<std::is_invocable_v<F, Args..., std::string const>,
+                           Argument &> {
++#ifdef ARGPARSE_DIFF_CAPTURE
++    if (!m_diff_internal_action) {
++      m_diff_user_action = true;
++    }
++#endif
+     using action_type = std::conditional_t<
+         std::is_void_v<std::invoke_result_t<F, Args..., std::string const>>,
+         void_action, valued_action>;
+@@ -698,6 +720,10 @@
+     if (m_default_value.has_value()) {
+       var = std::any_cast<bool>(m_default_value);
+     }
++#ifdef ARGPARSE_DIFF_CAPTURE
++    DiffInternalAction diff_internal(*this);
++    m_diff_scan_type = typeid(bool).name();
++#endif
+     action([&var](const auto & /*unused*/) {
+       var = true;
+       return var;
+@@ -710,6 +736,10 @@
+     if (m_default_value.has_value()) {
+       var = std::any_cast<T>(m_default_value);
+     }
++#ifdef ARGPARSE_DIFF_CAPTURE
++    DiffInternalAction diff_internal(*this);
++    m_diff_scan_type = typeid(T).name();
++#endif
+     action([&var](const auto &s) {
+       var = details::parse_number<T, details::radix_10>()(s);
+       return var;
+@@ -721,6 +751,10 @@
+     if (m_default_value.has_value()) {
+       var = std::any_cast<double>(m_default_value);
+     }
++#ifdef ARGPARSE_DIFF_CAPTURE
++    DiffInternalAction diff_internal(*this);
++    m_diff_scan_type = typeid(double).name();
++#endif
+     action([&var](const auto &s) {
+       var = details::parse_number<double, details::chars_format::general>()(s);
+       return var;
+@@ -732,6 +766,10 @@
+     if (m_default_value.has_value()) {
+       var = std::any_cast<std::string>(m_default_value);
+     }
++#ifdef ARGPARSE_DIFF_CAPTURE
++    DiffInternalAction diff_internal(*this);
++    m_diff_scan_type = typeid(std::string).name();
++#endif
+     action([&var](const std::string &s) {
+       var = s;
+       return var;
+@@ -743,6 +781,10 @@
+     if (m_default_value.has_value()) {
+       var = std::any_cast<std::filesystem::path>(m_default_value);
+     }
++#ifdef ARGPARSE_DIFF_CAPTURE
++    DiffInternalAction diff_internal(*this);
++    m_diff_scan_type = typeid(std::filesystem::path).name();
++#endif
+     action([&var](const std::string &s) { var = s; });
+     return *this;
+   }
+@@ -751,6 +793,10 @@
+     if (m_default_value.has_value()) {
+       var = std::any_cast<std::vector<std::string>>(m_default_value);
+     }
++#ifdef ARGPARSE_DIFF_CAPTURE
++    DiffInternalAction diff_internal(*this);
++    m_diff_scan_type = typeid(std::vector<std::string>).name();
++#endif
+     action([this, &var](const std::string &s) {
+       if (!m_is_used) {
+         var.clear();
+@@ -766,6 +812,10 @@
+     if (m_default_value.has_value()) {
+       var = std::any_cast<std::vector<int>>(m_default_value);
+     }
++#ifdef ARGPARSE_DIFF_CAPTURE
++    DiffInternalAction diff_internal(*this);
++    m_diff_scan_type = typeid(std::vector<int>).name();
++#endif
+     action([this, &var](const std::string &s) {
+       if (!m_is_used) {
+         var.clear();
+@@ -781,6 +831,10 @@
+     if (m_default_value.has_value()) {
+       var = std::any_cast<std::set<std::string>>(m_default_value);
+     }
++#ifdef ARGPARSE_DIFF_CAPTURE
++    DiffInternalAction diff_internal(*this);
++    m_diff_scan_type = typeid(std::set<std::string>).name();
++#endif
+     action([this, &var](const std::string &s) {
+       if (!m_is_used) {
+         var.clear();
+@@ -796,6 +850,10 @@
+     if (m_default_value.has_value()) {
+       var = std::any_cast<std::set<int>>(m_default_value);
+     }
++#ifdef ARGPARSE_DIFF_CAPTURE
++    DiffInternalAction diff_internal(*this);
++    m_diff_scan_type = typeid(std::set<int>).name();
++#endif
+     action([this, &var](const std::string &s) {
+       if (!m_is_used) {
+         var.clear();
+@@ -822,6 +880,11 @@
+   auto scan() -> std::enable_if_t<std::is_arithmetic_v<T>, Argument &> {
+     static_assert(!(std::is_const_v<T> || std::is_volatile_v<T>),
+                   "T should not be cv-qualified");
++#ifdef ARGPARSE_DIFF_CAPTURE
++    DiffInternalAction diff_internal(*this);
++    m_diff_scan_shape = std::string(1, Shape);
++    m_diff_scan_type = typeid(T).name();
++#endif
+     auto is_one_of = [](char c, auto... x) constexpr {
+       return ((c == x) || ...);
+     };
+@@ -1630,6 +1693,13 @@
+   std::string_view m_prefix_chars; // ArgumentParser has the prefix_chars
+   int m_usage_newline_counter = 0;
+   std::size_t m_group_idx = 0;
++#ifdef ARGPARSE_DIFF_CAPTURE
++  bool m_diff_builtin = false;
++  bool m_diff_user_action = false;
++  bool m_diff_internal_action = false;
++  std::string m_diff_scan_shape;
++  std::string m_diff_scan_type;
++#endif
+ };
+ 
+ class ArgumentParser {
+@@ -1643,8 +1713,8 @@
+         m_exit_on_default_arguments(exit_on_default_arguments),
+         m_parser_path(m_program_name) {
+     if ((add_args & default_arguments::help) == default_arguments::help) {
+-      add_argument("-h", "--help")
+-          .action([&](const auto & /*unused*/) {
++      auto &help_argument = add_argument("-h", "--help");
++      help_argument.action([&](const auto & /*unused*/) {
+             os << help().str();
+             if (m_exit_on_default_arguments) {
+               std::exit(0);
+@@ -1654,10 +1724,13 @@
+           .help("shows help message and exits")
+           .implicit_value(true)
+           .nargs(0);
++#ifdef ARGPARSE_DIFF_CAPTURE
++      help_argument.m_diff_builtin = true;
++#endif
+     }
+     if ((add_args & default_arguments::version) == default_arguments::version) {
+-      add_argument("-v", "--version")
+-          .action([&](const auto & /*unused*/) {
++      auto &version_argument = add_argument("-v", "--version");
++      version_argument.action([&](const auto & /*unused*/) {
+             os << m_version << std::endl;
+             if (m_exit_on_default_arguments) {
+               std::exit(0);
+@@ -1667,6 +1740,9 @@
+           .help("prints version information and exits")
+           .implicit_value(true)
+           .nargs(0);
++#ifdef ARGPARSE_DIFF_CAPTURE
++      version_argument.m_diff_builtin = true;
++#endif
+     }
+   }
+ 
+@@ -1836,14 +1912,406 @@
+   ArgumentParser &set_assign_chars(std::string assign_chars) {
+     m_assign_chars = std::move(assign_chars);
+     return *this;
++  }
++
++#ifdef ARGPARSE_DIFF_CAPTURE
++private:
++  static std::string diff_escape(const std::string &s) {
++    std::ostringstream out;
++    out << '"';
++    for (unsigned char c : s) {
++      switch (c) {
++      case '"':
++        out << "\\\"";
++        break;
++      case '\\':
++        out << "\\\\";
++        break;
++      case '\b':
++        out << "\\b";
++        break;
++      case '\f':
++        out << "\\f";
++        break;
++      case '\n':
++        out << "\\n";
++        break;
++      case '\r':
++        out << "\\r";
++        break;
++      case '\t':
++        out << "\\t";
++        break;
++      default:
++        if (c < 0x20 || c >= 0x7f) {
++          out << "\\u" << std::hex << std::setw(4) << std::setfill('0')
++              << static_cast<unsigned>(c) << std::dec;
++        } else {
++          out << static_cast<char>(c);
++        }
++      }
++    }
++    out << '"';
++    return out.str();
++  }
++
++  static std::string diff_hex(const std::string &s) {
++    static constexpr char digits[] = "0123456789abcdef";
++    std::string out;
++    out.reserve(s.size() * 2);
++    for (unsigned char c : s) {
++      out.push_back(digits[c >> 4]);
++      out.push_back(digits[c & 0x0f]);
++    }
++    return out;
++  }
++
++  static std::string diff_any_repr(const std::any &a) {
++    if (!a.has_value()) {
++      return {};
++    }
++    if (a.type() == typeid(bool)) {
++      return std::any_cast<bool>(a) ? "true" : "false";
++    }
++    if (a.type() == typeid(int)) {
++      return std::to_string(std::any_cast<int>(a));
++    }
++    if (a.type() == typeid(unsigned)) {
++      return std::to_string(std::any_cast<unsigned>(a));
++    }
++    if (a.type() == typeid(long)) {
++      return std::to_string(std::any_cast<long>(a));
++    }
++    if (a.type() == typeid(std::string)) {
++      return std::any_cast<const std::string &>(a);
++    }
++    if (a.type() == typeid(const char *)) {
++      return std::any_cast<const char *>(a);
++    }
++    return {};
++  }
++
++  std::string diff_argument_json(const Argument &a, std::size_t index) const {
++    std::ostringstream o;
++    o << "{\"index\":" << index << ",\"names\":[";
++    for (std::size_t i = 0; i < a.m_names.size(); ++i) {
++      o << (i ? "," : "") << diff_escape(a.m_names[i]);
++    }
++    o << "],\"positional\":"
++      << ((!a.m_is_optional) ? "true" : "false");
++    o << ",\"nargs_min\":" << a.m_num_args_range.get_min();
++    o << ",\"nargs_max\":";
++    if (a.m_num_args_range.get_max() ==
++        (std::numeric_limits<std::size_t>::max)()) {
++      o << "null";
++    } else {
++      o << a.m_num_args_range.get_max();
++    }
++    o << ",\"required\":" << (a.m_is_required ? "true" : "false");
++    o << ",\"repeatable\":" << (a.m_is_repeatable ? "true" : "false");
++    o << ",\"hidden\":" << (a.m_is_hidden ? "true" : "false");
++    o << ",\"accepts_optional_like\":"
++      << (a.m_accepts_optional_like_value ? "true" : "false");
++    o << ",\"has_default\":" << (a.m_default_value.has_value() ? "true" : "false");
++    o << ",\"default_repr\":"
++      << diff_escape(a.m_default_value_repr);
++    o << ",\"default_type\":"
++      << diff_escape(a.m_default_value.has_value()
++                         ? std::string(a.m_default_value.type().name())
++                         : std::string{});
++    o << ",\"has_implicit\":"
++      << (a.m_implicit_value.has_value() ? "true" : "false");
++    o << ",\"implicit_repr\":"
++      << diff_escape(diff_any_repr(a.m_implicit_value));
++    o << ",\"implicit_type\":"
++      << diff_escape(a.m_implicit_value.has_value()
++                         ? std::string(a.m_implicit_value.type().name())
++                         : std::string{});
++    o << ",\"choices\":";
++    if (a.m_choices.has_value()) {
++      o << "[";
++      for (std::size_t i = 0; i < a.m_choices->size(); ++i) {
++        o << (i ? "," : "") << diff_escape((*a.m_choices)[i]);
++      }
++      o << "]";
++    } else {
++      o << "null";
++    }
++    o << ",\"actions\":[";
++    for (std::size_t i = 0; i < a.m_actions.size(); ++i) {
++      if (i) {
++        o << ",";
++      }
++      o << (std::holds_alternative<Argument::void_action>(a.m_actions[i])
++                ? "\"void\""
++                : "\"valued\"");
++    }
++    o << "],\"group_idx\":" << a.m_group_idx;
++    o << ",\"builtin\":" << (a.m_diff_builtin ? "true" : "false");
++    o << ",\"user_action\":" << (a.m_diff_user_action ? "true" : "false");
++    o << ",\"scan_shape\":" << diff_escape(a.m_diff_scan_shape);
++    o << ",\"scan_type\":"
++      << diff_escape(a.m_diff_scan_type);
++    o << ",\"metavar\":" << diff_escape(a.m_metavar);
++    o << "}";
++    return o.str();
++  }
++
++  std::string diff_parser_json(
++      const ArgumentParser &p,
++      const std::vector<const ArgumentParser *> &order) const {
++    auto index_in_order = [&](const ArgumentParser *q) -> long {
++      auto it = std::find(order.begin(), order.end(), q);
++      if (it == order.end()) {
++        return -1;
++      }
++      return static_cast<long>(std::distance(order.begin(), it));
++    };
++    auto index_of_argument = [&](const Argument *needle) -> long {
++      std::size_t i = 0;
++      for (const auto &a : p.m_positional_arguments) {
++        if (&a == needle) {
++          return static_cast<long>(i);
++        }
++        ++i;
++      }
++      for (const auto &a : p.m_optional_arguments) {
++        if (&a == needle) {
++          return static_cast<long>(i);
++        }
++        ++i;
++      }
++      return -1;
++    };
++
++    std::ostringstream o;
++    o << "{\"program\":" << diff_escape(p.m_program_name);
++    o << ",\"parser_path\":" << diff_escape(p.m_parser_path);
++    o << ",\"prefix\":" << diff_escape(p.m_prefix_chars);
++    o << ",\"assign\":" << diff_escape(p.m_assign_chars);
++    o << ",\"suppress\":" << (p.m_suppress ? "true" : "false");
++    o << ",\"group_names\":[";
++    for (std::size_t i = 0; i < p.m_group_names.size(); ++i) {
++      o << (i ? "," : "") << diff_escape(p.m_group_names[i]);
++    }
++    o << "],\"positionals\":[";
++    std::size_t idx = 0;
++    for (const auto &a : p.m_positional_arguments) {
++      o << (idx ? "," : "") << diff_argument_json(a, idx);
++      ++idx;
++    }
++    o << "],\"optionals\":[";
++    bool first_opt = true;
++    for (const auto &a : p.m_optional_arguments) {
++      if (!first_opt) {
++        o << ",";
++      }
++      first_opt = false;
++      o << diff_argument_json(a, idx);
++      ++idx;
++    }
++    o << "],\"mutex\":[";
++    for (std::size_t i = 0; i < p.m_mutually_exclusive_groups.size(); ++i) {
++      const auto &group = p.m_mutually_exclusive_groups[i];
++      o << (i ? "," : "") << "{\"required\":"
++        << (group.m_required ? "true" : "false") << ",\"elements\":[";
++      for (std::size_t j = 0; j < group.m_elements.size(); ++j) {
++        o << (j ? "," : "") << index_of_argument(group.m_elements[j]);
++      }
++      o << "]}";
++    }
++    o << "],\"hidden_aliases\":[";
++    bool first_alias = true;
++    for (const auto &[name, arg_it] : p.m_argument_map) {
++      const auto &names = arg_it->m_names;
++      if (std::find(names.begin(), names.end(), name) != names.end()) {
++        continue;
++      }
++      if (!first_alias) {
++        o << ",";
++      }
++      first_alias = false;
++      o << "[" << diff_escape(name) << ","
++        << diff_escape(names.empty() ? std::string{} : names.front()) << "]";
++    }
++    o << "],\"subparsers\":[";
++    bool first_sub = true;
++    for (const auto &[name, sub_it] : p.m_subparser_map) {
++      if (!first_sub) {
++        o << ",";
++      }
++      first_sub = false;
++      o << "{\"name\":" << diff_escape(name)
++        << ",\"parser\":" << index_in_order(&sub_it->get()) << "}";
++    }
++    o << "],\"is_parsed\":" << (p.m_is_parsed ? "true" : "false") << "}";
++    return o.str();
++  }
++
++  std::string diff_schema_json() const {
++    std::vector<const ArgumentParser *> order;
++    diff_collect_parsers(*this, order);
++    std::ostringstream o;
++    o << "[";
++    for (std::size_t i = 0; i < order.size(); ++i) {
++      o << (i ? "," : "") << diff_parser_json(*order[i], order);
++    }
++    o << "]";
++    return o.str();
++  }
++
++  static void diff_collect_parsers(
++      const ArgumentParser &p,
++      std::vector<const ArgumentParser *> &order) {
++    if (std::find(order.begin(), order.end(), &p) != order.end()) {
++      return;
++    }
++    order.push_back(&p);
++    for (const auto &[name, sub_it] : p.m_subparser_map) {
++      (void)name;
++      diff_collect_parsers(sub_it->get(), order);
++    }
++  }
++
++  static int &diff_depth() {
++    static thread_local int depth = 0;
++    return depth;
++  }
++
++  static void diff_write_record(const std::string &record) noexcept {
++    try {
++      const char *path = std::getenv("ARGPARSE_DIFF_OUT");
++      if (path == nullptr || *path == '\0') {
++        return;
++      }
++      static std::mutex mutex;
++      std::lock_guard<std::mutex> lock(mutex);
++      std::ofstream out(path, std::ios::app | std::ios::binary);
++      out << record << '\n';
++    } catch (...) {
++    }
++  }
++
++  void diff_emit_record(const std::vector<std::string> &args,
++                        const std::string &schema_json, const char *file,
++                        int line, bool known, bool ok,
++                        const std::string &error_type,
++                        const std::string &error_message,
++                        const std::vector<std::string> *unknown) const {
++    std::ostringstream o;
++    o << "{\"file\":" << diff_escape(file ? std::string(file) : std::string{});
++    o << ",\"line\":" << line;
++    o << ",\"kind\":" << diff_escape(known ? "known" : "args");
++    o << ",\"args\":[";
++    for (std::size_t i = 0; i < args.size(); ++i) {
++      o << (i ? "," : "") << diff_escape(args[i]);
++    }
++    o << "],\"args_hex\":[";
++    for (std::size_t i = 0; i < args.size(); ++i) {
++      o << (i ? "," : "") << diff_escape(diff_hex(args[i]));
++    }
++    o << "],\"parsers\":" << schema_json;
++    o << ",\"outcome\":" << diff_escape(ok ? "ok" : "error");
++    o << ",\"error_type\":" << diff_escape(error_type);
++    o << ",\"error\":" << diff_escape(error_message);
++    o << ",\"unknown\":";
++    if (unknown == nullptr) {
++      o << "null";
++    } else {
++      o << "[";
++      for (std::size_t i = 0; i < unknown->size(); ++i) {
++        o << (i ? "," : "") << diff_escape((*unknown)[i]);
++      }
++      o << "]";
++    }
++    o << ",\"unknown_hex\":";
++    if (unknown == nullptr) {
++      o << "null";
++    } else {
++      o << "[";
++      for (std::size_t i = 0; i < unknown->size(); ++i) {
++        o << (i ? "," : "") << diff_escape(diff_hex((*unknown)[i]));
++      }
++      o << "]";
++    }
++    o << "}";
++    diff_write_record(o.str());
+   }
+ 
++  struct DiffCallGuard {
++    ArgumentParser &parser;
++    std::vector<std::string> args;
++    const char *file;
++    int line;
++    bool known;
++    bool active;
++    int uncaught;
++    std::string schema_json;
++    bool has_unknown{false};
++    std::vector<std::string> unknown;
++
++    DiffCallGuard(ArgumentParser &p, const std::vector<std::string> &a,
++                  const char *f, int l, bool k)
++        : parser(p), args(a), file(f), line(l), known(k), active(false),
++          uncaught(std::uncaught_exceptions()) {
++      if (++diff_depth() == 1) {
++        active = true;
++        schema_json = p.diff_schema_json();
++      }
++    }
++
++    void set_unknown(const std::vector<std::string> &u) {
++      if (active) {
++        has_unknown = true;
++        unknown = u;
++      }
++    }
++
++    ~DiffCallGuard() {
++      if (active) {
++        const bool ok = std::uncaught_exceptions() <= uncaught;
++        std::string error_type;
++        std::string error_message;
++        if (!ok) {
++          try {
++            std::exception_ptr ep = std::current_exception();
++            if (ep) {
++              std::rethrow_exception(ep);
++            }
++          } catch (const std::exception &e) {
++            error_type = typeid(e).name();
++            error_message = e.what();
++          } catch (...) {
++            error_type = "unknown";
++            error_message = "non-std exception";
++          }
++        }
++        parser.diff_emit_record(args, schema_json, file, line, known, ok,
++                                error_type, error_message,
++                                has_unknown ? &unknown : nullptr);
++      }
++      --diff_depth();
++    }
++  };
++
++public:
++#endif
++
+   /* Call parse_args_internal - which does all the work
+    * Then, validate the parsed arguments
+    * This variant is used mainly for testing
+    * @throws std::runtime_error in case of any invalid argument
+    */
+-  void parse_args(const std::vector<std::string> &arguments) {
++  void parse_args(const std::vector<std::string> &arguments
++#ifdef ARGPARSE_DIFF_CAPTURE
++                  ,
++                  const char *diff_file = __builtin_FILE(),
++                  int diff_line = __builtin_LINE()
++#endif
++  ) {
++#ifdef ARGPARSE_DIFF_CAPTURE
++    DiffCallGuard diff_guard(*this, arguments, diff_file, diff_line, false);
++#endif
+     parse_args_internal(arguments);
+     // Check if all arguments are parsed
+     for ([[maybe_unused]] const auto &[unused, argument] : m_argument_map) {
+@@ -1894,12 +2362,24 @@
+    * @throws std::runtime_error in case of any invalid argument
+    */
+   std::vector<std::string>
+-  parse_known_args(const std::vector<std::string> &arguments) {
++  parse_known_args(const std::vector<std::string> &arguments
++#ifdef ARGPARSE_DIFF_CAPTURE
++                   ,
++                   const char *diff_file = __builtin_FILE(),
++                   int diff_line = __builtin_LINE()
++#endif
++  ) {
++#ifdef ARGPARSE_DIFF_CAPTURE
++    DiffCallGuard diff_guard(*this, arguments, diff_file, diff_line, true);
++#endif
+     auto unknown_arguments = parse_known_args_internal(arguments);
+     // Check if all arguments are parsed
+     for ([[maybe_unused]] const auto &[unused, argument] : m_argument_map) {
+       argument->validate();
+     }
++#ifdef ARGPARSE_DIFF_CAPTURE
++    diff_guard.set_unknown(unknown_arguments);
++#endif
+     return unknown_arguments;
+   }
+ 
+@@ -1908,8 +2388,19 @@
+    * @throws std::runtime_error in case of any invalid argument
+    */
+   // NOLINTNEXTLINE(cppcoreguidelines-avoid-c-arrays)
+-  void parse_args(int argc, const char *const argv[]) {
+-    parse_args({argv, argv + argc});
++  void parse_args(int argc, const char *const argv[]
++#ifdef ARGPARSE_DIFF_CAPTURE
++                  ,
++                  const char *diff_file = __builtin_FILE(),
++                  int diff_line = __builtin_LINE()
++#endif
++  ) {
++    parse_args({argv, argv + argc}
++#ifdef ARGPARSE_DIFF_CAPTURE
++               ,
++               diff_file, diff_line
++#endif
++    );
+   }
+ 
+   /* Main entry point for parsing command-line arguments using this
+@@ -1917,8 +2408,19 @@
+    * @throws std::runtime_error in case of any invalid argument
+    */
+   // NOLINTNEXTLINE(cppcoreguidelines-avoid-c-arrays)
+-  auto parse_known_args(int argc, const char *const argv[]) {
+-    return parse_known_args({argv, argv + argc});
++  auto parse_known_args(int argc, const char *const argv[]
++#ifdef ARGPARSE_DIFF_CAPTURE
++                        ,
++                        const char *diff_file = __builtin_FILE(),
++                        int diff_line = __builtin_LINE()
++#endif
++  ) {
++    return parse_known_args({argv, argv + argc}
++#ifdef ARGPARSE_DIFF_CAPTURE
++                            ,
++                            diff_file, diff_line
++#endif
++    );
+   }
+ 
+   /* Getter for options with default values.

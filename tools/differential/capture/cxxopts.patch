@@ -1,0 +1,209 @@
+--- a/include/cxxopts.hpp
++++ b/include/cxxopts.hpp
+@@ -43,6 +43,12 @@
+ #include <vector>
+ #include <algorithm>
+ #include <locale>
++
++#ifdef CXXOPTS_DIFF_CAPTURE
++#include <fstream>
++#include <cstdio>
++#include <typeinfo>
++#endif
+ 
+ #ifdef CXXOPTS_NO_EXCEPTIONS
+ #include <iostream>
+@@ -411,6 +417,14 @@
+ 
+   virtual bool
+   is_boolean() const = 0;
++
++#ifdef CXXOPTS_DIFF_CAPTURE
++  virtual std::string
++  diff_type_id() const
++  {
++    return {};
++  }
++#endif
+ };
+ 
+ CXXOPTS_DIAGNOSTIC_POP
+@@ -1263,6 +1277,14 @@
+     return std::is_same<T, bool>::value;
+   }
+ 
++#ifdef CXXOPTS_DIFF_CAPTURE
++  std::string
++  diff_type_id() const override
++  {
++    return typeid(T).name();
++  }
++#endif
++
+   const T&
+   get() const
+   {
+@@ -2062,6 +2084,10 @@
+   {
+     return m_program;
+   }
++
++#ifdef CXXOPTS_DIFF_CAPTURE
++  std::string diff_schema() const;
++#endif
+ 
+   private:
+ 
+@@ -2504,15 +2530,151 @@
+ Options::parse_positional(std::initializer_list<std::string> options)
+ {
+   parse_positional(std::vector<std::string>(options));
++}
++
++#ifdef CXXOPTS_DIFF_CAPTURE
++namespace diff {
++
++inline std::string
++esc(const std::string& s)
++{
++  std::string out;
++  out.reserve(s.size() + 8);
++  for (unsigned char c : s)
++  {
++    switch (c)
++    {
++      case '"': out += "\\\""; break;
++      case '\\': out += "\\\\"; break;
++      case '\n': out += "\\n"; break;
++      case '\r': out += "\\r"; break;
++      case '\t': out += "\\t"; break;
++      default:
++        if (c < 0x20 || c >= 0x7f)
++        {
++          char buf[8];
++          std::snprintf(buf, sizeof(buf), "\\u%04x", c);
++          out += buf;
++        }
++        else
++        {
++          out += static_cast<char>(c);
++        }
++    }
++  }
++  return out;
++}
++
++inline void
++capture(const std::string& schema,
++        const std::vector<std::string>& args,
++        bool ok,
++        const std::string& error)
++{
++  const char* path = std::getenv("CXXOPTS_DIFF_OUT");
++  if (path == nullptr || *path == '\0')
++  {
++    return;
++  }
++  std::ofstream out(path, std::ios::app);
++  out << "{\"schema\":" << schema << ",\"args\":[";
++  bool first = true;
++  for (const auto& arg : args)
++  {
++    if (!first) out << ',';
++    first = false;
++    out << '"' << esc(arg) << '"';
++  }
++  out << "],\"outcome\":\"" << (ok ? "ok" : "error") << "\",\"error\":\""
++      << esc(error) << "\"}\n";
+ }
+ 
++} // namespace diff
++
++inline std::string
++Options::diff_schema() const
++{
++  std::string out = "{\"program\":\"" + diff::esc(m_program) + "\"";
++  out += ",\"allow_unrecognised\":";
++  out += m_allow_unrecognised ? "true" : "false";
++  out += ",\"positional\":[";
++  bool first = true;
++  for (const auto& pos : m_positional)
++  {
++    if (!first) out += ',';
++    first = false;
++    out += '"' + diff::esc(pos) + '"';
++  }
++  out += "],\"options\":[";
++  std::unordered_set<const OptionDetails*> seen;
++  first = true;
++  for (const auto& entry : *m_options)
++  {
++    const auto& detail = *entry.second;
++    if (!seen.insert(entry.second.get()).second)
++    {
++      continue;
++    }
++    if (!first) out += ',';
++    first = false;
++    out += "{\"short\":\"" + diff::esc(detail.short_name()) + "\"";
++    out += ",\"long\":[";
++    bool first_long = true;
++    for (const auto& name : detail.long_names())
++    {
++      if (!first_long) out += ',';
++      first_long = false;
++      out += '"' + diff::esc(name) + '"';
++    }
++    out += "]";
++    out += ",\"desc\":\"" + diff::esc(detail.description()) + "\"";
++    const auto& value = detail.value();
++    out += ",\"is_boolean\":";
++    out += value.is_boolean() ? "true" : "false";
++    out += ",\"is_container\":";
++    out += value.is_container() ? "true" : "false";
++    out += ",\"has_default\":";
++    out += value.has_default() ? "true" : "false";
++    out += ",\"default\":\"" + diff::esc(value.get_default_value()) + "\"";
++    out += ",\"has_implicit\":";
++    out += value.has_implicit() ? "true" : "false";
++    out += ",\"implicit\":\"" + diff::esc(value.get_implicit_value()) + "\"";
++    out += ",\"type_id\":\"" + diff::esc(value.diff_type_id()) + "\"}";
++  }
++  out += "]}";
++  return out;
++}
++#endif
++
+ inline
+ ParseResult
+ Options::parse(int argc, const char* const* argv)
+ {
++#ifdef CXXOPTS_DIFF_CAPTURE
++  std::vector<std::string> diff_args;
++  for (int i = 1; i < argc; ++i)
++  {
++    diff_args.emplace_back(argv[i] == nullptr ? "" : argv[i]);
++  }
++  const std::string diff_schema_json = diff_schema();
++#endif
+   OptionParser parser(*m_options, m_positional, m_allow_unrecognised);
+ 
+-  return parser.parse(argc, argv);
++  try
++  {
++    auto result = parser.parse(argc, argv);
++#ifdef CXXOPTS_DIFF_CAPTURE
++    diff::capture(diff_schema_json, diff_args, true, {});
++#endif
++    return result;
++  }
++  catch (const std::exception& e)
++  {
++#ifdef CXXOPTS_DIFF_CAPTURE
++    diff::capture(diff_schema_json, diff_args, false, e.what());
++#endif
++    throw;
++  }
+ }
+ 
+ inline ParseResult
