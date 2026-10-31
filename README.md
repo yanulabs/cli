@@ -530,7 +530,7 @@ ctest --test-dir build-diff -R differential_upstream --output-on-failure
 
 `tools/differential/` replays every parse call captured from the complete
 CLI11 v2.7.2, argparse v3.2, and cxxopts v3.3.1 test suites — 1,575, 565, and
-40 records respectively. Each replay reconstructs the upstream schema and feeds
+46 records respectively. Each replay reconstructs the upstream schema and feeds
 the identical argument vector to `cli.hpp`. Accept/reject parity is checked for
 all three suites; for CLI11, successful cases with no unsupported-feature tag
 also compare every parsed option, positional, and flag value (215 of 269

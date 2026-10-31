@@ -7,7 +7,7 @@ the upstream test suites of three other C++ command-line parsers:
 |----------|----------|-----------------|------------|--------------------|----------------------|
 | CLI11    | `v2.7.2` | 1,575           | 1,575      | 484                | 0                    |
 | argparse | `v3.2`   | 565             | 565        | 96                 | 0                    |
-| cxxopts  | `v3.3.1` | 40              | 40         | 0                  | 0                    |
+| cxxopts  | `v3.3.1` | 46              | 46         | 0                  | 0                    |
 
 The counts above are from the checked-in corpora and are reproduced by the
 driver.  "Untagged divergences" must be zero; the driver fails otherwise.

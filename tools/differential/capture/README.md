@@ -15,7 +15,7 @@ parse writes one JSON line containing:
 |---------|-----|--------|--------|
 | CLI11 | `v2.7.2` | `cbd58a3696887b34c70949aef21a71735a0c2ad5` | `cli11_all.jsonl.gz` (1,575 records) |
 | argparse | `v3.2` | `3eda91b2e1ce7d569f84ba295507c4cd8fd96910` | `argparse_all.jsonl.gz` (565 records) |
-| cxxopts | `v3.3.1` | `44380e5a44706ab7347f400698c703eb2a196202` | `cxxopts_all.jsonl.gz` (40 records) |
+| cxxopts | `v3.3.1` | `44380e5a44706ab7347f400698c703eb2a196202` | `cxxopts_all.jsonl.gz` (46 records) |
 
 The upstream commits were shallow clones of the tags above.  The full upstream
 test suites were used; no source files were skipped from capture.
@@ -106,6 +106,12 @@ gzip -9 -c cxxopts_all.jsonl  > corpus/cxxopts_all.jsonl.gz
   `env_value_hex`) because the replay has to recreate them; unrelated ambient
   environment state is not part of the corpus.
 - argparse and cxxopts capture schemas and outcomes, not parsed values.
+- cxxopts must be built with C++17 (as in the command above) so the
+  `std::optional` and `std::filesystem::path` test cases guarded by
+  `CXXOPTS_HAS_OPTIONAL` and `CXXOPTS_HAS_FILESYSTEM` are compiled in.  A
+  C++11/14 build silently omits six parse calls from the capture.  The
+  checked-in corpus contains all 46 `Options::parse` calls in
+  `test/options.cpp`, which is the only test source that performs parses.
 
 ## License
 
