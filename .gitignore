@@ -10,6 +10,7 @@ install_manifest.txt
 CTestTestfile.cmake
 *.cmake
 !cmake/cliConfig.cmake.in
+!tests/check_exit.cmake
 
 # Compiled binaries
 *.o

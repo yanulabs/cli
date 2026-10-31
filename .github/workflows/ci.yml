@@ -269,18 +269,16 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
-      - name: Install Clang 19 and libc++
+      - name: Install Clang 19
         run: |
           wget -q https://apt.llvm.org/llvm.sh
           chmod +x llvm.sh
           sudo ./llvm.sh 19
-          sudo apt-get install -y libc++-19-dev libc++abi-19-dev
       - name: Configure
         run: >
           cmake -S . -B build
           -DCMAKE_BUILD_TYPE=RelWithDebInfo
           -DCMAKE_CXX_COMPILER=clang++-19
-          -DCMAKE_CXX_FLAGS="-stdlib=libc++"
           -DCLI_BUILD_EXAMPLES=OFF
           -DCLI_BUILD_TESTS=ON
           -DCLI_BUILD_FUZZERS=ON
