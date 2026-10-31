@@ -1494,5 +1494,6 @@ lines.append('}')
 open(OUT, 'w').write('\n'.join(lines))
 print(f"value comparisons {coverage['compared']} / {coverage['cases']} "
       f"untagged successful cases, {coverage['fields']} fields; "
-      f"skipped {coverage['skipped']} field(s) without a builtin mapping")
+      f"skipped {coverage['skipped']} field(s) without a builtin mapping; "
+      f"{coverage['cases'] - coverage['compared']} case(s) had no parsed values")
 print('wrote', OUT)
