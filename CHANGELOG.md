@@ -77,7 +77,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `tool sub --version` works
 - **Default validation** — defaults are checked against `range()`,
   `choices()`, and custom validators
-- **Domain-scoped test suite** — 555 test cases across 19 doctest suites
+- **Domain-scoped test suite** — 556 test cases across 19 doctest suites
   (`api`, `completion`, `constraints`, `custom_types`, `environment`,
   `errors`, `extensions`, `flags`, `groups`, `help`, `lifecycle`, `lookup`,
   `options`, `positionals`, `robustness`, `subcommands`, `tokens`,
@@ -87,6 +87,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   CLI11 (BSD-3-Clause), cxxopts (MIT), and argparse (MIT) cover `--`
   handling, negative-number grammar, arbitrary option names, values that
   look like options, empty tokens, subcommand extras, and config sections
+- **Upstream differential replay harness** (`CLI_BUILD_DIFFERENTIAL_TESTS=ON`)
+  — replays every parse call captured from the full CLI11 v2.7.2,
+  argparse v3.2, and cxxopts v3.3.1 test suites; compares accept/reject
+  outcomes, and for CLI11 also compares parsed option and positional values.
+  Untagged divergences or hard-blocked schemas fail the run; feature tags
+  document the upstream semantics outside the supported subset.  Corpora,
+  capture patches, and rebuild instructions live under `tools/differential/`
+- **CLI11-compatible `char` parsing** — a single-character literal binds
+  directly, while longer input is converted as an integer (`77` → `'M'`,
+  `0x44` → `'D'`)
 - **Process-level `parse_or_exit()` tests** — separate driver verifies help,
   version, error exit codes, nested help/version scoping, and callback
   dispatch without terminating the unit-test process

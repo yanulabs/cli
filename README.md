@@ -49,6 +49,7 @@
 | **Reusable App** | `parse()` resets automatically; `app.reset()` is available explicitly |
 | **Initializer parse** | `app.parse({"-v", "--jobs", "8"})` — no argc/argv needed |
 | **Vector parse** | `app.parse(std::vector<std::string>{...})` |
+| **Differential verification** | Replays the full upstream CLI11, argparse, and cxxopts test corpora, including parsed values for supported CLI11 options |
 
 ---
 
@@ -518,7 +519,39 @@ cmake --build build-compare --target bench_compare
 cmake -S . -B build-fuzz -DCLI_BUILD_EXAMPLES=OFF -DCLI_BUILD_FUZZERS=ON
 cmake --build build-fuzz --target fuzz_parse
 ./build-fuzz/tests/fuzz_parse tests/fuzz_corpus -max_len=4096 -runs=200000
+
+# Upstream differential replays (opt-in; needs Python 3 and GCC/Clang)
+cmake -S . -B build-diff -DCLI_BUILD_DIFFERENTIAL_TESTS=ON
+cmake --build build-diff -j
+ctest --test-dir build-diff -R differential_upstream --output-on-failure
 ```
+
+### Upstream differential testing
+
+`tools/differential/` replays every parse call captured from the complete
+CLI11 v2.7.2, argparse v3.2, and cxxopts v3.3.1 test suites — 1,575, 565, and
+40 records respectively. Each replay reconstructs the upstream schema and feeds
+the identical argument vector to `cli.hpp`. Accept/reject parity is checked for
+all three suites; for CLI11, successful cases with no unsupported-feature tag
+also compare every parsed option, positional, and flag value (215 of 269
+successful untagged cases and 296 fields on the checked-in corpora, with no
+skipped field lacking a builtin mapping).
+
+The driver fails on any untagged divergence, parsed-value mismatch, or schema
+that cannot be replayed. Tagged divergences name semantics outside the supported
+subset (config files, custom converters, help rendering, exotic containers, and
+so on); they are expected and are not counted as parser mismatches. The checked
+corpora currently produce zero untagged divergences and zero hard blocks.
+
+```bash
+python3 tools/differential/run.py --cxx clang++
+python3 tools/differential/run.py --suite cli11 --cxx clang++ --strict
+```
+
+The scope, tag glossary, capture provenance, rebuild commands, and limitations
+are documented in [`tools/differential/README.md`](tools/differential/README.md).
+This is differential testing against captured upstream behaviour, not a claim
+of full upstream feature parity.
 
 Tests are split by domain (`flags`, `options`, `positionals`, `values`,
 `tokens`, `upstream_edge_cases`, `constraints`, `groups`, `environment`,
