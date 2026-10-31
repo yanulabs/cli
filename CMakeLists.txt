@@ -12,6 +12,9 @@ project(
 option(CLI_BUILD_EXAMPLES "Build example programs"   ON)
 option(CLI_BUILD_TESTS    "Build the test suite"     ON)
 option(CLI_BUILD_FUZZERS  "Build libFuzzer targets"  OFF)
+option(CLI_BUILD_DIFFERENTIAL_TESTS
+    "Register upstream differential replay tests (needs Python 3)"
+    OFF)
 option(CLI_BUILD_BENCHMARKS "Build throughput benchmarks" OFF)
 option(CLI_BUILD_COMPARATIVE_BENCHMARKS
     "Build head-to-head benchmarks against CLI11 and cxxopts" OFF)

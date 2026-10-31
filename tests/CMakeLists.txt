@@ -119,6 +119,27 @@ set_tests_properties(cli_exit_ancestor_callback PROPERTIES
     FAIL_REGULAR_EXPRESSION "root-callback"
 )
 
+# Upstream differential replays are opt-in: they need Python 3 and compile
+# generated sources at test time, so a normal build stays fast and offline.
+if(CLI_BUILD_DIFFERENTIAL_TESTS)
+    if(MSVC)
+        message(FATAL_ERROR
+            "CLI_BUILD_DIFFERENTIAL_TESTS requires a GCC- or Clang-style compiler")
+    endif()
+    find_package(Python3 REQUIRED COMPONENTS Interpreter)
+    add_test(NAME differential_upstream
+        COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/../tools/differential/run.py
+            --cxx ${CMAKE_CXX_COMPILER}
+            --include ${CMAKE_CURRENT_SOURCE_DIR}/../include
+            --out-dir ${CMAKE_CURRENT_BINARY_DIR}/differential
+    )
+    set_tests_properties(differential_upstream PROPERTIES
+        LABELS   "differential"
+        TIMEOUT  1800
+    )
+endif()
+
 # libFuzzer is a Clang feature; keep it opt-in so normal builds stay portable.
 if(CLI_BUILD_FUZZERS)
     if(NOT CMAKE_CXX_COMPILER_ID MATCHES "Clang")

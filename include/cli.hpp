@@ -386,6 +386,7 @@ consteval std::string_view type_meta() noexcept {
     if constexpr (std::is_same_v<U, std::string>)                return "TEXT";
     else if constexpr (std::is_same_v<U, std::filesystem::path>) return "PATH";
     else if constexpr (std::is_same_v<U, bool>)                  return "BOOL";
+    else if constexpr (std::is_same_v<U, char>)                  return "CHAR";
     else if constexpr (std::is_floating_point_v<U>)              return "FLOAT";
     else if constexpr (std::is_unsigned_v<U>)                    return "UINT";
     else if constexpr (std::is_integral_v<U>)                    return "INT";
@@ -436,6 +437,21 @@ template<typename T>
             ascii_iequals(sv, "f")     || ascii_iequals(sv, "n"))   return false;
         return std::unexpected(
             std::format("'{}' is not a valid boolean — use true/false/t/f/1/0/yes/no/y/n/on/off", sv));
+
+    } else if constexpr (std::is_same_v<T, char>) {
+        // CLI11 semantics: a single character is taken literally; longer
+        // inputs are converted as integers ("77" -> 'M', "0x44" -> 'D').
+        if (sv.size() == 1)
+            return sv.front();
+        auto parsed = from_string<long long>(sv);
+        if (!parsed)
+            return std::unexpected(std::format("'{}' is not a valid character", sv));
+        // Match CLI11: wider input is converted through std::int8_t, so the
+        // accepted range does not depend on whether plain char is signed.
+        if (*parsed < static_cast<long long>(std::numeric_limits<std::int8_t>::min()) ||
+            *parsed > static_cast<long long>(std::numeric_limits<std::int8_t>::max()))
+            return std::unexpected(std::format("'{}' overflows target character type", sv));
+        return static_cast<char>(static_cast<std::int8_t>(*parsed));
 
     } else if constexpr (std::is_integral_v<T>) {
         if (sv.empty())

@@ -714,4 +714,23 @@ TEST_CASE("CLI11: child option shadows parent option of same name") {
     CHECK(*p_opt == "parent");
 }
 
+TEST_CASE("CLI11: char option takes a single character literally") {
+    cli::App app("t");
+    auto value = app.add<char>("-c");
+    REQUIRE(app.parse({"-c", "g"}));
+    CHECK(*value == 'g');
+    REQUIRE(app.parse({"-c", "1"}));
+    CHECK(*value == '1');
+    REQUIRE(app.parse({"-c", "77"}));
+    CHECK(*value == static_cast<char>(77));
+    REQUIRE(app.parse({"-c", "0x44"}));
+    CHECK(*value == static_cast<char>(0x44));
+    REQUIRE(app.parse({"-c", "-128"}));
+    CHECK(*value == static_cast<char>(-128));
+    CHECK(!app.parse({"-c", "128"}));
+    CHECK(!app.parse({"-c", "255"}));
+    auto res = app.parse({"-c", "751615654161688126132138844896646748852"});
+    CHECK(!res);
+}
+
 } // TEST_SUITE
