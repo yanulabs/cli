@@ -2837,38 +2837,190 @@ public:
             }
             return escaped;
         };
+        auto command_path = [](const App& app) {
+            std::string path;
+            for (const App* node = &app; node->parent_ != nullptr; node = node->parent_) {
+                if (!path.empty()) path.insert(0, 1, ' ');
+                path.insert(0, node->name_);
+            }
+            return path;
+        };
+        auto options_for = [&](const App& app) {
+            std::string words;
+            for (const auto& visible : app.visible_options()) {
+                const auto* opt = visible.option;
+                if (opt->hidden_) continue;
+                for (const auto& n : visible.names) words += dq_escape(n) + " ";
+                for (const auto& negated : app.completion_negated_spellings(visible))
+                    words += dq_escape(negated) + " ";
+            }
+            if (!app.find_opt_inherited("-h"))      words += "-h ";
+            if (!app.find_opt_inherited("--help"))  words += "--help ";
+            if (!app.effective_version().empty()) {
+                if (!app.find_opt_inherited("-V"))        words += "-V ";
+                if (!app.find_opt_inherited("--version")) words += "--version ";
+            }
+            return words;
+        };
+        auto subcommands_for = [&](const App& app) {
+            std::string words;
+            for (const auto& s : app.subcommands_) {
+                if (s->hidden_) continue;
+                words += dq_escape(s->name_) + " ";
+                for (const auto& a : s->aliases_) words += dq_escape(a) + " ";
+            }
+            return words;
+        };
+
+        const bool completion_tree = parent_ == nullptr && !subcommands_.empty();
+        std::vector<const App*> nodes;
+        if (completion_tree) {
+            auto collect = [&](auto&& self, const App& node) -> void {
+                nodes.push_back(&node);
+                for (const auto& sub : node.subcommands_)
+                    if (!sub->hidden_) self(self, *sub);
+            };
+            collect(collect, *this);
+        }
 
         std::string comment = name_;
         for (auto& c : comment)
             if (std::iscntrl(static_cast<unsigned char>(c))) c = ' ';
 
         out << "# Bash completion for " << comment << "\n";
+        if (completion_tree) {
+            const auto info_fn = "_" + fn + "_option_info";
+            out << info_fn << "() {\n"
+                   "    local key=\"$1|$2\" used=\"$3\"\n"
+                   "    opt_kind=-1\n"
+                   "    skip_min=0\n"
+                   "    skip_max=0\n"
+                   "    case \"$key\" in\n";
+            auto shell_arity = [](std::size_t n) {
+                constexpr auto max = static_cast<std::size_t>(
+                    std::numeric_limits<long long>::max());
+                return n > max ? max : n;
+            };
+            for (const auto* node : nodes) {
+                const auto path = command_path(*node);
+                for (const auto& visible : node->visible_options()) {
+                    const auto& opt = *visible.option;
+                    const int kind = opt.is_flag_ ? 0 : 1;
+                    const auto min = opt.is_flag_ ? 0
+                        : opt.nargs_min_ == 0 ? 1 : shell_arity(opt.nargs_min_);
+                    const auto max = opt.is_flag_ ? 0
+                        : opt.nargs_max_ == 0 ? 1
+                        : opt.nargs_max_ == static_cast<std::size_t>(-1) ? -1L
+                        : static_cast<long long>(shell_arity(opt.nargs_max_));
+                    for (const auto& name : visible.names) {
+                        out << "        " << shell_word(path + "|" + std::string(name))
+                            << ") opt_kind=" << kind << "; skip_min=" << min
+                            << "; skip_max=" << max << " ;;\n";
+                    }
+                }
+            }
+            out << "    esac\n"
+                   "    if ((opt_kind == 1 && used)); then\n"
+                   "        if ((skip_min > 0)); then ((skip_min--)); fi\n"
+                   "        if ((skip_max > 0)); then ((skip_max--)); fi\n"
+                   "    fi\n"
+                   "}\n\n";
+        }
+
         out << "_" << fn << "() {\n"
                "    local cur prev opts subs\n"
                "    cur=\"${COMP_WORDS[COMP_CWORD]}\"\n"
                "    opts=\"";
-        for (const auto& visible : visible_options()) {
-            const auto* opt = visible.option;
-            if (opt->hidden_) continue;
-            for (const auto& n : visible.names) out << dq_escape(n) << " ";
-            if (negated_spelling_visible(visible))
-                out << dq_escape("--no-" + std::string(visible.long_name().substr(2)))
-                    << " ";
-        }
-        if (!find_opt_inherited("-h"))      out << "-h ";
-        if (!find_opt_inherited("--help"))  out << "--help ";
-        if (!effective_version().empty()) {
-            if (!find_opt_inherited("-V"))        out << "-V ";
-            if (!find_opt_inherited("--version")) out << "--version ";
-        }
+        out << options_for(*this);
         out << "\"\n    subs=\"";
-        for (const auto& s : subcommands_) {
-            if (s->hidden_) continue;
-            out << dq_escape(s->name_) << " ";
-            for (const auto& a : s->aliases_) out << dq_escape(a) << " ";
+        out << subcommands_for(*this);
+        out << "\"\n";
+
+        if (completion_tree) {
+            out << "    local path word name inline ch j i found opt_kind skip_min skip_max\n"
+                   "    local negative_number='^-([0-9]+(\\.[0-9]*)?|\\.[0-9]+)([eE][+-]?[0-9]+)?$|^-0[xX][0-9a-fA-F]+$|^-0[bB][01]+$'\n"
+                   "    path=\"\"\n"
+                   "    skip_min=0\n"
+                   "    skip_max=0\n"
+                   "    for ((i=1; i<COMP_CWORD; i++)); do\n"
+                   "        word=\"${COMP_WORDS[i]}\"\n"
+                   "        if ((skip_max != 0)); then\n"
+                   "            if ((skip_min == 0)) && [[ $word != - && $word == -* && ! $word =~ $negative_number ]]; then\n"
+                   "                skip_min=0\n"
+                   "                skip_max=0\n"
+                   "            else\n"
+                   "                if ((skip_min > 0)); then ((skip_min--)); fi\n"
+                   "                if ((skip_max > 0)); then ((skip_max--)); fi\n"
+                   "                continue\n"
+                   "            fi\n"
+                   "        fi\n"
+                   "        if [[ \"$word\" == \"--\" ]]; then break; fi\n"
+                   "        name=\"$word\"\n"
+                   "        inline=0\n"
+                   "        if [[ $name == -*=* ]]; then name=\"${name%%=*}\"; inline=1; fi\n"
+                   "        _" << fn << "_option_info \"$path\" \"$name\" \"$inline\"\n"
+                   "        if ((opt_kind >= 0)); then\n"
+                   "            if ((inline == 0)) && ((i+1 < COMP_CWORD)) && [[ ${COMP_WORDS[i+1]} == = ]]; then\n"
+                   "                ((i++))\n"
+                   "                if ((i+1 < COMP_CWORD)); then ((i++)); fi\n"
+                   "                _" << fn << "_option_info \"$path\" \"$name\" 1\n"
+                   "            fi\n"
+                   "            continue\n"
+                   "        fi\n"
+                   "        if [[ $word == -?* && $word != --* ]]; then\n"
+                   "            found=0\n"
+                   "            for ((j=1; j<${#word}; j++)); do\n"
+                   "                ch=\"-${word:j:1}\"\n"
+                   "                _" << fn << "_option_info \"$path\" \"$ch\" 0\n"
+                   "                if ((opt_kind < 0)); then break; fi\n"
+                   "                if ((opt_kind == 1)); then\n"
+                   "                    found=1\n"
+                   "                    inline=0\n"
+                   "                    if ((j+1 < ${#word})); then\n"
+                   "                        inline=1\n"
+                   "                    elif ((i+1 < COMP_CWORD)) && [[ ${COMP_WORDS[i+1]} == = ]]; then\n"
+                   "                        inline=1\n"
+                   "                        ((i++))\n"
+                   "                        if ((i+1 < COMP_CWORD)); then ((i++)); fi\n"
+                   "                    fi\n"
+                   "                    _" << fn << "_option_info \"$path\" \"$ch\" \"$inline\"\n"
+                   "                    break\n"
+                   "                fi\n"
+                   "            done\n"
+                   "            if ((found)); then continue; fi\n"
+                   "            if ((opt_kind == 0)) && ((i+1 < COMP_CWORD)) && [[ ${COMP_WORDS[i+1]} == = ]]; then\n"
+                   "                ((i++))\n"
+                   "                if ((i+1 < COMP_CWORD)); then ((i++)); fi\n"
+                   "                continue\n"
+                   "            fi\n"
+                   "        fi\n"
+                   "        case \"$path|$word\" in\n";
+            for (const auto* node : nodes) {
+                if (node->parent_ == nullptr) continue;
+                const auto parent_path = command_path(*node->parent_);
+                for (const auto& spelling : node->aliases_) {
+                    const auto pattern = parent_path.empty()
+                        ? "|" + spelling : parent_path + "|" + spelling;
+                    out << "            " << shell_word(pattern) << ") path="
+                        << shell_word(command_path(*node)) << " ;;\n";
+                }
+                const auto pattern = parent_path.empty()
+                    ? "|" + node->name_ : parent_path + "|" + node->name_;
+                out << "            " << shell_word(pattern) << ") path="
+                    << shell_word(command_path(*node)) << " ;;\n";
+            }
+            out << "        esac\n"
+                   "    done\n"
+                   "    case \"$path\" in\n";
+            for (const auto* node : nodes) {
+                out << "        " << shell_word(command_path(*node)) << ") opts=\""
+                    << options_for(*node) << "\"; subs=\"" << subcommands_for(*node)
+                    << "\" ;;\n";
+            }
+            out << "    esac\n";
         }
-        out << "\"\n"
-               "    COMPREPLY=($(compgen -W \"${opts} ${subs}\" -- \"${cur}\"))\n"
+
+        out << "    COMPREPLY=($(compgen -W \"${opts} ${subs}\" -- \"${cur}\"))\n"
                "}\n"
                "complete -F _" << fn << " " << shell_word(name_) << "\n";
     }
@@ -2877,8 +3029,11 @@ public:
         auto fish_esc = [](std::string_view s) {
             std::string r;
             r.reserve(s.size());
-            for (char c : s)
-                r += (c == '\'') ? "'\"'\"'" : std::string(1, c);
+            for (char c : s) {
+                if (c == '\\') r += "\\\\";
+                else if (c == '\'') r += "'\"'\"'";
+                else r += c;
+            }
             return r;
         };
         auto fish_word = [&](std::string_view s) {
@@ -2890,73 +3045,298 @@ public:
             if (safe) return std::string(s);
             return std::string("'") + fish_esc(s) + "'";
         };
-
-        for (const auto& visible : visible_options()) {
-            const auto* opt = visible.option;
-            if (opt->hidden_) continue;
-            const auto sn = visible.short_name();
-            const auto ln = visible.long_name();
-            if (sn.empty() && ln.empty()) continue;
-            out << "complete -c " << fish_word(name_);
-            if (!sn.empty()) {
-                // Fish distinguishes classic one-letter shorts (-v) from
-                // old-style single-dash long options (-verbose).
-                if (sn.size() == 2) out << " -s " << fish_word(sn.substr(1));
-                else                out << " -o " << fish_word(sn.substr(1));
+        auto append_condition = [&](std::string_view condition) {
+            if (!condition.empty()) out << " -n '" << fish_esc(condition) << "'";
+        };
+        auto sanitize = [](std::string s) {
+            for (auto& c : s)
+                if (!std::isalnum(static_cast<unsigned char>(c))) c = '_';
+            return s;
+        };
+        auto command_path = [](const App& app) {
+            std::string path;
+            for (const App* node = &app; node->parent_ != nullptr; node = node->parent_) {
+                if (!path.empty()) path.insert(0, 1, ' ');
+                path.insert(0, node->name_);
             }
-            if (!ln.empty()) out << " -l " << fish_word(ln.substr(2));
-            if (opt->is_flag_) out << " -f";
-            else               out << " -r";
-            if (!opt->choices_str().empty() && !opt->is_count_option()) {
-                std::string choices;
-                for (char c : opt->choices_str()) {
-                    if (c == '|') choices += ' ';
-                    else if (c != '"') choices += c;
+            return path;
+        };
+        const bool completion_tree = parent_ == nullptr && !subcommands_.empty();
+        const auto context_fn = "__" + sanitize(name_) + "_command_context";
+        const auto info_fn = "__" + sanitize(name_) + "_option_info";
+        auto command_condition = [&](const App& app) {
+            return "test (" + context_fn + ") = " + fish_word(command_path(app));
+        };
+        auto root_condition = [&]() {
+            return "test (" + context_fn + ") = -";
+        };
+        const std::string command_name = name_;
+
+        if (completion_tree) {
+            std::vector<const App*> nodes;
+            auto collect = [&](auto&& self, const App& node) -> void {
+                nodes.push_back(&node);
+                for (const auto& sub : node.subcommands_)
+                    if (!sub->hidden_) self(self, *sub);
+            };
+            collect(collect, *this);
+
+            out << "function " << info_fn << "\n"
+                   "    switch \"$argv[1]|$argv[2]\"\n";
+            auto shell_arity = [](std::size_t n) {
+                constexpr auto max = static_cast<std::size_t>(
+                    std::numeric_limits<long long>::max());
+                return n > max ? max : n;
+            };
+            for (const auto* node : nodes) {
+                const auto path = command_path(*node);
+                for (const auto& visible : node->visible_options()) {
+                    const auto& opt = *visible.option;
+                    const int kind = opt.is_flag_ ? 0 : 1;
+                    const auto min = opt.is_flag_ ? 0
+                        : opt.nargs_min_ == 0 ? 1 : shell_arity(opt.nargs_min_);
+                    const auto max = opt.is_flag_ ? 0
+                        : opt.nargs_max_ == 0 ? 1
+                        : opt.nargs_max_ == static_cast<std::size_t>(-1) ? -1L
+                        : static_cast<long long>(shell_arity(opt.nargs_max_));
+                    for (const auto& name : visible.names) {
+                        out << "        case " << fish_word(path + "|" + std::string(name))
+                            << "\n            printf '%s\\n' " << kind << ' ' << min << ' ' << max
+                            << "\n";
+                    }
                 }
-                out << " -a '" << fish_esc(choices) << "'";
             }
-            if (!opt->help_text.empty())
-                out << " -d '" << fish_esc(opt->help_text) << "'";
-            out << "\n";
+            out << "        case '*'\n"
+                   "            printf '%s\\n' -1 0 0\n"
+                   "    end\n"
+                   "end\n\n";
 
-            if (negated_spelling_visible(visible)) {
-                out << "complete -c " << fish_word(name_) << " -l "
-                    << fish_word("no-" + std::string(ln.substr(2))) << " -f";
-                out << " -d 'Disable --" << fish_esc(ln.substr(2)) << "'\n";
+            out << "function " << context_fn << "\n"
+                   "    set -l tokens (commandline -opc)\n"
+                   "    set -l path ''\n"
+                   "    set -l i 2\n"
+                   "    set -l skip_min 0\n"
+                   "    set -l skip_max 0\n"
+                   "    set -l negative_number '^-([0-9]+(\\.[0-9]*)?|\\.[0-9]+)([eE][+-]?[0-9]+)?$|^-0[xX][0-9a-fA-F]+$|^-0[bB][01]+$'\n"
+                   "    while test $i -le (count $tokens)\n"
+                   "        set -l word $tokens[$i]\n"
+                   "        if test $skip_max -ne 0\n"
+                   "            set -l boundary 0\n"
+                   "            if test $skip_min -eq 0; and test \"$word\" != -; and string match -qr '^-' -- $word\n"
+                   "                if not string match -qr \"$negative_number\" -- $word\n"
+                   "                    set boundary 1\n"
+                   "                end\n"
+                   "            end\n"
+                   "            if test $boundary -eq 1\n"
+                   "                set skip_min 0\n"
+                   "                set skip_max 0\n"
+                   "            else\n"
+                   "                if test $skip_min -gt 0\n"
+                   "                    set skip_min (math $skip_min - 1)\n"
+                   "                end\n"
+                   "                if test $skip_max -gt 0\n"
+                   "                    set skip_max (math $skip_max - 1)\n"
+                   "                end\n"
+                   "                set i (math $i + 1)\n"
+                   "                continue\n"
+                   "            end\n"
+                   "        end\n"
+                   "        if test \"$word\" = --\n"
+                   "            break\n"
+                   "        end\n"
+                   "        set -l name $word\n"
+                   "        set -l inline 0\n"
+                   "        if string match -qr '^-.*=' -- $word\n"
+                   "            set name (string replace -r '=.*$' '' -- $word)\n"
+                   "            set inline 1\n"
+                   "        end\n"
+                   "        set -l info (" << info_fn << " \"$path\" \"$name\")\n"
+                   "        set -l kind $info[1]\n"
+                   "        if test $kind -ge 0\n"
+                   "            set skip_min $info[2]\n"
+                   "            set skip_max $info[3]\n"
+                   "            if test $inline -eq 1\n"
+                   "                if test $skip_min -gt 0\n"
+                   "                    set skip_min (math $skip_min - 1)\n"
+                   "                end\n"
+                   "                if test $skip_max -gt 0\n"
+                   "                    set skip_max (math $skip_max - 1)\n"
+                   "                end\n"
+                   "            end\n"
+                   "            set i (math $i + 1)\n"
+                   "            continue\n"
+                   "        end\n"
+                   "        if string match -qr '^-[^-].+' -- $word\n"
+                   "            set -l j 2\n"
+                   "            set -l found 0\n"
+                   "            while test $j -le (string length -- \"$word\")\n"
+                   "                set -l char (string sub -s $j -l 1 -- \"$word\")\n"
+                   "                set -l ch \"-$char\"\n"
+                   "                set info (" << info_fn << " \"$path\" \"$ch\")\n"
+                   "                set kind $info[1]\n"
+                   "                if test $kind -lt 0\n"
+                   "                    break\n"
+                   "                end\n"
+                   "                if test $kind -eq 1\n"
+                   "                    set found 1\n"
+                   "                    set inline 0\n"
+                   "                    if test $j -lt (string length -- \"$word\")\n"
+                   "                        set inline 1\n"
+                   "                    end\n"
+                   "                    set info (" << info_fn << " \"$path\" \"$ch\")\n"
+                   "                    set skip_min $info[2]\n"
+                   "                    set skip_max $info[3]\n"
+                   "                    if test $inline -eq 1\n"
+                   "                        if test $skip_min -gt 0\n"
+                   "                            set skip_min (math $skip_min - 1)\n"
+                   "                        end\n"
+                   "                        if test $skip_max -gt 0\n"
+                   "                            set skip_max (math $skip_max - 1)\n"
+                   "                        end\n"
+                   "                    end\n"
+                   "                    break\n"
+                   "                end\n"
+                   "                set j (math $j + 1)\n"
+                   "            end\n"
+                   "            if test $found -eq 1\n"
+                   "                set i (math $i + 1)\n"
+                   "                continue\n"
+                   "            end\n"
+                   "        end\n"
+                   "        switch \"$path|$word\"\n";
+            for (const auto* node : nodes) {
+                if (node->parent_ == nullptr) continue;
+                const auto parent_path = command_path(*node->parent_);
+                for (const auto& spelling : node->aliases_) {
+                    const auto pattern = parent_path.empty()
+                        ? "|" + spelling : parent_path + "|" + spelling;
+                    out << "            case " << fish_word(pattern) << "\n"
+                           "                set path " << fish_word(command_path(*node)) << "\n";
+                }
+                const auto pattern = parent_path.empty()
+                    ? "|" + node->name_ : parent_path + "|" + node->name_;
+                out << "            case " << fish_word(pattern) << "\n"
+                       "                set path " << fish_word(command_path(*node)) << "\n";
             }
-        }
-        if (!find_opt_inherited("-h"))
-            out << "complete -c " << fish_word(name_) << " -s h -f -d 'Print help'\n";
-        if (!find_opt_inherited("--help"))
-            out << "complete -c " << fish_word(name_) << " -l help -f -d 'Print help'\n";
-        if (!effective_version().empty()) {
-            if (!find_opt_inherited("-V"))
-                out << "complete -c " << fish_word(name_) << " -s V -f -d 'Print version'\n";
-            if (!find_opt_inherited("--version"))
-                out << "complete -c " << fish_word(name_) << " -l version -f -d 'Print version'\n";
+            out << "        end\n"
+                   "        set i (math $i + 1)\n"
+                   "    end\n"
+                   "    if test -z \"$path\"\n"
+                   "        printf '%s' -\n"
+                   "    else\n"
+                   "        printf '%s' \"$path\"\n"
+                   "    end\n"
+                   "end\n\n";
         }
 
-        for (const auto& s : subcommands_) {
-            if (s->hidden_) continue;
-            out << "complete -c " << fish_word(name_) << " -f -a '"
-                << fish_esc(s->name_) << "'";
-            if (!s->desc_.empty()) out << " -d '" << fish_esc(s->desc_) << "'";
-            out << "\n";
-            for (const auto& a : s->aliases_) {
-                out << "complete -c " << fish_word(name_) << " -f -a '"
-                    << fish_esc(a) << "'";
-                if (!s->desc_.empty())
-                    out << " -d '" << fish_esc(s->desc_) << " (→ "
-                        << fish_esc(s->name_) << ")'";
+        auto emit_node = [&](auto&& self, const App& node,
+                             const std::string& condition) -> void {
+            auto emit_metadata = [&](const detail::OptionBase& opt) {
+                if (opt.is_flag_) out << " -f";
+                else               out << " -r";
+                if (!opt.choices_str().empty() && !opt.is_count_option()) {
+                    std::string choices;
+                    for (char c : opt.choices_str()) {
+                        if (c == '|') choices += ' ';
+                        else if (c != '"') choices += c;
+                    }
+                    out << " -a '" << fish_esc(choices) << "'";
+                }
+                if (!opt.help_text.empty())
+                    out << " -d '" << fish_esc(opt.help_text) << "'";
+                append_condition(condition);
+                out << "\n";
+            };
+            for (const auto& visible : node.visible_options()) {
+                const auto* opt = visible.option;
+                if (opt->hidden_) continue;
+                const auto sn = visible.short_name();
+                const auto ln = visible.long_name();
+                if (sn.empty() && ln.empty()) continue;
+                out << "complete -c " << fish_word(command_name);
+                if (!sn.empty()) {
+                    // Fish distinguishes classic one-letter shorts (-v) from
+                    // old-style single-dash long options (-verbose).
+                    if (sn.size() == 2) out << " -s " << fish_word(sn.substr(1));
+                    else                out << " -o " << fish_word(sn.substr(1));
+                }
+                if (!ln.empty()) out << " -l " << fish_word(ln.substr(2));
+                emit_metadata(*opt);
+
+                // Fish completion entries have one primary short/long pair;
+                // emit additional option aliases as equivalent entries.
+                for (const auto& alias : visible.names) {
+                    if (alias == sn || alias == ln) continue;
+                    out << "complete -c " << fish_word(command_name);
+                    if (alias.starts_with("--"))
+                        out << " -l " << fish_word(alias.substr(2));
+                    else if (alias.size() == 2)
+                        out << " -s " << fish_word(alias.substr(1));
+                    else
+                        out << " -o " << fish_word(alias.substr(1));
+                    emit_metadata(*opt);
+                }
+
+                for (const auto& negated : node.completion_negated_spellings(visible)) {
+                    out << "complete -c " << fish_word(command_name) << " -l "
+                        << fish_word(negated.substr(2)) << " -f";
+                    out << " -d 'Disable --" << fish_esc(negated.substr(5)) << "'";
+                    append_condition(condition);
+                    out << "\n";
+                }
+            }
+            if (!node.find_opt_inherited("-h")) {
+                out << "complete -c " << fish_word(command_name)
+                    << " -s h -f -d 'Print help'";
+                append_condition(condition);
                 out << "\n";
             }
-        }
+            if (!node.find_opt_inherited("--help")) {
+                out << "complete -c " << fish_word(command_name)
+                    << " -l help -f -d 'Print help'";
+                append_condition(condition);
+                out << "\n";
+            }
+            if (!node.effective_version().empty()) {
+                if (!node.find_opt_inherited("-V")) {
+                    out << "complete -c " << fish_word(command_name)
+                        << " -s V -f -d 'Print version'";
+                    append_condition(condition);
+                    out << "\n";
+                }
+                if (!node.find_opt_inherited("--version")) {
+                    out << "complete -c " << fish_word(command_name)
+                        << " -l version -f -d 'Print version'";
+                    append_condition(condition);
+                    out << "\n";
+                }
+            }
+
+            for (const auto& s : node.subcommands_) {
+                if (s->hidden_) continue;
+                out << "complete -c " << fish_word(command_name) << " -f -a '"
+                    << fish_esc(s->name_) << "'";
+                if (!s->desc_.empty()) out << " -d '" << fish_esc(s->desc_) << "'";
+                append_condition(condition);
+                out << "\n";
+                for (const auto& a : s->aliases_) {
+                    out << "complete -c " << fish_word(command_name) << " -f -a '"
+                        << fish_esc(a) << "'";
+                    if (!s->desc_.empty())
+                        out << " -d '" << fish_esc(s->desc_) << " (→ "
+                            << fish_esc(s->name_) << ")'";
+                    append_condition(condition);
+                    out << "\n";
+                }
+                if (completion_tree)
+                    self(self, *s, command_condition(*s));
+            }
+        };
+
+        emit_node(emit_node, *this, completion_tree ? root_condition() : std::string{});
     }
 
     void zsh_completion(std::ostream& out = std::cout) const {
-        auto fn = name_;
-        for (auto& c : fn) if (!std::isalnum(static_cast<unsigned char>(c))) c = '_';
-
         auto zsh_esc = [](std::string_view s) {
             std::string r;
             r.reserve(s.size());
@@ -2967,22 +3347,42 @@ public:
             }
             return r;
         };
+        auto zsh_opt_esc = [](std::string_view s) {
+            std::string r;
+            r.reserve(s.size());
+            for (char c : s) {
+                if (c == '\\') r += "\\\\";
+                else if (c == '\'') r += "'\\''";
+                else if (c == '[' || c == ']' || c == ':') { r += '\\'; r += c; }
+                else r += c;
+            }
+            return r;
+        };
+        auto sanitize = [](std::string s) {
+            for (auto& c : s)
+                if (!std::isalnum(static_cast<unsigned char>(c))) c = '_';
+            return s;
+        };
+        std::vector<const App*> nodes;
+        auto collect_nodes = [&](auto&& self, const App& node) -> void {
+            nodes.push_back(&node);
+            for (const auto& sub : node.subcommands_)
+                if (!sub->hidden_) self(self, *sub);
+        };
+        collect_nodes(collect_nodes, *this);
+        std::unordered_map<const App*, std::size_t> ordinals;
+        for (std::size_t i = 0; i < nodes.size(); ++i) ordinals.emplace(nodes[i], i + 1);
 
-        std::string compdef_name = name_;
-        for (auto& c : compdef_name)
-            if (std::iscntrl(static_cast<unsigned char>(c))) c = '_';
-
-        out << "#compdef " << compdef_name << "\n\n";
-        out << "_" << fn << "() {\n";
-
-        if (!subcommands_.empty()) {
-            out << "    local context state state_descr line\n";
-            out << "    typeset -A opt_args\n\n";
-        }
-
-        out << "    local -a args\n";
-        out << "    args=(\n";
-
+        auto function_name = [&](const App& app) {
+            std::string fn = "_" + sanitize(name_);
+            std::vector<std::string> parts;
+            for (const App* node = &app; node != this; node = node->parent_)
+                parts.push_back(node->name_);
+            for (auto it = parts.rbegin(); it != parts.rend(); ++it)
+                fn += "_" + sanitize(*it);
+            if (&app != this) fn += "_" + std::to_string(ordinals.at(&app));
+            return fn;
+        };
         auto choice_action = [&zsh_esc](const detail::OptionBase& opt) {
             if (opt.is_flag_ || opt.is_count_option()) return std::string{};
             const auto choices = opt.choices_str();
@@ -2995,81 +3395,115 @@ public:
             action += ')';
             return zsh_esc(action);
         };
+        auto emit_spec = [&](const App& app, const detail::VisibleOption& visible) {
+            const auto& opt = *visible.option;
+            if (visible.names.empty()) return;
 
-        auto emit_spec = [&](const detail::VisibleOption& visible) {
-            const auto& opt    = *visible.option;
-            const auto  sn     = visible.short_name();
-            const auto  ln     = visible.long_name();
-            if (sn.empty() && ln.empty()) return;
-            const auto sn_esc = zsh_esc(sn);
-            const auto ln_esc = zsh_esc(ln);
-
-            std::string spec;
-            if (opt.is_multi()) spec += '*';
-            if (!sn.empty() && !ln.empty()) {
-                spec += "'(" + sn_esc + " " + ln_esc + ")'{"
-                        + sn_esc + "," + ln_esc + "}";
-                spec += "'";
-            } else {
-                spec += "'" + (ln.empty() ? sn_esc : ln_esc);
+            std::string exclusions;
+            if (visible.names.size() > 1
+                && std::ranges::none_of(visible.names, [](std::string_view name) {
+                       return name.find('(') != std::string_view::npos
+                           || name.find(')') != std::string_view::npos;
+                   })) {
+                exclusions = "(";
+                for (std::size_t i = 0; i < visible.names.size(); ++i) {
+                    if (i != 0) exclusions += ' ';
+                    exclusions += zsh_opt_esc(visible.names[i]);
+                }
+                exclusions += ")";
             }
+            std::string suffix;
             if (!opt.help_text.empty())
-                spec += "[" + zsh_esc(opt.help_text) + "]";
-            spec += "'";
+                suffix += "[" + zsh_esc(opt.help_text) + "]";
             if (!opt.is_flag_) {
                 const auto meta = opt.meta.empty() ? std::string("value") : zsh_esc(opt.meta);
                 auto action = choice_action(opt);
                 if (action.empty()) action = "_default";
-                spec += ":" + meta + ":" + action;
+                suffix += ":" + meta + ":" + action;
             }
-            out << "        " << spec << "\n";
+            for (const auto& name : visible.names) {
+                out << "        '";
+                if (opt.is_multi()) out << "*";
+                out << exclusions << zsh_opt_esc(name) << suffix << "'\n";
+            }
 
-            if (negated_spelling_visible(visible)) {
-                out << "        '--no-" << zsh_esc(ln.substr(2)) << "[Disable --"
-                    << zsh_esc(ln.substr(2)) << "]'\n";
+            for (const auto& negated : app.completion_negated_spellings(visible)) {
+                const auto positive = std::string_view(negated).substr(5);
+                out << "        '--no-" << zsh_opt_esc(positive)
+                    << "[Disable --" << zsh_opt_esc(positive) << "]'\n";
             }
         };
 
-        for (const auto& visible : visible_options()) {
-            if (visible.option->hidden_) continue;
-            emit_spec(visible);
-        }
-        if (!find_opt_inherited("-h") && !find_opt_inherited("--help")) {
-            out << "        '(-h --help)'{-h,--help}'[Print help]'\n";
-        } else {
-            if (!find_opt_inherited("-h"))     out << "        '-h[Print help]'\n";
-            if (!find_opt_inherited("--help")) out << "        '--help[Print help]'\n";
-        }
-        if (!effective_version().empty()) {
-            if (!find_opt_inherited("-V") && !find_opt_inherited("--version")) {
-                out << "        '(-V --version)'{-V,--version}'[Print version]'\n";
-            } else {
-                if (!find_opt_inherited("-V"))        out << "        '-V[Print version]'\n";
-                if (!find_opt_inherited("--version")) out << "        '--version[Print version]'\n";
+        auto emit_function = [&](auto&& self, const App& app,
+                                 const std::string& fn) -> void {
+            out << fn << "() {\n";
+            if (!app.subcommands_.empty()) {
+                out << "    local context state state_descr line\n";
+                out << "    typeset -A opt_args\n\n";
             }
-        }
-        out << "    )\n\n";
-
-        if (!subcommands_.empty()) {
-            out << "    local -a subcmds\n";
-            out << "    subcmds=(\n";
-            for (const auto& s : subcommands_) {
-                if (s->hidden_) continue;
-                out << "        '" << zsh_esc(s->name_) << ":" << zsh_esc(s->desc_) << "'\n";
-                for (const auto& a : s->aliases_)
-                    out << "        '" << zsh_esc(a) << ":" << zsh_esc(s->desc_) << " (alias)'\n";
+            out << "    local -a args\n";
+            out << "    args=(\n";
+            for (const auto& visible : app.visible_options()) {
+                if (!visible.option->hidden_) emit_spec(app, visible);
+            }
+            if (!app.find_opt_inherited("-h") && !app.find_opt_inherited("--help")) {
+                out << "        '(-h --help)'{-h,--help}'[Print help]'\n";
+            } else {
+                if (!app.find_opt_inherited("-h"))     out << "        '-h[Print help]'\n";
+                if (!app.find_opt_inherited("--help")) out << "        '--help[Print help]'\n";
+            }
+            if (!app.effective_version().empty()) {
+                if (!app.find_opt_inherited("-V") && !app.find_opt_inherited("--version")) {
+                    out << "        '(-V --version)'{-V,--version}'[Print version]'\n";
+                } else {
+                    if (!app.find_opt_inherited("-V"))        out << "        '-V[Print version]'\n";
+                    if (!app.find_opt_inherited("--version")) out << "        '--version[Print version]'\n";
+                }
             }
             out << "    )\n\n";
-            out << "    _arguments -C $args[@] ':command:->command'\n";
-            out << "    case $state in\n";
-            out << "        command) _describe 'commands' subcmds ;;\n";
-            out << "    esac\n";
-        } else {
-            out << "    _arguments $args[@]\n";
-        }
 
-        out << "}\n\n";
-        out << "_" << fn << "\n";
+            if (!app.subcommands_.empty()) {
+                out << "    local -a subcmds\n";
+                out << "    subcmds=(\n";
+                for (const auto& s : app.subcommands_) {
+                    if (s->hidden_) continue;
+                    out << "        '" << zsh_esc(s->name_) << ":" << zsh_esc(s->desc_) << "'\n";
+                    for (const auto& a : s->aliases_)
+                        out << "        '" << zsh_esc(a) << ":" << zsh_esc(s->desc_) << " (alias)'\n";
+                }
+                out << "    )\n\n";
+                out << "    _arguments -C \"${args[@]}\" ':command:->command' '*::arg:->args'\n";
+                out << "    case $state in\n";
+                out << "        command) _describe 'commands' subcmds ;;\n";
+                out << "        args)\n";
+                out << "            case $line[1] in\n";
+                for (const auto& s : app.subcommands_) {
+                    if (s->hidden_) continue;
+                    out << "                '" << zsh_esc(s->name_) << "'";
+                    for (const auto& alias : s->aliases_)
+                        out << "|'" << zsh_esc(alias) << "'";
+                    out << ") " << function_name(*s) << " ;;\n";
+                }
+                out << "            esac\n";
+                out << "            ;;\n";
+                out << "    esac\n";
+            } else {
+                out << "    _arguments \"${args[@]}\"\n";
+            }
+            out << "}\n\n";
+
+            for (const auto& sub : app.subcommands_)
+                if (!sub->hidden_) self(self, *sub, function_name(*sub));
+        };
+
+        std::string compdef_name = name_;
+        for (auto& c : compdef_name)
+            if (std::iscntrl(static_cast<unsigned char>(c))) c = '_';
+
+        out << "#compdef " << compdef_name << "\n\n";
+        const auto root_fn = function_name(*this);
+        emit_function(emit_function, *this, root_fn);
+        out << root_fn << "\n";
     }
 
 private:
@@ -3967,6 +4401,22 @@ private:
         negated.reserve(ln.size() + 3);
         negated.append("--no-").append(ln.substr(2));
         return find_opt_inherited(negated) == nullptr;
+    }
+
+    /// Every negated long spelling the parser accepts for this visible flag.
+    /// Aliases participate independently, while an exact registered spelling
+    /// always wins over generated negation.
+    [[nodiscard]] std::vector<std::string> completion_negated_spellings(
+        const detail::VisibleOption& visible) const {
+        std::vector<std::string> out;
+        if (!visible.option->negatable_) return out;
+        for (const auto& name : visible.names) {
+            if (!name.starts_with("--")) continue;
+            std::string negated = "--no-";
+            negated.append(name.substr(2));
+            if (find_opt_inherited(negated) == nullptr) out.push_back(std::move(negated));
+        }
+        return out;
     }
 
     void render_option_list(std::string& out) const {

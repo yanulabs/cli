@@ -501,7 +501,7 @@ int main(int argc, char** argv) {
     const auto owned_nested = to_owned(nested_args);
 
     std::cout << std::format("head-to-head parse benchmark — {} iterations\n", iterations);
-    std::cout << std::format("cli.hpp 1.0.0 | CLI11 {} | cxxopts {}.{}.{}\n\n",
+    std::cout << std::format("cli.hpp 1.2.0 | CLI11 {} | cxxopts {}.{}.{}\n\n",
                              CLI11_VERSION, cxxopts::version.major,
                              cxxopts::version.minor, cxxopts::version.patch);
     std::cout << std::format("{:<24} {:>11} {:>11} {:>11}\n",

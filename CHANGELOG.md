@@ -21,6 +21,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `-h`/`--help`/`-V`/`--version` correctly suppresses the corresponding
   built-in rows; shadowing is name-by-name, so a local `-v` hides only the
   inherited `-v` while `--verbose` remains available
+- **Context-aware root completions** — Bash, Fish, and Zsh scripts switch to
+  each subcommand's option set, including nested commands, command aliases,
+  and option aliases; Bash/Fish command tracking skips option values using
+  the declared arity
 - **INI config files** — `config_file(path, required)` and `config_option()`
   load root and `[command.path]` sections, quoted values, arrays, and
   negatable flags; section headers may be quoted or use TOML `[[section]]`
@@ -77,7 +81,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `tool sub --version` works
 - **Default validation** — defaults are checked against `range()`,
   `choices()`, and custom validators
-- **Domain-scoped test suite** — 574 test cases across 19 doctest suites
+- **Domain-scoped test suite** — 582 test cases across 19 doctest suites
   (`api`, `completion`, `constraints`, `custom_types`, `environment`,
   `errors`, `extensions`, `flags`, `groups`, `help`, `lifecycle`, `lookup`,
   `options`, `positionals`, `robustness`, `subcommands`, `tokens`,
@@ -209,6 +213,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (`[default: , two]`, `[|auto]`) instead of silently dropping them
 
 ### Changed
+- Package metadata now reports version 1.2.0, matching the latest changelog;
+  FetchContent tracks `main` until a real release tag or commit SHA is chosen
 - Failed parses now leave the invocation tree reset instead of exposing partial
   values, defaults, extras, config data, or active-command state; exceptions from
   validators/transforms roll back before propagating

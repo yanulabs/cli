@@ -36,7 +36,7 @@
 | **Subcommands** | Recursive, each with their own option set; inherited version |
 | **Rich help** | ANSI-colored, auto-aligned, section-structured; `help_text()` returns a string |
 | **Suggestions** | Levenshtein "did you mean?" on unknown options (incl. `--no-X` variants) |
-| **Completions** | Bash, Fish (with subcommand aliases), and Zsh generators |
+| **Completions** | Bash, Fish, and Zsh generators with nested subcommand context and aliases |
 | **Count options** | `add_count("--verbose")` counts `-v -v -v` occurrences; `[count]` shown in help |
 | **Required flags/counts** | `.required()` works on options, flags, counts, and positionals |
 | **Transforms** | `.transform(fn)` applies a post-parse value transformation |
@@ -101,7 +101,7 @@ include(FetchContent)
 FetchContent_Declare(
     cli
     GIT_REPOSITORY https://github.com/yanujz/cli.git
-    GIT_TAG        v1.0.0
+    GIT_TAG        main  # replace with a release tag or commit SHA
 )
 FetchContent_MakeAvailable(cli)
 
@@ -495,6 +495,9 @@ app.print_help(std::cerr);           // write to any ostream
 
 ```cpp
 app.zsh_completion(std::cout);  // writes #compdef-style function
+// Root-generated Bash/Fish/Zsh scripts switch option sets after subcommands,
+// including nested commands and aliases. Bash/Fish context scanners skip
+// option values according to the declared option arity.
 // Usage: eval "$(mytool --shell zsh)"
 ```
 
