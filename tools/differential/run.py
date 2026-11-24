@@ -13,9 +13,9 @@ The checked-in corpora were captured from:
   cxxopts  v3.3.1
   argparse v3.2
 
-Accept/reject parity is checked for every replayable capture.  CLI11 captures
-also record option results, so successful untagged cases are checked for
-parsed-value equality as well (value mismatches use direction 2).
+Accept/reject parity is checked for every replayable capture.  CLI11 and cxxopts
+capture parsed values, so successful untagged cases are checked for parsed-value
+equality as well (value mismatches use direction 2).
 """
 from __future__ import annotations
 
@@ -44,8 +44,8 @@ SUITES = {
     },
     'cxxopts': {
         'generator': 'generate_cxxopts.py',
-        'tag_field': 2,
-        'direction_field': None,
+        'tag_field': 3,
+        'direction_field': 2,
     },
 }
 
@@ -127,8 +127,6 @@ def run_suite(name, spec, args, out_dir):
     for line in generated.stdout.splitlines():
         if line.startswith('value comparisons '):
             print(f'  {line}')
-    if name != 'cli11':
-        print('  parsed values: not captured by this corpus; accept/reject only')
     blocked = parse_generator_output(generated.stdout)
     if blocked:
         print(f'{name}: {blocked} capture record(s) could not be replayed', file=sys.stderr)

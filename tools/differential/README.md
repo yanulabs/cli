@@ -20,26 +20,34 @@ same parser schema and the exact same argument vector.  Two checks are made:
 1. **Accept/reject parity** for all suites.  A mismatch is reported as
    direction `+1` when `cli.hpp` accepts an input the upstream library rejects,
    and `-1` when `cli.hpp` rejects an input the upstream library accepts.
-2. **Parsed values** for CLI11.  CLI11 captures record each option's
-   `results()` and `count()`.  Successful, untagged cases compare the value
+2. **Parsed values** for CLI11 and cxxopts.  CLI11 captures each option's raw
+   `results()` and `count()`; cxxopts captures typed scalar/vector values for
+   explicitly parsed options.  Successful, untagged cases compare the value
    `cli.hpp` stored for every builtin-convertible option, positional, and flag.
    A parsed-value mismatch is reported as direction `+2`.
 
-Value comparison derives the expected value from the upstream raw result:
-strings are compared as strings, integral results through `strtoll`/`strtoull`
-with base 0, floating results through `strtold`, chars through CLI11's
-single-character-or-integer rule, and flags through `as<bool>()` after applying
-CLI11's `to_flag_value` rules.  Floating comparisons treat NaN equal to NaN.
+CLI11 expected values come from upstream raw results: strings are compared as
+strings, integral results through `strtoll`/`strtoull` with base 0, floating
+results through `strtold`, chars through CLI11's single-character-or-integer
+rule, and flags through `as<bool>()` after applying CLI11's `to_flag_value`
+rules.  cxxopts expected values use the additive typed `parsed_values` envelope.
+Floating comparisons treat NaN equal to NaN.
 
 At the time of writing, CLI11 value comparison covers **215 of 269 untagged
-successful cases and 296 parsed fields**; no field was skipped for lack of a
-builtin mapping, and the remaining successful cases have no parsed option
-values to compare.  The generator prints the live coverage and skip count on
-every run.  If an upstream option is not builtin-convertible, or its result
-count does not match the translated shape, its value is not compared and the
-skip is counted; the case is still checked for accept/reject parity.
+successful cases and 296 parsed fields**.  cxxopts covers **11 of 14 untagged
+successful cases and 20 parsed fields**.  No captured field was skipped for lack
+of a builtin mapping, and the remaining successful cases have no parsed option
+values to compare.  Each generator prints live coverage and skip counts on every
+run.  If an upstream value is not builtin-convertible, or its shape does not
+match the translated handle, its value is not compared and the skip is counted;
+the case is still checked for accept/reject parity.
 
 Error messages, help text, exit codes, and side effects are not compared.
+
+The cxxopts corpus adds an optional `parsed_values` array without changing its
+schema or outcome fields.  Each entry carries a canonical option name, explicit
+parse count, and typed scalar/vector value.  Generators treat corpora without the
+field as accept/reject-only, so older captures remain replayable.
 
 ## Usage
 
@@ -223,8 +231,8 @@ reproducible.  Generated replay sources are not checked in.
 
 ## Known limitations
 
-- Only CLI11 captures parsed values.  argparse and cxxopts are checked for
-  accept/reject parity only.
+- Only argparse captures schemas and outcomes without parsed values; CLI11 and
+  cxxopts also compare values for supported, untagged successful cases.
 - Values are compared only for cases with no tags, a successful upstream
   outcome, builtin-convertible element types, and a translated result shape.
 - Tags are feature-based.  They identify semantics outside the supported

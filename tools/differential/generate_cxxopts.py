@@ -8,6 +8,8 @@ import re
 import sys
 from collections import Counter
 
+from diff_values import CPP_VALUE_HELPERS, typed_comparison
+
 TOOL_DIR = os.path.dirname(os.path.abspath(__file__))
 
 
@@ -201,11 +203,107 @@ def tags_for_case(r):
     return tags
 
 
+def canonical_name(o):
+    names = o.get('long') or []
+    return names[0] if names else o.get('short', '')
+
+
+def parsed_value_map(r):
+    return {entry['option']: entry for entry in r.get('parsed_values', [])}
+
+
+def option_check(r, o, positional=False):
+    if r.get('tags') or r['outcome'] != 'ok':
+        return None
+    entry = parsed_value_map(r).get(canonical_name(o))
+    if entry is None:
+        return None
+    cpp, is_vec, _ = resolve_type(o)
+    if cpp is None:
+        return None
+    flag_lookup = 'app' if (not positional and cpp == 'bool'
+                            and o.get('is_boolean') and o.get('has_implicit')) else None
+    check = typed_comparison(cpp, is_vec, entry['value'], canonical_name(o), flag_lookup)
+    if check is not None and flag_lookup is not None:
+        check['name'] = option_names(o)[0]
+    return check
+
+
+def expected_expr(check):
+    expected = check['expected']
+    if isinstance(expected, tuple) and expected[0] == 'string_literal':
+        return cpp_str(expected[1])
+    if isinstance(expected, tuple) and expected[0] == 'vector':
+        items = []
+        for item in expected[1]:
+            if isinstance(item, tuple) and item[0] == 'string_literal':
+                items.append(cpp_str(item[1]))
+            else:
+                items.append(item)
+        return f'std::vector<{check["cpp"]}>{{' + ', '.join(items) + '}'
+    return expected
+
+
+def emit_value_checks(checks, lines):
+    for check in checks:
+        label = cpp_str(check['label'])
+        expected = expected_expr(check)
+        if check['kind'] == 'flag':
+            actual = f'{check["lookup"]}[{cpp_str(check["name"])}].as<bool>()'
+            lines.append(f'    if (ok && {actual} != {expected}) {{')
+            lines.append('        value_ok = false;')
+            lines.append(f'        std::printf("VALUE\\t%s\\t%s\\t%s\\n", {label}, '
+                         f'{expected} ? "true" : "false", {actual} ? "true" : "false");')
+            lines.append('    }')
+            continue
+        handle = check['handle']
+        lines.append(f'    if (ok && !{handle}) {{')
+        lines.append('        value_ok = false;')
+        lines.append(f'        std::printf("VALUE\\t%s\\t%s\\t<unset>\\n", {label}, '
+                     f'diff_repr({expected}).c_str());')
+        lines.append('    }')
+        lines.append(f'    else if (ok && !diff_eq({handle}.value(), {expected})) {{')
+        lines.append('        value_ok = false;')
+        lines.append(f'        std::printf("VALUE\\t%s\\t%s\\t%s\\n", {label}, '
+                     f'diff_repr({expected}).c_str(), diff_repr({handle}.value()).c_str());')
+        lines.append('    }')
+    return lines
+
+
+def count_value_coverage(valid):
+    stats = Counter()
+    for r in valid:
+        if r['tags'] or r['outcome'] != 'ok':
+            continue
+        stats['cases'] += 1
+        has_check = False
+        entries = r.get('parsed_values') or []
+        if not entries:
+            stats['no_values'] += 1
+        for entry in entries:
+            o = option_by_name(r['schema'], entry['option'])
+            if o is None:
+                stats['skipped'] += 1
+                continue
+            check = option_check(r, o, entry['option'] in r['schema']['positional'])
+            if check is None:
+                stats['skipped'] += 1
+            else:
+                stats['fields'] += 1
+                has_check = True
+        if has_check:
+            stats['compared'] += 1
+    return stats
+
+
 def emit_case(r):
     schema = r['schema']
-    lines = []
-    lines.append('    cli::App app("app");')
+    lines = ['    cli::App app("app");']
     emitted = set()
+    checks = []
+    counter = [0]
+    compare = not r['tags'] and r['outcome'] == 'ok'
+    positional_names = set(schema['positional'])
     for o in schema['options']:
         cpp, is_vec, tags = resolve_type(o)
         if cpp is None:
@@ -223,7 +321,17 @@ def emit_case(r):
             expr += f'.alias({cpp_str(n)})'
         if is_vec and not o.get('is_boolean'):
             expr += ".delimiter(',')"
-        lines.append(f'    (void){expr};')
+        check = None
+        if compare and canonical_name(o) not in positional_names:
+            check = option_check(r, o)
+        if check is not None:
+            handle = f'opt_{counter[0]}'
+            counter[0] += 1
+            check['handle'] = handle
+            checks.append(check)
+            lines.append(f'    auto {handle} = {expr};')
+        else:
+            lines.append(f'    (void){expr};')
         emitted.add(id(o))
     for pos in schema['positional']:
         o = option_by_name(schema, pos)
@@ -234,15 +342,31 @@ def emit_case(r):
             continue
         typ = f'std::vector<{cpp}>' if is_vec else cpp
         expr = f'app.add_positional<{typ}>({cpp_str(pos)}).required(false)'
-        lines.append(f'    (void){expr};')
+        check = option_check(r, o, positional=True) if compare else None
+        if check is not None:
+            handle = f'opt_{counter[0]}'
+            counter[0] += 1
+            check['handle'] = handle
+            checks.append(check)
+            lines.append(f'    auto {handle} = {expr};')
+        else:
+            lines.append(f'    (void){expr};')
     if schema.get('allow_unrecognised'):
         lines.append('    app.allow_extras();')
     elif not schema['positional'] and all(a == '--' or not a.startswith('-') for a in r['args']):
         lines.append('    app.allow_extras();')
+    body = lines
+    lines = ['    bool ok = false;', '    bool value_ok = true;', '    try {']
+    lines += ['    ' + line for line in body]
     arglist = ', '.join(cpp_string_expr(x) for x in r['args_b'])
-    lines.append(f'    auto res = app.parse(std::vector<std::string>{{{arglist}}});')
+    lines.append(f'        auto res = app.parse(std::vector<std::string>{{{arglist}}});')
+    lines.append('        ok = res.has_value();')
+    for line in emit_value_checks(checks, []):
+        lines.append('    ' + line)
+    lines.append('    } catch (const std::exception&) { ok = false; }')
     expected = 'true' if r['outcome'] == 'ok' else 'false'
-    lines.append(f'    return res.has_value() == {expected};')
+    lines.append(f'    if (ok == {expected}) return value_ok ? 0 : 2;')
+    lines.append('    return ok ? 1 : -1;')
     return lines
 
 
@@ -266,23 +390,29 @@ for r in rows:
 print(f'replayable {len(valid)} / {len(rows)}; blocked {sum(blocked.values())}: {dict(blocked)}')
 print('tagged cases:', sum(1 for r in valid if r['tags']), file=sys.stderr)
 
-lines = ['#include <cli.hpp>', '#include <cstdio>', '#include <cstdint>',
-         '#include <string>', '#include <vector>', '']
+lines = ['#include <cli.hpp>', '#include <cmath>', '#include <cstdio>', '#include <cstdint>',
+         '#include <cstdlib>', '#include <sstream>', '#include <string>', '#include <vector>', '']
+lines.append(CPP_VALUE_HELPERS)
 for i, r in enumerate(valid):
-    lines.append(f'static bool case_{i}() {{')
+    lines.append(f'static int case_{i}() {{')
     lines.extend(emit_case(r))
     lines.append('}')
     lines.append('')
 lines.append('int main() {')
 lines.append('    int failures = 0;')
 for i, r in enumerate(valid):
-    tags = ','.join(sorted(r['tags']))
+    tags = ','.join(sorted(r['tags'])) or '-'
     args = ' '.join(r['args'])
     lines.append(
-        f'    if (!case_{i}()) {{ std::printf("FAIL\\t{i}\\t%s\\t%s\\t%s\\n", '
-        f'{cpp_str(tags)}, {cpp_str(args)}, {cpp_str(r.get("error", ""))}); ++failures; }}')
+        f'    {{ int d = case_{i}(); if (d != 0) {{ std::printf("FAIL\\t{i}\\t%d\\t%s\\t%s\\t%s\\n", d, '
+        f'{cpp_str(tags)}, {cpp_str(args)}, {cpp_str(r.get("error", ""))}); ++failures; }} }}')
 lines.append(f'    std::printf("SUMMARY\\t%d\\t{len(valid)}\\n", failures);')
 lines.append('    return failures == 0 ? 0 : 1;')
 lines.append('}')
 open(OUT, 'w').write('\n'.join(lines))
+coverage = count_value_coverage(valid)
+print(f"value comparisons {coverage['compared']} / {coverage['cases']} "
+      f"untagged successful cases, {coverage['fields']} fields; "
+      f"skipped {coverage['skipped']} field(s) without a builtin mapping; "
+      f"{coverage['no_values']} case(s) had no parsed values")
 print('wrote', OUT)

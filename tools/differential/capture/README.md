@@ -7,7 +7,7 @@ parse writes one JSON line containing:
 - the exact argument vector (byte-preserving `args_hex` for argparse),
 - the constructed parser schema,
 - the accept/reject outcome and error,
-- for CLI11, the option results and counts (used for parsed-value checks).
+- for CLI11 and cxxopts, parsed option/positional values used for value checks.
 
 ## Versions
 
@@ -76,7 +76,7 @@ ARGPARSE_DIFF_OUT="$PWD/argparse_all.jsonl" \
 git clone --depth 1 --branch v3.3.1 https://github.com/jarro2783/cxxopts.git
 patch -p1 -d cxxopts < capture/cxxopts.patch
 cmake -S cxxopts -B cxxopts-build \
-  -DCMAKE_CXX_STANDARD=17 \
+  -DCXXOPTS_CXX_STANDARD=17 \
   -DCXXOPTS_BUILD_TESTS=ON \
   -DCXXOPTS_BUILD_EXAMPLES=OFF \
   -DCMAKE_CXX_FLAGS=-DCXXOPTS_DIFF_CAPTURE
@@ -105,9 +105,9 @@ gzip -9 -c cxxopts_all.jsonl  > corpus/cxxopts_all.jsonl.gz
 - Environment values read by CLI11 options are recorded (`env_set`,
   `env_value_hex`) because the replay has to recreate them; unrelated ambient
   environment state is not part of the corpus.
-- argparse and cxxopts capture schemas and outcomes, not parsed values.
-- cxxopts must be built with C++17 (as in the command above) so the
-  `std::optional` and `std::filesystem::path` test cases guarded by
+- argparse captures schemas and outcomes, not parsed values.
+- cxxopts must be built with C++17 (`CXXOPTS_CXX_STANDARD=17`, as in the
+  command above) so the `std::optional` and `std::filesystem::path` test cases guarded by
   `CXXOPTS_HAS_OPTIONAL` and `CXXOPTS_HAS_FILESYSTEM` are compiled in.  A
   C++11/14 build silently omits six parse calls from the capture.  The
   checked-in corpus contains all 46 `Options::parse` calls in

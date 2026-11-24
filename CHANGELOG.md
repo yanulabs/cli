@@ -90,7 +90,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Upstream differential replay harness** (`CLI_BUILD_DIFFERENTIAL_TESTS=ON`)
   — replays every parse call captured from the full CLI11 v2.7.2,
   argparse v3.2, and cxxopts v3.3.1 test suites; compares accept/reject
-  outcomes, and for CLI11 also compares parsed option and positional values.
+  outcomes, and for CLI11 and cxxopts also compares parsed option, positional,
+  and flag values.
   Untagged divergences or hard-blocked schemas fail the run; feature tags
   document the upstream semantics outside the supported subset.  Corpora,
   capture patches, and rebuild instructions live under `tools/differential/`;
