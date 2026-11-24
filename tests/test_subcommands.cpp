@@ -764,6 +764,45 @@ TEST_CASE("direct subcommand parsing finalizes inherited globals") {
     CHECK(*jobs == 8);
 }
 
+TEST_CASE("direct subcommand parsing ignores non-global ancestor requirements") {
+    cli::App app("tool");
+    auto token = app.add<std::string>("--token").required();
+    auto mode  = app.add<std::string>("--mode").default_val("root");
+    auto& build = app.subcommand("build", "");
+
+    REQUIRE(build.parse({}));
+    CHECK(!token);
+    CHECK(*mode == "root");
+    CHECK(app.active_subcommand() == &build);
+
+    auto root_missing = app.parse({"build"});
+    REQUIRE(!root_missing);
+    CHECK(root_missing.error().kind == cli::ParseError::Kind::MissingRequired);
+    CHECK(contains(root_missing.error().message, "--token"));
+
+    auto child_unknown = build.parse({"--token", "x"});
+    REQUIRE(!child_unknown);
+    CHECK(child_unknown.error().kind == cli::ParseError::Kind::UnknownOption);
+}
+
+TEST_CASE("direct subcommand parsing enforces only global ancestor groups") {
+    cli::App app("tool");
+    auto verbose = app.add_flag("--verbose").global();
+    auto quiet   = app.add_flag("--quiet").global();
+    (void)verbose;
+    (void)quiet;
+    (void)app.add_flag("--json");
+    (void)app.add_flag("--yaml");
+    app.mutex_group({"--verbose", "--quiet"});
+    app.require_one_of({"--json", "--yaml"});
+    auto& build = app.subcommand("build", "");
+
+    REQUIRE(build.parse({}));
+    auto conflict = build.parse({"--verbose", "--quiet"});
+    REQUIRE(!conflict);
+    CHECK(conflict.error().kind == cli::ParseError::Kind::MutuallyExclusive);
+}
+
 TEST_CASE("parsing a nested subcommand directly finalizes every ancestor") {
     cli::App app("tool");
     auto root_value = app.add<int>("--root").default_val(1).global();

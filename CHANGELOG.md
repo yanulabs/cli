@@ -77,7 +77,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `tool sub --version` works
 - **Default validation** — defaults are checked against `range()`,
   `choices()`, and custom validators
-- **Domain-scoped test suite** — 558 test cases across 19 doctest suites
+- **Domain-scoped test suite** — 567 test cases across 19 doctest suites
   (`api`, `completion`, `constraints`, `custom_types`, `environment`,
   `errors`, `extensions`, `flags`, `groups`, `help`, `lifecycle`, `lookup`,
   `options`, `positionals`, `robustness`, `subcommands`, `tokens`,
@@ -113,6 +113,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `find_package` consumer build
 
 ### Fixed
+- Config arrays preserve element boundaries for delimited vectors, distinguish
+  `[]` from `[""]`, and reject malformed headers, quotes, arrays, and trailing
+  text with `ConfigError`
+- Nested response-file includes resolve relative to the including file, and an
+  empty required config path reports `ConfigError`
+- Positional defaults are checked against `nargs`, and arity mutated through a
+  handle is revalidated before parsing so later positionals remain reachable
+- Direct subcommand parsing applies ancestor environment/config/default
+  fallbacks but only enforces required and group constraints for inherited
+  globals; unreachable non-global ancestor requirements no longer fail
 - The fuzz harness now escapes non-marker `@...` tokens before parsing, so
   adversarial inputs cannot make response-file expansion open arbitrary paths
 - Subcommand benchmarks no longer dereference option handles after a second

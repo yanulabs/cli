@@ -287,9 +287,10 @@ Globals are inherited by every descendant, participate in abbreviation and
 typo suggestions, and appear in child help/completion. Shadowing is
 name-by-name: a child option named `-v` hides only the inherited `-v`, while
 the global `--verbose` spelling remains functional and documented. Parsing a
-subcommand directly (`build.parse(...)`) uses the same inherited globals and
-root config/response-file policy, and finalizes ancestors just as
-`app.parse({"build", ...})` does.
+subcommand directly (`build.parse(...)`) applies ancestor environment, config,
+and default fallbacks, but only inherited globals participate in required and
+group checks; non-global ancestor options and positionals cannot be supplied
+from that entry point and do not make the direct parse fail.
 
 ### Negatable flags
 
@@ -342,7 +343,9 @@ auto all = app.add_positional<std::vector<std::string>>("all").nargs_at_least(1)
 
 Fixed arities may be followed by other positionals. Ranged and at-least
 arities are variable, so they must be registered last; doing otherwise throws
-`std::invalid_argument` at registration time.
+`std::invalid_argument` at registration time. Arity is revalidated before each
+parse, so changing a handle from fixed to variable arity after registration is
+also rejected. Positional defaults must satisfy the configured arity.
 
 ### Config files
 
@@ -362,11 +365,13 @@ target = release
 
 Precedence is **command line > environment > config > default**. Sections map
 to command paths (`[remote.add]` for nested commands), values may be quoted,
-and array syntax `[a, b, "c,d"]` populates vector options and positionals.
-Section headers may be quoted (`["build"]`) or use TOML's double-bracket
-spelling (`[[build]]`); `[default]` configures the root command, and a UTF-8
-BOM at the start of the file is ignored. Missing optional files are ignored;
-`config_file(path, true)` makes them mandatory. Malformed files return
+and array syntax `[a, b, "c,d"]` populates vector options and positionals
+without re-splitting quoted delimiters. `[]` supplies an explicit empty vector,
+while `[""]` supplies one empty element. Section headers may be quoted
+(`["build"]`) or use TOML's double-bracket spelling (`[[build]]`); `[default]`
+configures the root command, and a UTF-8 BOM at the start of the file is
+ignored. Missing optional files are ignored; `config_file(path, true)` makes
+them mandatory. Malformed headers, quotes, arrays, and trailing text return
 `ParseError::Kind::ConfigError`.
 
 ### Response files
@@ -378,8 +383,8 @@ app.response_files();
 
 Files are tokenised with shell-like quoting, support `#` comments and nested
 `@file` references (up to 8 levels), and produce
-`ParseError::Kind::ResponseFileError` on failure. `@@name` escapes a literal
-`@name` token.
+`ParseError::Kind::ResponseFileError` on failure. Nested paths are resolved
+relative to the including file. `@@name` escapes a literal `@name` token.
 
 ### Extra arguments for wrapper tools
 
@@ -570,8 +575,8 @@ reset. On an Apple-silicon laptop (Release, Clang) the suite currently runs at:
 | Scenario | ns/parse | parses/sec |
 |---|---:|---:|
 | 8 short flags | ~130 | ~7.7 M |
-| 6 typed options (12 tokens) | ~225 | ~4.4 M |
-| mixed flags/options/vector/positional | ~225 | ~4.4 M |
+| 6 typed options (12 tokens) | ~228 | ~4.4 M |
+| mixed flags/options/vector/positional | ~227 | ~4.4 M |
 | subcommand + options | ~130 | ~7.7 M |
 | nested subcommand | ~116 | ~8.6 M |
 

@@ -716,6 +716,14 @@ struct OptionBase {
     virtual ~OptionBase() = default;
     virtual ParseResult parse(std::string_view val, std::string_view opt_name, const App* app) = 0;
     virtual ParseResult parse_env(std::string_view val, const App* app) = 0;
+    // Config arrays already carry element boundaries; parse each element
+    // without applying the command-line delimiter a second time.
+    virtual ParseResult parse_config_element(std::string_view val,
+                                             std::string_view opt_name,
+                                             const App* app) {
+        return parse(val, opt_name, app);
+    }
+    virtual void        set_empty_config() {}
     // Fast path for an occurrence with no explicit value (`-v`, `--flag`).
     // Count options override this to increment; bool flags avoid formatting
     // and re-parsing the literal "true" on every token.
@@ -917,6 +925,23 @@ struct OptionImpl final : OptionBase {
         return {};
     }
 
+    ParseResult parse_config_element(std::string_view sv, std::string_view opt,
+                                     const App* app) override {
+        if constexpr (is_vec_v<T>) {
+            if (auto r = parse_one(sv, opt, app); !r) return r;
+            is_set_ = true;
+            return {};
+        }
+        return parse(sv, opt, app);
+    }
+
+    void set_empty_config() override {
+        if constexpr (is_vec_v<T>) {
+            value   = T{};
+            is_set_ = true;
+        }
+    }
+
     ParseResult set_implicit(const App* app) override {
         if constexpr (std::is_same_v<T, bool>) {
             // Fast path only when there is no constraint to check.  A boolean
@@ -1115,6 +1140,11 @@ struct PositionalBase {
     virtual ~PositionalBase() = default;
     virtual ParseResult parse(std::string_view v, const App* app)     = 0;
     virtual ParseResult parse_env(std::string_view v, const App* app) = 0;
+    virtual ParseResult parse_config_element(std::string_view v, const App* app) {
+        return parse(v, app);
+    }
+    virtual void        set_empty_config() {}
+    virtual size_t      value_count() const noexcept = 0;
     virtual ParseResult validate_and_finalize(const App* app)         = 0;
     virtual bool        has_default() const noexcept                  = 0;
     virtual void        apply_default()                               = 0;
@@ -1179,6 +1209,23 @@ struct PositionalImpl final : PositionalBase {
         return {};
     }
 
+    ParseResult parse_config_element(std::string_view sv, const App* app) override {
+        if constexpr (is_vec_v<T>) {
+            if (auto r = parse_one(sv, label, app); !r) return r;
+            is_set_ = true;
+            return {};
+        }
+        return parse(sv, app);
+    }
+
+    void set_empty_config() override {
+        if constexpr (is_vec_v<T>) {
+            value        = T{};
+            parsed_count_ = 0;
+            is_set_      = true;
+        }
+    }
+
     ParseResult parse_env(std::string_view sv, const App* app) override {
         const auto& env_label = env_var;
         if constexpr (is_vec_v<T>) {
@@ -1218,6 +1265,10 @@ struct PositionalImpl final : PositionalBase {
     }
 
     bool has_default() const noexcept override { return default_.has_value(); }
+    size_t value_count() const noexcept override {
+        if constexpr (is_vec_v<T>) return value ? value->size() : 0;
+        else                       return value ? 1 : 0;
+    }
     void apply_default() override {
         if (default_) {
             value = *default_;
@@ -1282,8 +1333,14 @@ private:
 // §5.5  Config data — small INI/TOML-style reader
 // ────────────────────────────────────────────────────────────────────────────
 
+struct ConfigValue {
+    std::string              text;
+    bool                     is_array = false;
+    std::vector<std::string> elements;
+};
+
 struct ConfigData {
-    using Section = std::unordered_map<std::string, std::string, StringHash, std::equal_to<>>;
+    using Section = std::unordered_map<std::string, ConfigValue, StringHash, std::equal_to<>>;
     std::unordered_map<std::string, Section, StringHash, std::equal_to<>> sections;
 };
 
@@ -1295,15 +1352,46 @@ struct ConfigData {
     return s;
 }
 
-inline void strip_matching_quotes(std::string& s) {
-    if (s.size() >= 2 && ((s.front() == '"' && s.back() == '"')
-                          || (s.front() == '\'' && s.back() == '\'')))
-        s = s.substr(1, s.size() - 2);
+[[nodiscard]] inline bool config_quote_starts(std::string_view s, size_t i) noexcept {
+    return i == 0 || std::isspace(static_cast<unsigned char>(s[i - 1])) != 0
+           || s[i - 1] == '=' || s[i - 1] == '[' || s[i - 1] == ',';
+}
+
+[[nodiscard]] inline std::expected<std::string, std::string>
+unquote_config_text(std::string_view raw, std::string_view what) {
+    raw = trim_view(raw);
+    if (raw.empty()) return std::string{};
+    if (raw.front() != '"' && raw.front() != '\'') return std::string(raw);
+
+    const char quote = raw.front();
+    if (raw.size() < 2 || raw.back() != quote)
+        return std::unexpected(std::format("unterminated quoted {}", what));
+
+    std::string out;
+    out.reserve(raw.size() - 2);
+    for (size_t i = 1; i + 1 < raw.size(); ++i) {
+        const char c = raw[i];
+        if (quote == '"' && c == '\\' && i + 2 < raw.size()) {
+            const char next = raw[i + 1];
+            if (next == quote || next == '\\') out += next;
+            else {
+                out += '\\';
+                out += next;
+            }
+            ++i;
+        } else if (c == quote) {
+            return std::unexpected(std::format("trailing text after quoted {}", what));
+        } else {
+            out += c;
+        }
+    }
+    return out;
 }
 
 /// Remove an unquoted `#`/`;` comment that starts a new field (preceded by
 /// whitespace), preserving hashes inside paths such as `a#b`.
-[[nodiscard]] inline std::string_view strip_inline_comment(std::string_view s) noexcept {
+[[nodiscard]] inline std::expected<std::string_view, std::string>
+strip_inline_comment_checked(std::string_view s) {
     char quote = '\0';
     bool escaped = false;
     for (size_t i = 0; i < s.size(); ++i) {
@@ -1314,14 +1402,69 @@ inline void strip_matching_quotes(std::string& s) {
             else if (c == quote) quote = '\0';
             continue;
         }
-        if (c == '"' || c == '\'') {
+        if ((c == '"' || c == '\'') && config_quote_starts(s, i)) {
             quote = c;
         } else if ((c == '#' || c == ';')
-                   && (i == 0 || std::isspace(static_cast<unsigned char>(s[i - 1])))) {
+                   && (i == 0 || std::isspace(static_cast<unsigned char>(s[i - 1])) != 0)) {
             return s.substr(0, i);
         }
     }
+    if (quote != '\0') return std::unexpected("unterminated quote");
     return s;
+}
+
+[[nodiscard]] inline std::expected<std::vector<std::string>, std::string>
+parse_config_array(std::string_view raw) {
+    if (trim_view(raw).empty()) return std::vector<std::string>{};
+
+    std::vector<std::string_view> pieces;
+    size_t start = 0;
+    char quote = '\0';
+    bool escaped = false;
+    bool content = false;
+    for (size_t i = 0; i < raw.size(); ++i) {
+        const char c = raw[i];
+        if (escaped) { escaped = false; continue; }
+        if (quote != '\0') {
+            if (c == '\\' && quote == '"') escaped = true;
+            else if (c == quote) quote = '\0';
+            continue;
+        }
+        if ((c == '"' || c == '\'') && !content) {
+            quote = c;
+        } else if (c == ',') {
+            pieces.push_back(raw.substr(start, i - start));
+            start = i + 1;
+            content = false;
+        } else if (std::isspace(static_cast<unsigned char>(c)) == 0) {
+            content = true;
+        }
+    }
+    if (quote != '\0') return std::unexpected("unterminated quote in array");
+    pieces.push_back(raw.substr(start));
+
+    std::vector<std::string> values;
+    values.reserve(pieces.size());
+    for (const auto piece : pieces) {
+        auto value = unquote_config_text(piece, "array element");
+        if (!value) return std::unexpected(value.error());
+        values.push_back(std::move(*value));
+    }
+    return values;
+}
+
+[[nodiscard]] inline std::expected<ConfigValue, std::string>
+parse_config_value(std::string_view raw) {
+    if (!raw.empty() && raw.front() == '[') {
+        if (raw.size() < 2 || raw.back() != ']')
+            return std::unexpected("unterminated array value");
+        auto elements = parse_config_array(raw.substr(1, raw.size() - 2));
+        if (!elements) return std::unexpected(elements.error());
+        return ConfigValue{std::string(raw), true, std::move(*elements)};
+    }
+    auto text = unquote_config_text(raw, "value");
+    if (!text) return std::unexpected(text.error());
+    return ConfigValue{std::move(*text), false, {}};
 }
 
 [[nodiscard]] inline std::expected<ConfigData, std::string>
@@ -1342,60 +1485,106 @@ parse_config(std::string_view text) {
             line.remove_suffix(1);
         if (line.empty() || line.front() == '#' || line.front() == ';')
             continue;
+
+        auto fail = [line_no](std::string_view message) {
+            return std::unexpected(std::format("line {}: {}", line_no, message));
+        };
+
         if (line.front() == '[') {
-            // A comment may follow the closing bracket, and section names may
-            // be quoted (TOML/CLI11) or use TOML's [[table]] spelling.  Only
-            // strip a comment when the line does not already end in ']', so
-            // hashes inside `[section # name]` stay part of the name.  A bare
-            // "[" left after removing a comment is not a section at all.
-            if (!line.ends_with(']')) {
-                line = trim_view(strip_inline_comment(line));
-                if (line.empty() || line == "[") continue;
+            // CLI11 treats a bare '[' followed by a comment as a comment line.
+            auto header_comment = strip_inline_comment_checked(line);
+            if (header_comment && trim_view(*header_comment) == "[") continue;
+            if (!header_comment) return fail(header_comment.error());
+
+            const bool table = line.size() >= 2 && line[1] == '[';
+            const size_t open = table ? 2 : 1;
+            size_t close = std::string_view::npos;
+            char quote = '\0';
+            bool escaped = false;
+            for (size_t i = open; i < line.size(); ++i) {
+                const char c = line[i];
+                if (escaped) { escaped = false; continue; }
+                if (quote != '\0') {
+                    if (c == '\\' && quote == '"') escaped = true;
+                    else if (c == quote) quote = '\0';
+                    continue;
+                }
+                if ((c == '"' || c == '\'')
+                    && config_quote_starts(line.substr(open, i - open), i - open)) {
+                    quote = c;
+                } else if (!table && c == ']') {
+                    close = i;
+                    break;
+                } else if (table && c == ']' && i + 1 < line.size()
+                           && line[i + 1] == ']') {
+                    close = i;
+                    break;
+                }
             }
-            std::string_view name;
-            if (line.size() >= 4 && line.starts_with("[[") && line.ends_with("]]"))
-                name = line.substr(2, line.size() - 4);
-            else {
-                const auto close = line.find(']');
-                if (close == std::string_view::npos)
-                    return std::unexpected(
-                        std::format("line {}: unterminated section header", line_no));
-                name = line.substr(1, close - 1);
-            }
-            std::string section_name(trim_view(name));
-            strip_matching_quotes(section_name);
-            if (section_name.empty())
-                return std::unexpected(
-                    std::format("line {}: empty section name", line_no));
+            if (quote != '\0') return fail("unterminated quote in section header");
+            if (close == std::string_view::npos)
+                return fail("unterminated section header");
+
+            const size_t suffix = close + (table ? 2 : 1);
+            const auto trailing = trim_view(line.substr(suffix));
+            if (!trailing.empty() && trailing.front() != '#' && trailing.front() != ';')
+                return fail("trailing text after section header");
+
+            auto section_name = unquote_config_text(
+                line.substr(open, close - open), "section name");
+            if (!section_name) return fail(section_name.error());
+            if (section_name->empty()) return fail("empty section name");
             // CLI11 reserves [default] for the root command's own options.
-            section = ascii_iequals(section_name, "default")
+            section = ascii_iequals(*section_name, "default")
                 ? std::string{}
-                : std::move(section_name);
+                : std::move(*section_name);
             continue;
         }
-        const auto eq = line.find('=');
-        std::string key;
-        std::string value;
-        if (eq == std::string_view::npos) {
-            key   = std::string(trim_view(strip_inline_comment(line)));
-            value = "true";
-        } else {
-            key   = std::string(trim_view(line.substr(0, eq)));
-            auto raw_value = trim_view(line.substr(eq + 1));
-            value = std::string(trim_view(strip_inline_comment(raw_value)));
+
+        size_t eq = std::string_view::npos;
+        char quote = '\0';
+        bool escaped = false;
+        for (size_t i = 0; i < line.size(); ++i) {
+            const char c = line[i];
+            if (escaped) { escaped = false; continue; }
+            if (quote != '\0') {
+                if (c == '\\' && quote == '"') escaped = true;
+                else if (c == quote) quote = '\0';
+                continue;
+            }
+            if ((c == '"' || c == '\'') && config_quote_starts(line, i)) quote = c;
+            else if (c == '=') { eq = i; break; }
         }
-        strip_matching_quotes(key);
-        if (key.empty())
-            return std::unexpected(
-                std::format("line {}: missing key", line_no));
-        strip_matching_quotes(value);
+        if (quote != '\0') return fail("unterminated quote");
+
+        std::string key;
+        ConfigValue value;
+        if (eq == std::string_view::npos) {
+            auto uncommented = strip_inline_comment_checked(line);
+            if (!uncommented) return fail(uncommented.error());
+            auto parsed_key = unquote_config_text(*uncommented, "key");
+            if (!parsed_key) return fail(parsed_key.error());
+            key = std::move(*parsed_key);
+            value.text = "true";
+        } else {
+            auto parsed_key = unquote_config_text(line.substr(0, eq), "key");
+            if (!parsed_key) return fail(parsed_key.error());
+            key = std::move(*parsed_key);
+
+            auto uncommented = strip_inline_comment_checked(line.substr(eq + 1));
+            if (!uncommented) return fail(uncommented.error());
+            auto parsed_value = parse_config_value(trim_view(*uncommented));
+            if (!parsed_value) return fail(parsed_value.error());
+            value = std::move(*parsed_value);
+        }
+        if (key.empty()) return fail("missing key");
         data.sections[section][std::move(key)] = std::move(value);
     }
     return data;
 }
 
 /// Return the config value for the first matching option spelling.
-[[nodiscard]] inline const std::string*
+[[nodiscard]] inline const ConfigValue*
 config_value_for(const ConfigData::Section& section,
                  const std::vector<std::string>& names) {
     for (const auto& name : names) {
@@ -1408,34 +1597,6 @@ config_value_for(const ConfigData::Section& section,
             return &it->second;
     }
     return nullptr;
-}
-
-/// Split `[a, "b,c"]` (or a plain scalar) into individual config values.
-[[nodiscard]] inline std::vector<std::string> config_values(std::string_view raw) {
-    const bool list = raw.size() >= 2 && raw.front() == '[' && raw.back() == ']';
-    if (!list) return { std::string(raw) };
-    raw = raw.substr(1, raw.size() - 2);
-    std::vector<std::string> values;
-    std::string current;
-    char quote = '\0';
-    for (char c : raw) {
-        if (quote != '\0') {
-            if (c == quote) quote = '\0';
-            else current += c;
-        } else if (c == '"' || c == '\'') {
-            quote = c;
-        } else if (c == ',') {
-            auto v = trim_view(current);
-            values.emplace_back(v);
-            current.clear();
-        } else {
-            current += c;
-        }
-    }
-    auto last = trim_view(current);
-    if (!last.empty() || !values.empty())
-        values.emplace_back(last);
-    return values;
 }
 
 // ── Response-file tokenisation ──────────────────────────────────────────────
@@ -1528,7 +1689,8 @@ tokenize_response_file(std::string_view text) {
 
 inline std::expected<std::vector<std::string>, ParseError>
 expand_response_tokens(std::span<const std::string_view> args,
-                       const App* app, unsigned depth, size_t& budget) {
+                       const App* app, unsigned depth, size_t& budget,
+                       const std::filesystem::path& base_dir = {}) {
     std::vector<std::string> expanded;
     expanded.reserve(args.size());
     for (const auto token : args) {
@@ -1551,32 +1713,36 @@ expand_response_tokens(std::span<const std::string_view> args,
         if (depth >= 8)
             return std::unexpected(ParseError::response_file(
                 token.substr(1), "nesting exceeds 8 levels", app));
-        const std::string path(token.substr(1));
+        const std::filesystem::path requested(token.substr(1));
+        const auto path = requested.is_absolute()
+            ? requested
+            : (base_dir.empty() ? requested : base_dir / requested);
         std::ifstream in(path, std::ios::binary);
         if (!in)
             return std::unexpected(ParseError::response_file(
-                path, "cannot open file", app));
+                path.string(), "cannot open file", app));
         in.seekg(0, std::ios::end);
         const auto end = in.tellg();
         if (end < 0)
             return std::unexpected(ParseError::response_file(
-                path, "cannot determine size", app));
+                path.string(), "cannot determine size", app));
         constexpr std::streamoff max_size = 4 * 1024 * 1024;
         if (end > max_size)
             return std::unexpected(ParseError::response_file(
-                path, "file is larger than 4 MiB", app));
+                path.string(), "file is larger than 4 MiB", app));
         in.seekg(0, std::ios::beg);
         std::string text(static_cast<size_t>(end), '\0');
         if (end > 0 && !in.read(text.data(), end))
             return std::unexpected(ParseError::response_file(
-                path, "read failed", app));
+                path.string(), "read failed", app));
         auto tokens = tokenize_response_file(text);
         if (!tokens)
-            return std::unexpected(ParseError::response_file(path, tokens.error(), app));
+            return std::unexpected(ParseError::response_file(path.string(), tokens.error(), app));
         std::vector<std::string_view> views;
         views.reserve(tokens->size());
         for (const auto& t : *tokens) views.emplace_back(t);
-        auto nested = expand_response_tokens(views, app, depth + 1, budget);
+        auto nested = expand_response_tokens(
+            views, app, depth + 1, budget, path.parent_path());
         if (!nested) return nested;
         for (auto& t : *nested) expanded.push_back(std::move(t));
     }
@@ -2925,6 +3091,14 @@ private:
         }
     }
 
+    void validate_positional_order() const {
+        for (size_t i = 0; i + 1 < positionals_.size(); ++i) {
+            if (positionals_[i]->variable_arity())
+                throw std::invalid_argument(
+                    "cli: a variable-arity positional must be the last positional");
+        }
+    }
+
     void validate_group_references() {
         if (!groups_dirty_) return;
         auto resolve = [this](const std::vector<std::vector<std::string>>& groups,
@@ -2971,6 +3145,9 @@ private:
             required = true;
         }
         if (path.empty()) {
+            if (required)
+                return std::unexpected(ParseError::config(
+                    path, "config path is empty", root));
             root->config_loaded_ = true;
             root->config_loaded_path_.clear();
             root->config_data_ = {};
@@ -3020,11 +3197,17 @@ private:
         detail::OptionBase* opt, const detail::ConfigData::Section& section) {
         if (opt->is_set_ || opt->from_env_ || opt->from_config_) return {};
         if (const auto* raw = detail::config_value_for(section, opt->names)) {
-            auto values = opt->is_multi() ? detail::config_values(*raw)
-                                          : std::vector<std::string>{ *raw };
-            if (values.empty()) return {};
-            for (const auto& v : values) {
-                if (auto r = opt->parse(v, opt->display_name(), this); !r) return r;
+            if (opt->is_multi() && raw->is_array) {
+                if (raw->elements.empty()) {
+                    opt->set_empty_config();
+                } else {
+                    for (const auto& v : raw->elements) {
+                        if (auto r = opt->parse_config_element(
+                                v, opt->display_name(), this); !r) return r;
+                    }
+                }
+            } else if (auto r = opt->parse(raw->text, opt->display_name(), this); !r) {
+                return r;
             }
             opt->is_set_     = false;
             opt->from_config_ = true;
@@ -3052,11 +3235,17 @@ private:
         if (pos->is_set_ || pos->from_env_ || pos->from_config_) return {};
         const auto it = section.find(pos->name);
         if (it == section.end()) return {};
-        auto values = pos->variadic_ ? detail::config_values(it->second)
-                                     : std::vector<std::string>{ it->second };
-        if (values.empty()) return {};
-        for (const auto& v : values) {
-            if (auto r = pos->parse(v, this); !r) return r;
+        const auto& raw = it->second;
+        if (pos->variadic_ && raw.is_array) {
+            if (raw.elements.empty()) {
+                pos->set_empty_config();
+            } else {
+                for (const auto& v : raw.elements) {
+                    if (auto r = pos->parse_config_element(v, this); !r) return r;
+                }
+            }
+        } else if (auto r = pos->parse(raw.text, this); !r) {
+            return r;
         }
         pos->is_set_      = false;
         pos->from_config_ = true;
@@ -3134,6 +3323,7 @@ private:
     template<typename Token>
     [[nodiscard]] ParseResult do_parse(std::span<const Token> args,
                                        bool invocation_root) {
+        validate_positional_order();
         validate_group_references();
         bool   end_opts       = false;
         bool   saw_positional = false;
@@ -3394,11 +3584,11 @@ private:
         return finish(/*subcommand_active=*/false, invocation_root);
     }
 
-    /// Finalize this command, then any ancestors when this command was the
-    /// entry point of a direct `sub.parse(...)` call.  Those ancestors still
-    /// own inherited globals, so their defaults, validators, transforms and
-    /// required checks must run exactly as they would for
-    /// `root.parse({"sub", ...})`.
+    /// Finalize this command, then value fallbacks on ancestors when this
+    /// command was the entry point of a direct `sub.parse(...)` call.  Ordinary
+    /// ancestor options cannot be supplied from that entry point, so only
+    /// inherited globals participate in required and group checks; ancestor
+    /// positionals are not part of the direct invocation.
     [[nodiscard]] ParseResult finish(bool subcommand_active, bool invocation_root) {
         if (auto r = finalize(subcommand_active); !r) return r;
         if (!invocation_root) return {};
@@ -3412,18 +3602,21 @@ private:
                 ancestor->remaining_args_.insert(ancestor->remaining_args_.end(),
                                                  descendant->remaining_args_.begin(),
                                                  descendant->remaining_args_.end());
-            if (auto r = ancestor->finalize(/*subcommand_active=*/true); !r)
+            ancestor->validate_group_references();
+            if (auto r = ancestor->finalize(
+                    /*subcommand_active=*/true, /*direct_ancestor=*/true); !r)
                 return r;
             descendant = ancestor;
         }
         return {};
     }
 
-    [[nodiscard]] ParseResult finalize(bool subcommand_active) {
+    [[nodiscard]] ParseResult finalize(bool subcommand_active,
+                                       bool direct_ancestor = false) {
         // Load config lazily: by this point any --config CLI value has been
         // parsed, and child finalization can reach the root data.
         App* root = root_app();
-        if (!root->config_file_.empty()
+        if (!root->config_file_.empty() || root->config_required_
             || (root->config_option_ != nullptr && root->config_option_->value)) {
             if (auto r = root->ensure_config_loaded(); !r) return r;
         }
@@ -3451,12 +3644,13 @@ private:
             }
             if (!opt->from_env_ && !opt->from_config_ && opt->has_default_)
                 opt->apply_default();
-            if (opt->required_ && !opt->from_env_ && !opt->from_config_
-                && !opt->has_default_)
+            if (opt->required_ && (!direct_ancestor || opt->global_)
+                && !opt->from_env_ && !opt->from_config_ && !opt->has_default_)
                 return std::unexpected(ParseError::missing_required(opt->display_name(), this));
         }
 
         for (auto& pos : positionals_) {
+            if (direct_ancestor) continue;
             if (pos->is_set_) {
                 if (pos->parsed_count_ < pos->nargs_min_)
                     return std::unexpected(ParseError::not_enough_values(
@@ -3475,17 +3669,21 @@ private:
                 if (auto r = apply_config_positional(pos.get(), *config_section); !r)
                     return r;
             }
-            if (!pos->from_env_ && !pos->from_config_ && pos->has_default_)
-                pos->apply_default();
-            // An explicitly supplied positional may still be short of a
-            // configured arity, even when it is not required overall.
-            if (pos->from_env_ || pos->from_config_) {
-                if (pos->parsed_count_ < pos->nargs_min_)
+            const bool from_default = !pos->from_env_ && !pos->from_config_
+                                      && pos->has_default_;
+            if (from_default) pos->apply_default();
+            // Explicit CLI, environment and config values count parsed
+            // elements; defaults count the values stored in the default.
+            if (pos->from_env_ || pos->from_config_ || from_default) {
+                const size_t count = pos->from_env_ || pos->from_config_
+                    ? pos->parsed_count_
+                    : pos->value_count();
+                if (count < pos->nargs_min_)
                     return std::unexpected(ParseError::not_enough_values(
-                        pos->name, pos->nargs_min_, pos->parsed_count_, this));
-                if (pos->parsed_count_ > pos->nargs_max_)
+                        pos->name, pos->nargs_min_, count, this));
+                if (count > pos->nargs_max_)
                     return std::unexpected(ParseError::too_many_values(
-                        pos->name, pos->nargs_max_, pos->parsed_count_, this));
+                        pos->name, pos->nargs_max_, count, this));
             }
         }
         if (!subcommand_active) {
@@ -3507,13 +3705,17 @@ private:
         for (auto& opt : options_)
             if (opt->needs_finalize_)
                 if (auto r = opt->validate_and_finalize(this); !r) return r;
-        for (auto& pos : positionals_)
-            if (pos->needs_finalize_)
-                if (auto r = pos->validate_and_finalize(this); !r) return r;
+        if (!direct_ancestor)
+            for (auto& pos : positionals_)
+                if (pos->needs_finalize_)
+                    if (auto r = pos->validate_and_finalize(this); !r) return r;
 
         // 3. Mutex group constraints.  Values supplied through the environment
         //    or a config file count as explicit choices; defaults do not.
         for (const auto& group : mutex_resolved_) {
+            if (direct_ancestor && std::ranges::any_of(
+                    group, [](const auto* opt) { return !opt->global_; }))
+                continue;
             std::string first_set;
             for (auto* opt : group) {
                 if (opt->is_set_ || opt->from_env_ || opt->from_config_) {
@@ -3527,6 +3729,9 @@ private:
 
         // 4. Require-together constraints
         for (const auto& group : require_resolved_) {
+            if (direct_ancestor && std::ranges::any_of(
+                    group, [](const auto* opt) { return !opt->global_; }))
+                continue;
             std::string_view any_set;
             for (auto* opt : group) {
                 if (opt->is_set_ || opt->from_env_ || opt->from_config_) {
@@ -3545,6 +3750,9 @@ private:
 
         // 5. Require-at-least-one groups
         for (const auto& group : require_one_resolved_) {
+            if (direct_ancestor && std::ranges::any_of(
+                    group, [](const auto* opt) { return !opt->global_; }))
+                continue;
             bool any_set = false;
             std::string names;
             for (auto* opt : group) {
