@@ -15,6 +15,8 @@ import re
 import sys
 from collections import Counter
 
+from diff_values import CPP_VALUE_HELPERS, typed_comparison
+
 TOOL_DIR = os.path.dirname(os.path.abspath(__file__))
 
 
@@ -402,7 +404,7 @@ def collect_tags(rec):
 
     numeric_types = {'int', 'unsigned', 'long', 'long long', 'short',
                      'signed char', 'unsigned char', 'unsigned short',
-                     'unsigned long', 'unsigned long long', 'float',
+                     'unsigned long', 'unsigned long long', 'char', 'float',
                      'double', 'long double'}
     has_numeric = any((arg_type(a)[0] in numeric_types) or
                       a.get('scan_shape') in set('diuobxXefga')
@@ -413,6 +415,8 @@ def collect_tags(rec):
             if tok.startswith('+'):
                 tags.add('numeric_plus_sign')
                 break
+        if any(re.fullmatch(r'0[0-9]+', tok) for tok in args[1:]):
+            tags.add('leading_zero_radix')
 
     for tok in args[1:]:
         if (tok.startswith('-') and not tok.startswith('--') and len(tok) > 1):
@@ -587,7 +591,114 @@ def validate_schema(rec):
     return None
 
 
-def emit_arg(app, a, hidden_aliases=()):
+def parsed_value_map(rec):
+    return {(entry['parser'], entry['argument']): entry
+            for entry in rec.get('parsed_values', [])}
+
+
+def comparison_for(rec, parser_id, a, argument_index, app_expr):
+    entry = parsed_value_map(rec).get((parser_id, argument_index))
+    if entry is None or a.get('builtin'):
+        return None
+    results = (entry.get('values') or {}).get('results') or []
+    if not results:
+        return None
+    cpp, is_container, _ = arg_type(a)
+    if cpp is None:
+        return None
+    vec = arg_vector(a, cpp, is_container)
+    if vec:
+        if len(results) == 1 and results[0].get('kind') == 'vector':
+            value = results[0]
+        else:
+            value = {'kind': 'vector', 'values': results}
+    else:
+        if len(results) != 1:
+            return None
+        value = results[0]
+    label = a['names'][0] if a['names'] else f'argument-{argument_index}'
+    flag_lookup = app_expr if is_flag(a) else None
+    check = typed_comparison(cpp, vec, value, label, flag_lookup)
+    if check is not None and flag_lookup is not None:
+        check['name'] = a['names'][0]
+    if check is not None:
+        path = rec['parsers'][parser_id].get('parser_path', '')
+        check['label'] = f'{path}:{label}' if path else label
+    return check
+
+
+def expected_expr(check):
+    expected = check['expected']
+    if isinstance(expected, tuple) and expected[0] == 'string_literal':
+        return cpp_str(expected[1])
+    if isinstance(expected, tuple) and expected[0] == 'vector':
+        items = []
+        for item in expected[1]:
+            if isinstance(item, tuple) and item[0] == 'string_literal':
+                items.append(cpp_str(item[1]))
+            else:
+                items.append(item)
+        return f'std::vector<{check["cpp"]}>{{' + ', '.join(items) + '}'
+    return expected
+
+
+def emit_value_checks(checks, lines):
+    for check in checks:
+        label = cpp_str(check['label'])
+        expected = expected_expr(check)
+        if check['kind'] == 'flag':
+            actual = f'{check["lookup"]}[{cpp_str(check["name"])}].as<bool>()'
+            lines.append(f'    if (ok && {actual} != {expected}) {{')
+            lines.append('        value_ok = false;')
+            lines.append(f'        std::printf("VALUE\\t%s\\t%s\\t%s\\n", {label}, '
+                         f'{expected} ? "true" : "false", {actual} ? "true" : "false");')
+            lines.append('    }')
+            continue
+        handle = check['handle']
+        lines.append(f'    if (ok && !{handle}) {{')
+        lines.append('        value_ok = false;')
+        lines.append(f'        std::printf("VALUE\\t%s\\t%s\\t<unset>\\n", {label}, '
+                     f'diff_repr({expected}).c_str());')
+        lines.append('    }')
+        lines.append(f'    else if (ok && !diff_eq({handle}.value(), {expected})) {{')
+        lines.append('        value_ok = false;')
+        lines.append(f'        std::printf("VALUE\\t%s\\t%s\\t%s\\n", {label}, '
+                     f'diff_repr({expected}).c_str(), diff_repr({handle}.value()).c_str());')
+        lines.append('    }')
+    return lines
+
+
+def count_value_coverage(cases):
+    stats = Counter()
+    for _, rec, _, tags in cases:
+        if tags or rec['outcome'] != 'ok':
+            continue
+        stats['cases'] += 1
+        has_check = False
+        entries = rec.get('parsed_values') or []
+        if not entries:
+            stats['no_values'] += 1
+        for entry in entries:
+            parser_id = entry['parser']
+            argument_index = entry['argument']
+            parser = rec['parsers'][parser_id]
+            allargs = parser['positionals'] + parser['optionals']
+            if argument_index >= len(allargs):
+                stats['skipped'] += 1
+                continue
+            a = allargs[argument_index]
+            check = comparison_for(rec, parser_id, a, argument_index, 'app')
+            if check is None:
+                stats['skipped'] += 1
+            else:
+                stats['fields'] += 1
+                has_check = True
+        if has_check:
+            stats['compared'] += 1
+    return stats
+
+
+def emit_arg(app, a, hidden_aliases=(), check=None, counter=None):
     cpp, is_container, tags = arg_type(a)
     if cpp is None:
         return []
@@ -634,11 +745,17 @@ def emit_arg(app, a, hidden_aliases=()):
                     expr += f'.nargs(1, {mx})'
                 else:
                     expr += f'.nargs({mn}, {mx})'
-    lines.append(f'    (void){expr};')
+    if check is not None:
+        handle = f'opt_{counter[0]}'
+        counter[0] += 1
+        check['handle'] = handle
+        lines.append(f'    auto {handle} = {expr};')
+    else:
+        lines.append(f'    (void){expr};')
     return lines
 
 
-def emit_positional(app, a):
+def emit_positional(app, a, check=None, counter=None):
     cpp, is_container, tags = arg_type(a)
     if cpp is None:
         return []
@@ -674,6 +791,11 @@ def emit_positional(app, a):
                 expr += f'.nargs(1, {mx})'
             else:
                 expr += f'.nargs({mn}, {mx})'
+    if check is not None:
+        handle = f'opt_{counter[0]}'
+        counter[0] += 1
+        check['handle'] = handle
+        return [f'    auto {handle} = {expr};']
     return [f'    (void){expr};']
 
 
@@ -701,7 +823,7 @@ def emit_mutex(app, parser):
     return lines
 
 
-def emit_node(rec, pid, app_expr, emitted):
+def emit_node(rec, pid, app_expr, emitted, checks, counter, compare):
     if pid in emitted:
         return []
     emitted.add(pid)
@@ -710,12 +832,19 @@ def emit_node(rec, pid, app_expr, emitted):
     for alias, target in parser['hidden_aliases']:
         alias_map.setdefault(target, []).append(alias)
     lines = []
-    for a in parser['optionals']:
+    positional_count = len(parser['positionals'])
+    for i, a in enumerate(parser['optionals']):
         if a['builtin']:
             continue
-        lines.extend(emit_arg(app_expr, a, alias_map.get(a['names'][0], [])))
-    for a in parser['positionals']:
-        lines.extend(emit_positional(app_expr, a))
+        check = comparison_for(rec, pid, a, positional_count + i, app_expr) if compare else None
+        if check is not None:
+            checks.append(check)
+        lines.extend(emit_arg(app_expr, a, alias_map.get(a['names'][0], []), check, counter))
+    for i, a in enumerate(parser['positionals']):
+        check = comparison_for(rec, pid, a, i, app_expr) if compare else None
+        if check is not None:
+            checks.append(check)
+        lines.extend(emit_positional(app_expr, a, check, counter))
     lines.extend(emit_mutex(app_expr, parser))
     for sub in parser['subparsers']:
         child = sub['parser']
@@ -723,40 +852,59 @@ def emit_node(rec, pid, app_expr, emitted):
             continue
         child_expr = f'app_{child}'
         lines.append(f'    auto& {child_expr} = {app_expr}.subcommand({cpp_str(sub["name"])}, "");')
-        lines.extend(emit_node(rec, child, child_expr, emitted))
+        lines.extend(emit_node(rec, child, child_expr, emitted, checks, counter, compare))
     return lines
 
 
-def emit_case(rec, index, blocked_reason=None):
+def emit_case(rec, index, blocked_reason=None, tags_override=None):
     args = [bytes.fromhex(h) for h in rec['args_hex']]
-    tags = collect_tags(rec) if blocked_reason is None else set()
-    lines = [f'static int case_{index}() {{']
-    lines.append('    cli::App app_0("app");')
+    tags = tags_override if tags_override is not None else (
+        collect_tags(rec) if blocked_reason is None else set())
+    compare = not tags and rec['outcome'] == 'ok'
+    checks = []
+    counter = [0]
+    body = ['    cli::App app_0("app");']
     emitted = set()
     emitted.add(0)
     parser = rec['parsers'][0]
     alias_map = {}
     for alias, target in parser['hidden_aliases']:
         alias_map.setdefault(target, []).append(alias)
-    for a in parser['optionals']:
+    positional_count = len(parser['positionals'])
+    for i, a in enumerate(parser['optionals']):
         if a['builtin']:
             continue
-        lines.extend(emit_arg('app_0', a, alias_map.get(a['names'][0], [])))
-    for a in parser['positionals']:
-        lines.extend(emit_positional('app_0', a))
-    lines.extend(emit_mutex('app_0', parser))
+        check = comparison_for(rec, 0, a, positional_count + i, 'app_0') if compare else None
+        if check is not None:
+            checks.append(check)
+        body.extend(emit_arg('app_0', a, alias_map.get(a['names'][0], []), check, counter))
+    for i, a in enumerate(parser['positionals']):
+        check = comparison_for(rec, 0, a, i, 'app_0') if compare else None
+        if check is not None:
+            checks.append(check)
+        body.extend(emit_positional('app_0', a, check, counter))
+    body.extend(emit_mutex('app_0', parser))
     for sub in parser['subparsers']:
         child = sub['parser']
         child_expr = f'app_{child}'
-        lines.append(f'    auto& {child_expr} = app_0.subcommand({cpp_str(sub["name"])}, "");')
-        lines.extend(emit_node(rec, child, child_expr, emitted))
+        body.append(f'    auto& {child_expr} = app_0.subcommand({cpp_str(sub["name"])}, "");')
+        body.extend(emit_node(rec, child, child_expr, emitted, checks, counter, compare))
     if rec['kind'] == 'known':
-        lines.append('    app_0.allow_extras();')
+        body.append('    app_0.allow_extras();')
     arglist = ', '.join(cpp_string_expr(x) for x in args[1:])
-    lines.append(f'    auto res = app_0.parse(std::vector<std::string>{{{arglist}}});')
+
+    lines = [f'static int case_{index}() {{',
+             '    bool ok = false;',
+             '    bool value_ok = true;',
+             '    try {']
+    lines += ['    ' + line for line in body]
+    lines.append(f'        auto res = app_0.parse(std::vector<std::string>{{{arglist}}});')
+    lines.append('        ok = res.has_value();')
+    for line in emit_value_checks(checks, []):
+        lines.append('    ' + line)
+    lines.append('    } catch (const std::exception&) { ok = false; }')
     expected = 'true' if rec['outcome'] == 'ok' else 'false'
-    lines.append('    bool ok = res.has_value();')
-    lines.append(f'    if (ok == {expected}) return 0;')
+    lines.append(f'    if (ok == {expected}) return value_ok ? 0 : 2;')
     lines.append('    return ok ? 1 : -1;')
     lines.append('}')
     return lines, tags
@@ -779,16 +927,18 @@ def main():
         if reason:
             blocked[reason] += 1
             continue
-        lines, tags = emit_case(rec, len(cases))
-        tags |= rec.get('_extra_tags', set())
+        tags = collect_tags(rec) | rec.get('_extra_tags', set())
         if split_tagged:
             tags.add('split_trailing_positional')
+        lines, tags = emit_case(rec, len(cases), tags_override=tags)
         cases.append((len(cases), rec, lines, tags))
         for tag in tags:
             tag_counter[tag] += 1
 
-    out = ['#include <cli.hpp>', '#include <cstdint>', '#include <string>',
-           '#include <vector>', '', 'namespace {', '']
+    out = ['#include <cli.hpp>', '#include <cmath>', '#include <cstdint>',
+           '#include <cstdio>', '#include <cstdlib>', '#include <sstream>',
+           '#include <string>', '#include <vector>', '', 'namespace {', '']
+    out.append(CPP_VALUE_HELPERS)
     out.append('struct Case { const char* tags; int (*fn)(); };')
     out.append('')
     for _, rec, lines, _ in cases:
@@ -819,6 +969,11 @@ def main():
     open(OUT, 'w', encoding='utf-8').write('\n'.join(out) + '\n')
     print(f'records {len(recs)}; replayable {len(cases)}; blocked {sum(blocked.values())}: {dict(blocked)}')
     print('tags:', dict(tag_counter))
+    coverage = count_value_coverage(cases)
+    print(f"value comparisons {coverage['compared']} / {coverage['cases']} "
+          f"untagged successful cases, {coverage['fields']} fields; "
+          f"skipped {coverage['skipped']} field(s) without a builtin mapping; "
+          f"{coverage['no_values']} case(s) had no parsed values")
     print('wrote', OUT)
 
 

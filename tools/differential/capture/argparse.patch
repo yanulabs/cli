@@ -1,6 +1,6 @@
 --- a/include/argparse/argparse.hpp
 +++ b/include/argparse/argparse.hpp
-@@ -31,6 +31,13 @@
+@@ -31,6 +31,14 @@
  #pragma once
  
  #include <cerrno>
@@ -9,16 +9,16 @@
 +#include <cstdint>
 +#include <exception>
 +#include <fstream>
++#include <limits>
 +#include <mutex>
 +#endif
  
  #ifndef ARGPARSE_MODULE_USE_STD_MODULE
  #include <algorithm>
-@@ -670,11 +677,26 @@
-     implicit_value(true);
+@@ -671,10 +679,25 @@
      return *this;
    }
-+
+ 
 +#ifdef ARGPARSE_DIFF_CAPTURE
 +  struct DiffInternalAction {
 +    Argument &self;
@@ -28,7 +28,7 @@
 +    ~DiffInternalAction() { self.m_diff_internal_action = false; }
 +  };
 +#endif
- 
++
    template <class F, class... Args>
    auto action(F &&callable, Args &&... bound_args)
        -> std::enable_if_t<std::is_invocable_v<F, Args..., std::string const>,
@@ -41,7 +41,7 @@
      using action_type = std::conditional_t<
          std::is_void_v<std::invoke_result_t<F, Args..., std::string const>>,
          void_action, valued_action>;
-@@ -698,6 +720,10 @@
+@@ -698,6 +721,10 @@
      if (m_default_value.has_value()) {
        var = std::any_cast<bool>(m_default_value);
      }
@@ -52,7 +52,7 @@
      action([&var](const auto & /*unused*/) {
        var = true;
        return var;
-@@ -710,6 +736,10 @@
+@@ -710,6 +737,10 @@
      if (m_default_value.has_value()) {
        var = std::any_cast<T>(m_default_value);
      }
@@ -63,7 +63,7 @@
      action([&var](const auto &s) {
        var = details::parse_number<T, details::radix_10>()(s);
        return var;
-@@ -721,6 +751,10 @@
+@@ -721,6 +752,10 @@
      if (m_default_value.has_value()) {
        var = std::any_cast<double>(m_default_value);
      }
@@ -74,7 +74,7 @@
      action([&var](const auto &s) {
        var = details::parse_number<double, details::chars_format::general>()(s);
        return var;
-@@ -732,6 +766,10 @@
+@@ -732,6 +767,10 @@
      if (m_default_value.has_value()) {
        var = std::any_cast<std::string>(m_default_value);
      }
@@ -85,7 +85,7 @@
      action([&var](const std::string &s) {
        var = s;
        return var;
-@@ -743,6 +781,10 @@
+@@ -743,6 +782,10 @@
      if (m_default_value.has_value()) {
        var = std::any_cast<std::filesystem::path>(m_default_value);
      }
@@ -96,7 +96,7 @@
      action([&var](const std::string &s) { var = s; });
      return *this;
    }
-@@ -751,6 +793,10 @@
+@@ -751,6 +794,10 @@
      if (m_default_value.has_value()) {
        var = std::any_cast<std::vector<std::string>>(m_default_value);
      }
@@ -107,7 +107,7 @@
      action([this, &var](const std::string &s) {
        if (!m_is_used) {
          var.clear();
-@@ -766,6 +812,10 @@
+@@ -766,6 +813,10 @@
      if (m_default_value.has_value()) {
        var = std::any_cast<std::vector<int>>(m_default_value);
      }
@@ -118,7 +118,7 @@
      action([this, &var](const std::string &s) {
        if (!m_is_used) {
          var.clear();
-@@ -781,6 +831,10 @@
+@@ -781,6 +832,10 @@
      if (m_default_value.has_value()) {
        var = std::any_cast<std::set<std::string>>(m_default_value);
      }
@@ -129,7 +129,7 @@
      action([this, &var](const std::string &s) {
        if (!m_is_used) {
          var.clear();
-@@ -796,6 +850,10 @@
+@@ -796,6 +851,10 @@
      if (m_default_value.has_value()) {
        var = std::any_cast<std::set<int>>(m_default_value);
      }
@@ -140,7 +140,7 @@
      action([this, &var](const std::string &s) {
        if (!m_is_used) {
          var.clear();
-@@ -822,6 +880,11 @@
+@@ -822,6 +881,11 @@
    auto scan() -> std::enable_if_t<std::is_arithmetic_v<T>, Argument &> {
      static_assert(!(std::is_const_v<T> || std::is_volatile_v<T>),
                    "T should not be cv-qualified");
@@ -152,7 +152,7 @@
      auto is_one_of = [](char c, auto... x) constexpr {
        return ((c == x) || ...);
      };
-@@ -1630,6 +1693,13 @@
+@@ -1630,6 +1694,13 @@
    std::string_view m_prefix_chars; // ArgumentParser has the prefix_chars
    int m_usage_newline_counter = 0;
    std::size_t m_group_idx = 0;
@@ -166,7 +166,7 @@
  };
  
  class ArgumentParser {
-@@ -1643,8 +1713,8 @@
+@@ -1643,8 +1714,8 @@
          m_exit_on_default_arguments(exit_on_default_arguments),
          m_parser_path(m_program_name) {
      if ((add_args & default_arguments::help) == default_arguments::help) {
@@ -177,7 +177,7 @@
              os << help().str();
              if (m_exit_on_default_arguments) {
                std::exit(0);
-@@ -1654,10 +1724,13 @@
+@@ -1654,10 +1725,13 @@
            .help("shows help message and exits")
            .implicit_value(true)
            .nargs(0);
@@ -193,7 +193,7 @@
              os << m_version << std::endl;
              if (m_exit_on_default_arguments) {
                std::exit(0);
-@@ -1667,6 +1740,9 @@
+@@ -1667,6 +1741,9 @@
            .help("prints version information and exits")
            .implicit_value(true)
            .nargs(0);
@@ -203,7 +203,7 @@
      }
    }
  
-@@ -1836,14 +1912,406 @@
+@@ -1836,14 +1913,577 @@
    ArgumentParser &set_assign_chars(std::string assign_chars) {
      m_assign_chars = std::move(assign_chars);
      return *this;
@@ -284,6 +284,167 @@
 +      return std::any_cast<const char *>(a);
 +    }
 +    return {};
++  }
++
++  template <typename T>
++  static std::string diff_float_text(const T &value) {
++    std::ostringstream out;
++    out.imbue(std::locale::classic());
++    out << std::setprecision(std::numeric_limits<T>::max_digits10) << value;
++    return out.str();
++  }
++
++  template <typename T>
++  static std::string diff_scalar_json(const T &value) {
++    if constexpr (std::is_same_v<T, bool>) {
++      return value ? "{\"kind\":\"bool\",\"value\":true}"
++                   : "{\"kind\":\"bool\",\"value\":false}";
++    } else if constexpr (std::is_same_v<T, std::string>) {
++      return "{\"kind\":\"string\",\"value\":" + diff_escape(value) + "}";
++    } else if constexpr (std::is_floating_point_v<T>) {
++      return "{\"kind\":\"float\",\"value\":"
++             + diff_escape(diff_float_text(value)) + "}";
++    } else if constexpr (std::is_same_v<T, char> ||
++                         std::is_same_v<T, signed char> ||
++                         std::is_same_v<T, unsigned char>) {
++      return "{\"kind\":\"char\",\"value\":"
++             + std::to_string(static_cast<long long>(value)) + "}";
++    } else if constexpr (std::is_signed_v<T>) {
++      return "{\"kind\":\"signed\",\"value\":"
++             + diff_escape(std::to_string(value)) + "}";
++    } else {
++      return "{\"kind\":\"unsigned\",\"value\":"
++             + diff_escape(std::to_string(value)) + "}";
++    }
++  }
++
++  template <typename T>
++  static std::string diff_vector_json(const std::vector<T> &values) {
++    std::string out = "{\"kind\":\"vector\",\"values\":[";
++    bool first = true;
++    for (const auto &value : values) {
++      if (!first) {
++        out += ',';
++      }
++      first = false;
++      out += diff_scalar_json(value);
++    }
++    return out + "]}";
++  }
++
++  template <typename T>
++  static std::string diff_any_scalar(const std::any &a) {
++    if (a.type() != typeid(T)) {
++      return {};
++    }
++    return diff_scalar_json(std::any_cast<const T &>(a));
++  }
++
++  template <typename T>
++  static std::string diff_any_vector(const std::any &a) {
++    if (a.type() != typeid(std::vector<T>)) {
++      return {};
++    }
++    return diff_vector_json(std::any_cast<const std::vector<T> &>(a));
++  }
++
++  static std::string diff_any_value_json(const std::any &a) {
++    if (!a.has_value()) {
++      return "{\"kind\":\"unsupported\",\"type_id\":\"\"}";
++    }
++    std::string out;
++    out = diff_any_scalar<bool>(a); if (!out.empty()) return out;
++    out = diff_any_scalar<std::string>(a); if (!out.empty()) return out;
++    out = diff_any_scalar<char>(a); if (!out.empty()) return out;
++    out = diff_any_scalar<signed char>(a); if (!out.empty()) return out;
++    out = diff_any_scalar<unsigned char>(a); if (!out.empty()) return out;
++    out = diff_any_scalar<short>(a); if (!out.empty()) return out;
++    out = diff_any_scalar<unsigned short>(a); if (!out.empty()) return out;
++    out = diff_any_scalar<int>(a); if (!out.empty()) return out;
++    out = diff_any_scalar<unsigned>(a); if (!out.empty()) return out;
++    out = diff_any_scalar<long>(a); if (!out.empty()) return out;
++    out = diff_any_scalar<unsigned long>(a); if (!out.empty()) return out;
++    out = diff_any_scalar<long long>(a); if (!out.empty()) return out;
++    out = diff_any_scalar<unsigned long long>(a); if (!out.empty()) return out;
++    out = diff_any_scalar<float>(a); if (!out.empty()) return out;
++    out = diff_any_scalar<double>(a); if (!out.empty()) return out;
++    out = diff_any_scalar<long double>(a); if (!out.empty()) return out;
++    out = diff_any_vector<std::string>(a); if (!out.empty()) return out;
++    out = diff_any_vector<int>(a); if (!out.empty()) return out;
++    if (a.type() == typeid(const char *)) {
++      return "{\"kind\":\"string\",\"value\":"
++             + diff_escape(std::any_cast<const char *>(a)) + "}";
++    }
++    return "{\"kind\":\"unsupported\",\"type_id\":"
++           + diff_escape(std::string(a.type().name())) + "}";
++  }
++
++  std::string diff_argument_values_json(const Argument &a) const {
++    if (!a.m_is_used) {
++      return {};
++    }
++    std::string results = "[";
++    if (!a.m_values.empty()) {
++      const auto last = diff_any_value_json(a.m_values.back());
++      const bool container_snapshot = last.rfind("{\"kind\":\"vector\"", 0) == 0;
++      const bool multiple = a.m_is_repeatable ||
++                            a.m_num_args_range.get_max() > 1 ||
++                            a.m_num_args_range.get_max() ==
++                              (std::numeric_limits<std::size_t>::max)();
++      if (container_snapshot) {
++        results += last;
++      } else {
++        bool first = true;
++        const auto count = multiple ? a.m_values.size() : 1;
++        for (std::size_t i = 0; i < count; ++i) {
++          const auto &value = a.m_values[multiple ? i : a.m_values.size() - 1];
++          if (!first) {
++            results += ',';
++          }
++          first = false;
++          results += diff_any_value_json(value);
++        }
++      }
++    }
++    results += "]";
++    return "{\"used\":true,\"results\":" + results + "}";
++  }
++
++  std::string diff_values_json() const {
++    std::vector<const ArgumentParser *> order;
++    diff_collect_parsers(*this, order);
++    std::ostringstream out;
++    out << '[';
++    bool first_entry = true;
++    for (std::size_t parser_index = 0; parser_index < order.size(); ++parser_index) {
++      const auto &parser = *order[parser_index];
++      std::size_t argument_index = 0;
++      auto emit = [&](const Argument &a) {
++        if (a.m_diff_builtin || !a.m_is_used) {
++          return;
++        }
++        const auto values = diff_argument_values_json(a);
++        if (values.empty()) {
++          return;
++        }
++        if (!first_entry) {
++          out << ',';
++        }
++        first_entry = false;
++        out << "{\"parser\":" << parser_index
++            << ",\"argument\":" << argument_index << ",\"values\":" << values << '}';
++      };
++      for (const auto &a : parser.m_positional_arguments) {
++        emit(a);
++        ++argument_index;
++      }
++      for (const auto &a : parser.m_optional_arguments) {
++        emit(a);
++        ++argument_index;
++      }
++    }
++    out << ']';
++    return out.str();
 +  }
 +
 +  std::string diff_argument_json(const Argument &a, std::size_t index) const {
@@ -485,10 +646,11 @@
 +      out << record << '\n';
 +    } catch (...) {
 +    }
-+  }
+   }
 +
 +  void diff_emit_record(const std::vector<std::string> &args,
-+                        const std::string &schema_json, const char *file,
++                        const std::string &schema_json,
++                        const std::string &parsed_values, const char *file,
 +                        int line, bool known, bool ok,
 +                        const std::string &error_type,
 +                        const std::string &error_message,
@@ -506,6 +668,7 @@
 +      o << (i ? "," : "") << diff_escape(diff_hex(args[i]));
 +    }
 +    o << "],\"parsers\":" << schema_json;
++    o << ",\"parsed_values\":" << parsed_values;
 +    o << ",\"outcome\":" << diff_escape(ok ? "ok" : "error");
 +    o << ",\"error_type\":" << diff_escape(error_type);
 +    o << ",\"error\":" << diff_escape(error_message);
@@ -531,8 +694,8 @@
 +    }
 +    o << "}";
 +    diff_write_record(o.str());
-   }
- 
++  }
++
 +  struct DiffCallGuard {
 +    ArgumentParser &parser;
 +    std::vector<std::string> args;
@@ -581,14 +744,22 @@
 +            error_message = "non-std exception";
 +          }
 +        }
-+        parser.diff_emit_record(args, schema_json, file, line, known, ok,
-+                                error_type, error_message,
++        std::string parsed_values = "[]";
++        if (ok) {
++          try {
++            parsed_values = parser.diff_values_json();
++          } catch (...) {
++            parsed_values = "[]";
++          }
++        }
++        parser.diff_emit_record(args, schema_json, parsed_values, file, line,
++                                known, ok, error_type, error_message,
 +                                has_unknown ? &unknown : nullptr);
 +      }
 +      --diff_depth();
 +    }
 +  };
-+
+ 
 +public:
 +#endif
 +
@@ -611,7 +782,7 @@
      parse_args_internal(arguments);
      // Check if all arguments are parsed
      for ([[maybe_unused]] const auto &[unused, argument] : m_argument_map) {
-@@ -1894,12 +2362,24 @@
+@@ -1894,12 +2534,24 @@
     * @throws std::runtime_error in case of any invalid argument
     */
    std::vector<std::string>
@@ -637,7 +808,7 @@
      return unknown_arguments;
    }
  
-@@ -1908,8 +2388,19 @@
+@@ -1908,8 +2560,19 @@
     * @throws std::runtime_error in case of any invalid argument
     */
    // NOLINTNEXTLINE(cppcoreguidelines-avoid-c-arrays)
@@ -659,7 +830,7 @@
    }
  
    /* Main entry point for parsing command-line arguments using this
-@@ -1917,8 +2408,19 @@
+@@ -1917,8 +2580,19 @@
     * @throws std::runtime_error in case of any invalid argument
     */
    // NOLINTNEXTLINE(cppcoreguidelines-avoid-c-arrays)

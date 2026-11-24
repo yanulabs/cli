@@ -13,7 +13,7 @@ The checked-in corpora were captured from:
   cxxopts  v3.3.1
   argparse v3.2
 
-Accept/reject parity is checked for every replayable capture.  CLI11 and cxxopts
+Accept/reject parity is checked for every replayable capture.  All three suites
 capture parsed values, so successful untagged cases are checked for parsed-value
 equality as well (value mismatches use direction 2).
 """

@@ -65,40 +65,50 @@ def typed_scalar_text(value: dict) -> str | None:
     return None
 
 
+def typed_kind_matches(cpp: str, value: dict) -> bool:
+    kind = value.get('kind')
+    if kind == 'string':
+        return cpp in CMP_STRING_TYPES
+    if kind == 'bool':
+        return cpp == 'bool'
+    if kind == 'char':
+        return cpp in CMP_CHAR_TYPES or cpp in {'std::int8_t', 'std::uint8_t'}
+    if kind == 'signed':
+        return cpp in CMP_SIGNED_TYPES
+    if kind == 'unsigned':
+        return cpp in CMP_UNSIGNED_TYPES
+    if kind == 'float':
+        return cpp in CMP_FLOAT_TYPES
+    return False
+
+
 def typed_comparison(cpp: str, is_vector: bool, value: dict,
                      label: str, flag_lookup: str | None = None) -> dict | None:
     """Describe a typed value check, or None when shapes/types do not map."""
-    if cpp in CMP_STRING_TYPES and not is_vector:
-        if value.get('kind') != 'string':
+    if value.get('kind') == 'vector':
+        if not is_vector:
             return None
-        expected = value.get('value')
-        if expected is None:
-            return None
-        # The caller replaces this marker with its byte-safe C++ literal.
-        expected = ('string_literal', expected)
-    else:
-        expected = None
-
-    if expected is None:
-        if value.get('kind') == 'vector':
-            if not is_vector:
+        items = []
+        for element in value.get('values', []):
+            if not typed_kind_matches(cpp, element):
                 return None
-            items = []
-            for element in value.get('values', []):
-                text = typed_scalar_text(element)
-                if text is None:
+            text = typed_scalar_text(element)
+            if text is None:
+                return None
+            if cpp in CMP_STRING_TYPES:
+                items.append(('string_literal', text))
+            else:
+                literal = expected_scalar(cpp, text)
+                if literal is None:
                     return None
-                if cpp in CMP_STRING_TYPES:
-                    items.append(('string_literal', text))
-                else:
-                    literal = expected_scalar(cpp, text)
-                    if literal is None:
-                        return None
-                    items.append(literal)
-            expected = ('vector', items)
+                items.append(literal)
+        expected = ('vector', items)
+    else:
+        if is_vector or not typed_kind_matches(cpp, value):
+            return None
+        if cpp in CMP_STRING_TYPES:
+            expected = ('string_literal', value.get('value'))
         else:
-            if is_vector:
-                return None
             text = typed_scalar_text(value)
             if text is None:
                 return None

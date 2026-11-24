@@ -538,10 +538,10 @@ ctest --test-dir build-diff -R differential_upstream --output-on-failure
 CLI11 v2.7.2, argparse v3.2, and cxxopts v3.3.1 test suites — 1,575, 565, and
 46 records respectively. Each replay reconstructs the upstream schema and feeds
 the identical argument vector to `cli.hpp`. Accept/reject parity is checked for
-all three suites; CLI11 and cxxopts also compare parsed option, positional, and
-flag values for successful untagged cases. Coverage is 215/269 cases and 296
-fields for CLI11, and 11/14 cases and 20 fields for cxxopts, with no captured
-field skipped for lack of a builtin mapping.
+all three suites; all three also compare parsed option, positional, and flag
+values for successful untagged cases. Coverage is 215/269 cases and 296 fields
+for CLI11, 118/136 cases and 129 fields for argparse, and 11/14 cases and 20
+fields for cxxopts, with no captured field skipped for lack of a builtin mapping.
 
 The driver fails on any untagged divergence, parsed-value mismatch, or schema
 that cannot be replayed. Tagged divergences name semantics outside the supported

@@ -7,7 +7,7 @@ parse writes one JSON line containing:
 - the exact argument vector (byte-preserving `args_hex` for argparse),
 - the constructed parser schema,
 - the accept/reject outcome and error,
-- for CLI11 and cxxopts, parsed option/positional values used for value checks.
+- for all three suites, typed or raw parsed values used for value checks.
 
 ## Versions
 
@@ -67,7 +67,7 @@ cmake -S argparse -B argparse-build \
 cmake --build argparse-build -j
 rm -f argparse_all.jsonl
 ARGPARSE_DIFF_OUT="$PWD/argparse_all.jsonl" \
-  ctest --test-dir argparse-build --output-on-failure
+  ./argparse-build/test/tests
 ```
 
 ### cxxopts
@@ -105,7 +105,8 @@ gzip -9 -c cxxopts_all.jsonl  > corpus/cxxopts_all.jsonl.gz
 - Environment values read by CLI11 options are recorded (`env_set`,
   `env_value_hex`) because the replay has to recreate them; unrelated ambient
   environment state is not part of the corpus.
-- argparse captures schemas and outcomes, not parsed values.
+- argparse records `m_is_used` and typed `m_values` after parsing; vector
+  container actions are normalized to their final snapshot.
 - cxxopts must be built with C++17 (`CXXOPTS_CXX_STANDARD=17`, as in the
   command above) so the `std::optional` and `std::filesystem::path` test cases guarded by
   `CXXOPTS_HAS_OPTIONAL` and `CXXOPTS_HAS_FILESYSTEM` are compiled in.  A
