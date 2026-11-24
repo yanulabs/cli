@@ -731,6 +731,19 @@ TEST_CASE("an empty required config path is an error") {
     CHECK(r.error().kind == cli::ParseError::Kind::ConfigError);
 }
 
+TEST_CASE("config errors roll back values parsed before config loading") {
+    TempFile cfg("rollback-malformed", "[unterminated\n");
+    cli::App app("tool");
+    app.config_file(cfg.path());
+    auto num = app.add<int>("--num").default_val(1);
+
+    auto bad = app.parse({"--num", "9"});
+    REQUIRE(!bad);
+    CHECK(bad.error().kind == cli::ParseError::Kind::ConfigError);
+    CHECK(!num);
+    CHECK(!num.is_set());
+}
+
 TEST_CASE("config values participate in constraints") {
     TempFile cfg("constraints", "port = 70000\n");
     cli::App app("tool");

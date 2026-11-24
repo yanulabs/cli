@@ -175,6 +175,11 @@ void          app.fish_completion(ostream&);
 void          app.zsh_completion(ostream&);
 ```
 
+Every parse starts by resetting the invocation tree. If parsing fails—either by
+returning `ParseError` or throwing from a validator/transform—the tree is left
+reset: no partially parsed values, defaults, extras, config data, or active
+subcommand remain observable.
+
 ### `Option<T>` builder chain
 
 ```cpp

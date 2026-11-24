@@ -37,8 +37,10 @@ TEST_CASE("value validation is reported before a mutex conflict") {
     auto r = app.parse({"--a", "-1", "--b"});
     REQUIRE(!r);
     CHECK(r.error().kind == cli::ParseError::Kind::ValidationFailed);
-    CHECK(*a == -1);
-    CHECK(*b);
+    CHECK(!a);
+    CHECK(!b);
+    CHECK(!a.is_set());
+    CHECK(!b.is_set());
 }
 
 TEST_CASE("mutex groups work with three options") {

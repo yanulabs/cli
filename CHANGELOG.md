@@ -77,7 +77,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `tool sub --version` works
 - **Default validation** — defaults are checked against `range()`,
   `choices()`, and custom validators
-- **Domain-scoped test suite** — 568 test cases across 19 doctest suites
+- **Domain-scoped test suite** — 574 test cases across 19 doctest suites
   (`api`, `completion`, `constraints`, `custom_types`, `environment`,
   `errors`, `extensions`, `flags`, `groups`, `help`, `lifecycle`, `lookup`,
   `options`, `positionals`, `robustness`, `subcommands`, `tokens`,
@@ -209,6 +209,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (`[default: , two]`, `[|auto]`) instead of silently dropping them
 
 ### Changed
+- Failed parses now leave the invocation tree reset instead of exposing partial
+  values, defaults, extras, config data, or active-command state; exceptions from
+  validators/transforms roll back before propagating
 - The fuzz oracle compares parsed values, explicit-set flags, extras, active
   command chains, repeated parses, and direct-child parsing against equivalent
   root dispatch instead of checking only success/error kinds

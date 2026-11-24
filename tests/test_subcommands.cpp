@@ -817,6 +817,20 @@ TEST_CASE("direct subcommand parsing enforces only global ancestor groups") {
     CHECK(conflict.error().kind == cli::ParseError::Kind::MutuallyExclusive);
 }
 
+TEST_CASE("a failed direct child parse clears inherited global state") {
+    cli::App app("tool");
+    auto verbose = app.add_flag("--verbose").global();
+    auto& build  = app.subcommand("build", "");
+    auto  target = build.add<std::string>("--target");
+
+    auto bad = build.parse({"--verbose", "--target", "release", "--unknown"});
+    REQUIRE(!bad);
+    CHECK(!verbose);
+    CHECK(!target);
+    CHECK(!app.active_subcommand());
+    CHECK(!build.active_subcommand());
+}
+
 TEST_CASE("parsing a nested subcommand directly finalizes every ancestor") {
     cli::App app("tool");
     auto root_value = app.add<int>("--root").default_val(1).global();

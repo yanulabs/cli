@@ -3300,24 +3300,40 @@ private:
     template<typename Token>
     [[nodiscard]] ParseResult run_parse(std::span<const Token> tokens,
                                         bool invocation_root) {
-        // response_files() is configured on the root command, but parsing a
-        // subcommand directly should still honor it.
-        const App* policy = this;
-        while (policy->parent_ != nullptr) policy = policy->parent_;
-        if (!policy->response_files_ || tokens.empty())
-            return do_parse(tokens, invocation_root);
-        std::vector<std::string_view> views;
-        views.reserve(tokens.size());
-        for (const auto& token : tokens)
-            views.emplace_back(token_text(token));
-        auto expanded = detail::expand_response_tokens(views, this);
-        if (!expanded) return std::unexpected(std::move(expanded.error()));
-        std::vector<std::string_view> expanded_views;
-        expanded_views.reserve(expanded->size());
-        for (const auto& token : *expanded)
-            expanded_views.emplace_back(token);
-        return do_parse(std::span<const std::string_view>(expanded_views),
+        try {
+            ParseResult result;
+            // response_files() is configured on the root command, but parsing a
+            // subcommand directly should still honor it.
+            const App* policy = this;
+            while (policy->parent_ != nullptr) policy = policy->parent_;
+            if (!policy->response_files_ || tokens.empty()) {
+                result = do_parse(tokens, invocation_root);
+            } else {
+                std::vector<std::string_view> views;
+                views.reserve(tokens.size());
+                for (const auto& token : tokens)
+                    views.emplace_back(token_text(token));
+                auto expanded = detail::expand_response_tokens(views, this);
+                if (!expanded) {
+                    result = std::unexpected(std::move(expanded.error()));
+                } else {
+                    std::vector<std::string_view> expanded_views;
+                    expanded_views.reserve(expanded->size());
+                    for (const auto& token : *expanded)
+                        expanded_views.emplace_back(token);
+                    result = do_parse(
+                        std::span<const std::string_view>(expanded_views),
                         invocation_root);
+                }
+            }
+            // A failed invocation must not expose partially parsed values,
+            // defaults, extras, config data, or active-command state.
+            if (!result) root_app()->reset();
+            return result;
+        } catch (...) {
+            root_app()->reset();
+            throw;
+        }
     }
 
     template<typename Token>

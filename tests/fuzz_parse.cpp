@@ -200,16 +200,7 @@ void check_error(const cli::ParseResult& result) {
 
 [[nodiscard]] bool equivalent_direct_state(const Snapshot& direct,
                                            const Snapshot& rooted) {
-    if (direct.ok != rooted.ok || direct.kind != rooted.kind
-        || direct.message != rooted.message || direct.context != rooted.context
-        || direct.values != rooted.values || direct.set != rooted.set
-        || direct.extras != rooted.extras)
-        return false;
-    // Root dispatch records the selected child before a child error, while a
-    // failing direct entry point never reaches finish().  Compare command state
-    // for successful parses, where both paths promise equivalent trees.
-    return !direct.ok
-        || (direct.active == rooted.active && direct.chain == rooted.chain);
+    return direct == rooted;
 }
 
 } // namespace
