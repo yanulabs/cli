@@ -273,6 +273,29 @@ jobs:
           cmake --build build --target bench_compare --parallel
           ./build/bench/bench_compare 200000
 
+  differential:
+    name: upstream differential replay
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install GCC 14
+        run: sudo apt-get update && sudo apt-get install -y g++-14
+      - name: Configure
+        env:
+          CC: gcc-14
+          CXX: g++-14
+        run: >
+          cmake -S . -B build
+          -DCMAKE_BUILD_TYPE=Release
+          -DCLI_BUILD_EXAMPLES=OFF
+          -DCLI_BUILD_TESTS=ON
+          -DCLI_BUILD_DIFFERENTIAL_TESTS=ON
+          -DCLI_INSTALL=OFF
+      - name: Build
+        run: cmake --build build --parallel
+      - name: Replay upstream suites
+        run: ctest --test-dir build -R differential_upstream --output-on-failure
+
   fuzz:
     name: libFuzzer smoke
     runs-on: ubuntu-24.04

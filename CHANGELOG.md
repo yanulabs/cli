@@ -77,7 +77,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `tool sub --version` works
 - **Default validation** — defaults are checked against `range()`,
   `choices()`, and custom validators
-- **Domain-scoped test suite** — 567 test cases across 19 doctest suites
+- **Domain-scoped test suite** — 568 test cases across 19 doctest suites
   (`api`, `completion`, `constraints`, `custom_types`, `environment`,
   `errors`, `extensions`, `flags`, `groups`, `help`, `lifecycle`, `lookup`,
   `options`, `positionals`, `robustness`, `subcommands`, `tokens`,
@@ -93,7 +93,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   outcomes, and for CLI11 also compares parsed option and positional values.
   Untagged divergences or hard-blocked schemas fail the run; feature tags
   document the upstream semantics outside the supported subset.  Corpora,
-  capture patches, and rebuild instructions live under `tools/differential/`
+  capture patches, and rebuild instructions live under `tools/differential/`;
+  a dedicated CI job runs all three suites on every push and pull request
 - **CLI11-compatible `char` parsing** — a single-character literal binds
   directly, while longer input is converted as an integer (`77` → `'M'`,
   `0x44` → `'D'`)
@@ -122,7 +123,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   handle is revalidated before parsing so later positionals remain reachable
 - Direct subcommand parsing applies ancestor environment/config/default
   fallbacks but only enforces required and group constraints for inherited
-  globals; unreachable non-global ancestor requirements no longer fail
+  globals; unreachable non-global ancestor requirements no longer fail, and
+  parent positionals are not finalized when a subcommand is active
 - The fuzz harness now escapes non-marker `@...` tokens before parsing, so
   adversarial inputs cannot make response-file expansion open arbitrary paths
 - Subcommand benchmarks no longer dereference option handles after a second
@@ -206,6 +208,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (`[default: , two]`, `[|auto]`) instead of silently dropping them
 
 ### Changed
+- The fuzz oracle compares parsed values, explicit-set flags, extras, active
+  command chains, repeated parses, and direct-child parsing against equivalent
+  root dispatch instead of checking only success/error kinds
 - Floating-point conversion detects `std::from_chars` support directly instead
   of relying on a lagging feature-test macro, avoiding temporary string
   allocation and locale-aware `strtod` on supporting standard libraries while

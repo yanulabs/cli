@@ -290,7 +290,8 @@ the global `--verbose` spelling remains functional and documented. Parsing a
 subcommand directly (`build.parse(...)`) applies ancestor environment, config,
 and default fallbacks, but only inherited globals participate in required and
 group checks; non-global ancestor options and positionals cannot be supplied
-from that entry point and do not make the direct parse fail.
+from that entry point and do not make the direct parse fail. Parent positionals
+are likewise not finalized when a subcommand is selected through the root.
 
 ### Negatable flags
 
@@ -525,7 +526,7 @@ cmake -S . -B build-fuzz -DCLI_BUILD_EXAMPLES=OFF -DCLI_BUILD_FUZZERS=ON
 cmake --build build-fuzz --target fuzz_parse
 ./build-fuzz/tests/fuzz_parse tests/fuzz_corpus -max_len=4096 -runs=200000
 
-# Upstream differential replays (opt-in; needs Python 3 and GCC/Clang)
+# Upstream differential replays (opt-in locally; required in CI)
 cmake -S . -B build-diff -DCLI_BUILD_DIFFERENTIAL_TESTS=ON
 cmake --build build-diff -j
 ctest --test-dir build-diff -R differential_upstream --output-on-failure
@@ -546,7 +547,8 @@ The driver fails on any untagged divergence, parsed-value mismatch, or schema
 that cannot be replayed. Tagged divergences name semantics outside the supported
 subset (config files, custom converters, help rendering, exotic containers, and
 so on); they are expected and are not counted as parser mismatches. The checked
-corpora currently produce zero untagged divergences and zero hard blocks.
+corpora currently produce zero untagged divergences and zero hard blocks.  A
+dedicated CI job replays all three suites on every push and pull request.
 
 ```bash
 python3 tools/differential/run.py --cxx clang++
@@ -565,7 +567,9 @@ Tests are split by domain (`flags`, `options`, `positionals`, `values`,
 suite, so failures are attributable to one area and the whole suite can still
 be run at once. The fuzz target is opt-in and requires Clang with a libFuzzer runtime
 (Linux CI uses Clang 19); `CLI_FUZZER_SANITIZERS` controls the sanitizer set
-(default `address,undefined`).
+(default `address,undefined`).  Its oracle compares parsed values, explicit-set
+flags, extras, active command chains, repeated parses, and direct-child parsing
+against equivalent root dispatch.
 
 ### Performance
 

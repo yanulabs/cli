@@ -3650,7 +3650,7 @@ private:
         }
 
         for (auto& pos : positionals_) {
-            if (direct_ancestor) continue;
+            if (subcommand_active) continue;
             if (pos->is_set_) {
                 if (pos->parsed_count_ < pos->nargs_min_)
                     return std::unexpected(ParseError::not_enough_values(
@@ -3705,7 +3705,7 @@ private:
         for (auto& opt : options_)
             if (opt->needs_finalize_)
                 if (auto r = opt->validate_and_finalize(this); !r) return r;
-        if (!direct_ancestor)
+        if (!subcommand_active)
             for (auto& pos : positionals_)
                 if (pos->needs_finalize_)
                     if (auto r = pos->validate_and_finalize(this); !r) return r;

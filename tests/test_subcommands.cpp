@@ -286,6 +286,20 @@ TEST_CASE("a positional before a subcommand token prevents dispatch") {
     CHECK(!app.active_subcommand());
 }
 
+TEST_CASE("parent positionals are not finalized when a subcommand is active") {
+    cli::App app("tool");
+    auto file = app.add_positional<std::string>("file").default_val("root.txt");
+    auto& build = app.subcommand("build", "");
+
+    REQUIRE(app.parse({"build"}));
+    CHECK(!file);
+    CHECK(app.active_subcommand() == &build);
+
+    REQUIRE(build.parse({}));
+    CHECK(!file);
+    CHECK(app.active_subcommand() == &build);
+}
+
 TEST_CASE("end-of-options prevents subcommand dispatch") {
     cli::App app("tool");
     auto file = app.add_positional<std::string>("file");

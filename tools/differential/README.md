@@ -70,8 +70,9 @@ ctest --test-dir build -R differential_upstream --output-on-failure
 ```
 
 The CMake registration is opt-in (`CLI_BUILD_DIFFERENTIAL_TESTS=OFF` by
-default) so normal builds stay fast and offline.  It requires Python 3 and a
-GCC/Clang-style compiler; it is intentionally unavailable under MSVC.
+default) so normal local builds stay fast and offline.  CI enables it in a
+dedicated job.  It requires Python 3 and a GCC/Clang-style compiler; it is
+intentionally unavailable under MSVC.
 
 Each generator can also be run directly:
 
