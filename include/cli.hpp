@@ -421,6 +421,11 @@ template<typename T>
 }
 
 template<typename T>
+concept HasFloatingFromChars = requires(const char* first, const char* last, T& value) {
+    { std::from_chars(first, last, value) } -> std::same_as<std::from_chars_result>;
+};
+
+template<typename T>
 [[nodiscard]] auto from_string(std::string_view sv) -> std::expected<T, std::string> {
     if constexpr (std::is_same_v<T, std::string>) {
         return std::string(sv);
@@ -520,12 +525,16 @@ template<typename T>
         if (num.empty())
             return std::unexpected(std::format("'{}' is not a valid number", sv));
         T val{};
-#if defined(__cpp_lib_to_chars) && __cpp_lib_to_chars >= 201611L
-        auto [p, ec] = std::from_chars(num.data(), num.data() + num.size(), val);
-        if (ec != std::errc{} || p != num.data() + num.size())
-            return std::unexpected(std::format("'{}' is not a valid number", sv));
-        return val;
-#else
+        // Feature-test macros for floating-point from_chars have lagged behind
+        // library support (notably in libc++).  Detect the overload directly so
+        // the common path avoids allocating a string and locale-aware strtod.
+        // Keep the fallback for libraries without the overload and for special
+        // spellings such as inf/nan that from_chars does not accept.
+        if constexpr (HasFloatingFromChars<T>) {
+            auto [p, ec] = std::from_chars(num.data(), num.data() + num.size(), val);
+            if (ec == std::errc{} && p == num.data() + num.size())
+                return val;
+        }
         try {
             size_t idx = 0;
             std::string s(num);
@@ -541,7 +550,6 @@ template<typename T>
         } catch (...) {
             return std::unexpected(std::format("'{}' is not a valid number", sv));
         }
-#endif
     } else if constexpr (requires(std::string_view raw) {
                              { cli_parse(raw, std::type_identity<T>{}) }
                                  -> std::same_as<std::expected<T, std::string>>;
@@ -566,6 +574,7 @@ template<typename T>
 // ────────────────────────────────────────────────────────────────────────────
 
 struct OptionBase;
+struct OptionRegistry;
 
 // Transparent hash so the index can be queried with a string_view without
 // allocating a temporary std::string on the hot parse path.
@@ -676,50 +685,6 @@ template<typename F>
     return {};
 }
 
-struct OptionRegistry {
-    std::unordered_map<std::string, OptionBase*, StringHash, std::equal_to<>> by_name;
-    // One-character short options are by far the most common token shape.
-    // A direct ASCII index avoids hashing for every `-v` / `-j` lookup.
-    std::array<OptionBase*, 128> one_char{};
-
-    [[nodiscard]] OptionBase* find(std::string_view name) const noexcept {
-        if (name.size() == 2 && name[0] == '-') {
-            const auto c = static_cast<unsigned char>(name[1]);
-            if (c < one_char.size() && one_char[c] != nullptr)
-                return one_char[c];
-        }
-        const auto it = by_name.find(name);
-        return it == by_name.end() ? nullptr : it->second;
-    }
-
-    void ensure_available(std::string_view name) const {
-        if (find(name) != nullptr)
-            throw std::invalid_argument(
-                std::format("cli: duplicate option name '{}'", name));
-    }
-
-    void add(OptionBase* option, std::string_view name) {
-        const auto [it, inserted] = by_name.try_emplace(std::string(name), option);
-        (void)it;
-        if (!inserted)
-            throw std::invalid_argument(
-                std::format("cli: duplicate option name '{}'", name));
-        if (name.size() == 2 && name[0] == '-') {
-            const auto c = static_cast<unsigned char>(name[1]);
-            if (c < one_char.size()) one_char[c] = option;
-        }
-    }
-
-    void remove(OptionBase* option) {
-        for (auto& slot : one_char)
-            if (slot == option) slot = nullptr;
-        for (auto it = by_name.begin(); it != by_name.end();) {
-            if (it->second == option) it = by_name.erase(it);
-            else ++it;
-        }
-    }
-};
-
 // ────────────────────────────────────────────────────────────────────────────
 // §3  OptionBase — internal polymorphic option node
 // ────────────────────────────────────────────────────────────────────────────
@@ -787,6 +752,79 @@ struct OptionBase {
     [[nodiscard]] std::string_view display_name() const noexcept {
         auto ln = long_name();
         return ln.empty() ? short_name() : ln;
+    }
+};
+
+struct OptionRegistry {
+    std::unordered_map<std::string, OptionBase*, StringHash, std::equal_to<>> by_name;
+    // One-character short options are by far the most common token shape.
+    // A direct ASCII index avoids hashing for every `-v` / `-j` lookup.
+    std::array<OptionBase*, 128> one_char{};
+    // Most schemas also have distinct first letters for their long options.
+    // Keep a candidate per ASCII letter and fall back to hashing on collisions;
+    // the candidate's full name is always checked before it is accepted.
+    std::array<OptionBase*, 128> long_candidate{};
+
+    [[nodiscard]] OptionBase* find(std::string_view name) const noexcept {
+        if (name.size() == 2 && name[0] == '-') {
+            const auto c = static_cast<unsigned char>(name[1]);
+            if (c < one_char.size()) return one_char[c];
+        }
+        if (name.size() > 2 && name[0] == '-' && name[1] == '-') {
+            const auto c = static_cast<unsigned char>(name[2]);
+            if (c < long_candidate.size()) {
+                auto* candidate = long_candidate[c];
+                if (candidate != nullptr && candidate->matches(name)) return candidate;
+            }
+        }
+        const auto it = by_name.find(name);
+        return it == by_name.end() ? nullptr : it->second;
+    }
+
+    void ensure_available(std::string_view name) const {
+        if (find(name) != nullptr)
+            throw std::invalid_argument(
+                std::format("cli: duplicate option name '{}'", name));
+    }
+
+    void add(OptionBase* option, std::string_view name) {
+        const auto [it, inserted] = by_name.try_emplace(std::string(name), option);
+        (void)it;
+        if (!inserted)
+            throw std::invalid_argument(
+                std::format("cli: duplicate option name '{}'", name));
+        if (name.size() == 2 && name[0] == '-') {
+            const auto c = static_cast<unsigned char>(name[1]);
+            if (c < one_char.size()) one_char[c] = option;
+        } else if (name.size() > 2 && name[0] == '-' && name[1] == '-') {
+            const auto c = static_cast<unsigned char>(name[2]);
+            if (c < long_candidate.size()) {
+                auto*& candidate = long_candidate[c];
+                if (candidate == nullptr) candidate = option;
+                else if (candidate != option) candidate = nullptr;
+            }
+        }
+    }
+
+    void remove(OptionBase* option) {
+        for (auto& slot : one_char)
+            if (slot == option) slot = nullptr;
+        for (auto it = by_name.begin(); it != by_name.end();) {
+            if (it->second == option) it = by_name.erase(it);
+            else ++it;
+        }
+        // Removing a candidate can make a previously ambiguous letter unique
+        // again.  Rebuild from the surviving owned keys while this cold path is
+        // already touching the map.
+        long_candidate.fill(nullptr);
+        for (const auto& [name, surviving] : by_name) {
+            if (name.size() <= 2 || name[0] != '-' || name[1] != '-') continue;
+            const auto c = static_cast<unsigned char>(name[2]);
+            if (c >= long_candidate.size()) continue;
+            auto*& candidate = long_candidate[c];
+            if (candidate == nullptr) candidate = surviving;
+            else if (candidate != surviving) candidate = nullptr;
+        }
     }
 };
 

@@ -13,6 +13,8 @@
 //         -DCLI_BUILD_COMPARATIVE_BENCHMARKS=ON -DCMAKE_BUILD_TYPE=Release
 // Run:
 //   ./build/bench/bench_compare [iterations]
+// Every timed iteration must parse successfully; value prechecks and any timed
+// failure make the benchmark exit nonzero.
 // ─────────────────────────────────────────────────────────────────────────────
 #include <cli.hpp>
 
@@ -49,12 +51,16 @@ template<typename Fn>
         sink += fn();
 
     const auto start = std::chrono::steady_clock::now();
-    for (size_t i = 0; i < iterations; ++i)
-        sink += fn();
+    bool correct = true;
+    for (size_t i = 0; i < iterations; ++i) {
+        const auto value = fn();
+        if (value == 0) correct = false;
+        sink += value;
+    }
     const auto stop = std::chrono::steady_clock::now();
 
     const auto ns = std::chrono::duration<double, std::nano>(stop - start).count();
-    return { ns / static_cast<double>(iterations), true };
+    return { ns / static_cast<double>(iterations), correct };
 }
 
 // ── cli.hpp scenarios ────────────────────────────────────────────────────────
@@ -78,7 +84,7 @@ Result cli_flags(size_t iterations, const std::vector<std::string_view>& args) {
     auto result = measure(iterations, [&] {
         return static_cast<std::uint64_t>(app.parse(args).has_value());
     });
-    result.correct = valid;
+    result.correct = valid && result.correct;
     return result;
 }
 
@@ -100,7 +106,7 @@ Result cli_options(size_t iterations, const std::vector<std::string_view>& args)
     auto result = measure(iterations, [&] {
         return static_cast<std::uint64_t>(app.parse(args).has_value());
     });
-    result.correct = valid;
+    result.correct = valid && result.correct;
     return result;
 }
 
@@ -120,12 +126,12 @@ Result cli_mixed(size_t iterations, const std::vector<std::string_view>& args) {
     auto result = measure(iterations, [&] {
         return static_cast<std::uint64_t>(app.parse(args).has_value());
     });
-    result.correct = valid;
+    result.correct = valid && result.correct;
     return result;
 }
 
 Result cli_subcommand(size_t iterations, const std::vector<std::string_view>& args,
-                      const std::vector<std::string_view>& nested) {
+                      const std::vector<std::string_view>& nested, bool nested_case) {
     cli::App app("bench", "desc", "1.0.0");
     (void)app.add_flag("--verbose").short_name("-v");
     auto& build  = app.subcommand("build", "Compile");
@@ -135,18 +141,19 @@ Result cli_subcommand(size_t iterations, const std::vector<std::string_view>& ar
     auto& add    = remote.subcommand("add", "Add one");
     auto  url    = add.add<std::string>("--url");
 
-    const bool valid = [&] {
-        const auto r = app.parse(args);
-        const auto n = app.parse(nested);
-        return r && n && *target == "release" && *jobs == 8
-               && *url == "https://example.com";
-    }();
+    auto parse = [&]() -> bool {
+        const auto& input = nested_case ? nested : args;
+        const auto r = app.parse(input);
+        if (!r) return false;
+        return nested_case ? *url == "https://example.com"
+                           : *target == "release" && *jobs == 8;
+    };
+    const bool valid = parse();
 
     auto result = measure(iterations, [&] {
-        return static_cast<std::uint64_t>(app.parse(args).has_value()
-                                          && app.parse(nested).has_value());
+        return static_cast<std::uint64_t>(parse());
     });
-    result.correct = valid;
+    result.correct = valid && result.correct;
     return result;
 }
 
@@ -203,7 +210,7 @@ Result cli11_flags(size_t iterations, const std::vector<std::string>& args) {
     auto result = measure(iterations, [&] {
         return static_cast<std::uint64_t>(parse());
     });
-    result.correct = valid;
+    result.correct = valid && result.correct;
     return result;
 }
 
@@ -237,7 +244,7 @@ Result cli11_options(size_t iterations, const std::vector<std::string>& args) {
     auto result = measure(iterations, [&] {
         return static_cast<std::uint64_t>(parse());
     });
-    result.correct = valid;
+    result.correct = valid && result.correct;
     return result;
 }
 
@@ -267,12 +274,12 @@ Result cli11_mixed(size_t iterations, const std::vector<std::string>& args) {
     auto result = measure(iterations, [&] {
         return static_cast<std::uint64_t>(parse());
     });
-    result.correct = valid;
+    result.correct = valid && result.correct;
     return result;
 }
 
 Result cli11_subcommand(size_t iterations, const std::vector<std::string>& args,
-                        const std::vector<std::string>& nested) {
+                        const std::vector<std::string>& nested, bool nested_case) {
     CLI::App app{"bench"};
     Cli11Args input{args};
     Cli11Args nested_input{nested};
@@ -287,24 +294,24 @@ Result cli11_subcommand(size_t iterations, const std::vector<std::string>& args,
     std::string url;
     add->add_option("--url", url);
 
-    auto parse = [&] -> bool {
-        input.reset();
-        nested_input.reset();
+    auto parse = [&](bool use_nested) -> bool {
+        auto& source = use_nested ? nested_input : input;
+        source.reset();
         try {
-            app.parse(input.scratch());
-            app.parse(nested_input.scratch());
+            app.parse(source.scratch());
         } catch (const CLI::ParseError&) {
             return false;
         }
         return true;
     };
-    const bool valid = parse()
-        && target == "release" && jobs == 8 && url == "https://example.com";
+    const bool valid = parse(nested_case)
+        && (nested_case ? url == "https://example.com"
+                        : target == "release" && jobs == 8);
 
     auto result = measure(iterations, [&] {
-        return static_cast<std::uint64_t>(parse());
+        return static_cast<std::uint64_t>(parse(nested_case));
     });
-    result.correct = valid;
+    result.correct = valid && result.correct;
     return result;
 }
 
@@ -366,7 +373,7 @@ Result cxxopts_flags(size_t iterations, const std::vector<std::string>& args) {
     auto result = measure(iterations, [&] {
         return static_cast<std::uint64_t>(parse());
     });
-    result.correct = valid;
+    result.correct = valid && result.correct;
     return result;
 }
 
@@ -406,7 +413,7 @@ Result cxxopts_options(size_t iterations, const std::vector<std::string>& args) 
     auto result = measure(iterations, [&] {
         return static_cast<std::uint64_t>(parse());
     });
-    result.correct = valid;
+    result.correct = valid && result.correct;
     return result;
 }
 
@@ -442,7 +449,7 @@ Result cxxopts_mixed(size_t iterations, const std::vector<std::string>& args) {
     auto result = measure(iterations, [&] {
         return static_cast<std::uint64_t>(parse());
     });
-    result.correct = valid;
+    result.correct = valid && result.correct;
     return result;
 }
 
@@ -517,19 +524,22 @@ int main(int argc, char** argv) {
                              cli11_mixed(iterations, owned_mixed),
                              cxxopts_mixed(iterations, owned_mixed));
 
-    const auto cli_sub = cli_subcommand(iterations, sub_args, nested_args);
-    const auto cli11_sub = cli11_subcommand(iterations, owned_sub, owned_nested);
-    std::cout << std::format("{:<24} {:>11.1f} {:>11.1f} {:>11}  {}\n",
-                             "nested subcommand", cli_sub.ns_per_parse,
-                             cli11_sub.ns_per_parse, "n/a",
-                             "cxxopts has no subcommands");
-    all_correct &= cli_sub.correct && cli11_sub.correct;
-    if (!cli_sub.correct || !cli11_sub.correct) {
-        std::cout << "  validation failed:";
-        if (!cli_sub.correct) std::cout << " cli.hpp";
-        if (!cli11_sub.correct) std::cout << " CLI11";
-        std::cout << '\n';
-    }
+    auto report_subcommand = [&](std::string_view name, bool nested_case) {
+        const auto cli_sub = cli_subcommand(iterations, sub_args, nested_args, nested_case);
+        const auto cli11_sub = cli11_subcommand(iterations, owned_sub, owned_nested, nested_case);
+        std::cout << std::format("{:<24} {:>11.1f} {:>11.1f} {:>11}  {}\n",
+                                 name, cli_sub.ns_per_parse, cli11_sub.ns_per_parse, "n/a",
+                                 "cxxopts has no subcommands");
+        if (!cli_sub.correct || !cli11_sub.correct) {
+            std::cout << "  validation failed:";
+            if (!cli_sub.correct) std::cout << " cli.hpp";
+            if (!cli11_sub.correct) std::cout << " CLI11";
+            std::cout << '\n';
+        }
+        return cli_sub.correct && cli11_sub.correct;
+    };
+    all_correct &= report_subcommand("subcommand + options", false);
+    all_correct &= report_subcommand("nested subcommand", true);
 
     const auto checksum = static_cast<std::uint64_t>(sink);
     std::cout << std::format("\n(checksum {})\n", checksum);

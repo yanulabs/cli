@@ -1,5 +1,6 @@
 #include "test_support.hpp"
 
+#include <cmath>
 #include <limits>
 
 TEST_SUITE_BEGIN("values");
@@ -168,6 +169,24 @@ TEST_CASE("floating-point values accept common literal forms") {
 
     REQUIRE(app.parse({"--value", "-1E-3"}));
     CHECK(*value == doctest::Approx(-0.001));
+}
+
+TEST_CASE("floating-point types preserve hexadecimal and special values") {
+    cli::App app("t");
+    auto f = app.add<float>("--float");
+    auto d = app.add<double>("--double");
+    auto ld = app.add<long double>("--long-double");
+
+    REQUIRE(app.parse({
+        "--float", "0x1.8p1",
+        "--double", "Infinity",
+        "--long-double", "-NaN",
+    }));
+    CHECK(*f == 3.0f);
+    CHECK(std::isinf(*d));
+    CHECK(*d > 0);
+    CHECK(std::isnan(*ld));
+    CHECK(std::signbit(*ld));
 }
 
 TEST_CASE("malformed floating-point spellings are rejected") {

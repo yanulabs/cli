@@ -128,9 +128,9 @@ extern "C" int LLVMFuzzerTestOneInput(const std::uint8_t* data, std::size_t size
     run.alias("r");
     (void)run.add<int>("--count");
 
-    // Map one marker spelling to the controlled response file.  Other
-    // `@...` tokens remain ordinary arguments so the fuzzer cannot read
-    // arbitrary paths while still exercising response expansion.
+    // Map one marker spelling to the controlled response file.  Escape every
+    // other @ prefix so adversarial paths remain literal and cannot make the
+    // fuzzer read arbitrary files while still exercising response expansion.
     std::vector<std::string> owned;
     owned.reserve(args.size());
     std::vector<std::string_view> parse_args;
@@ -138,6 +138,13 @@ extern "C" int LLVMFuzzerTestOneInput(const std::uint8_t* data, std::size_t size
     for (const auto arg : args) {
         if (arg == "@fuzz") {
             owned.push_back("@" + fuzz_files().response.string());
+            parse_args.emplace_back(owned.back());
+        } else if (arg.starts_with('@')) {
+            // response_files() expands every @token.  Double the prefix so
+            // adversarial paths stay literal instead of opening arbitrary
+            // files, devices, or pipes in the fuzzer process.
+            owned.emplace_back("@@");
+            owned.back().append(arg);
             parse_args.emplace_back(owned.back());
         } else {
             parse_args.emplace_back(arg);

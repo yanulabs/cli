@@ -77,7 +77,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `tool sub --version` works
 - **Default validation** — defaults are checked against `range()`,
   `choices()`, and custom validators
-- **Domain-scoped test suite** — 556 test cases across 19 doctest suites
+- **Domain-scoped test suite** — 558 test cases across 19 doctest suites
   (`api`, `completion`, `constraints`, `custom_types`, `environment`,
   `errors`, `extensions`, `flags`, `groups`, `help`, `lifecycle`, `lookup`,
   `options`, `positionals`, `robustness`, `subcommands`, `tokens`,
@@ -113,6 +113,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `find_package` consumer build
 
 ### Fixed
+- The fuzz harness now escapes non-marker `@...` tokens before parsing, so
+  adversarial inputs cannot make response-file expansion open arbitrary paths
+- Subcommand benchmarks no longer dereference option handles after a second
+  parse resets their values; subcommand and nested-subcommand workloads are now
+  measured separately, and both benchmark drivers fail if any timed parse
+  produces an unexpected result
 - `App::reset()` now clears the loaded config path and data, so a later parse
   cannot reuse a previous parse's configuration
 - `config_option()` registers `--config` as a global option, so
@@ -190,6 +196,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (`[default: , two]`, `[|auto]`) instead of silently dropping them
 
 ### Changed
+- Floating-point conversion detects `std::from_chars` support directly instead
+  of relying on a lagging feature-test macro, avoiding temporary string
+  allocation and locale-aware `strtod` on supporting standard libraries while
+  retaining the fallback for special values such as `inf` and `nan`
+- Long-option lookup uses a direct ASCII first-letter candidate index with full
+  name verification and hash-map fallback for collisions and non-ASCII names
 - Whole-value validators and transforms run before mutex/require group checks,
   so an invalid value is reported ahead of a structural group conflict
 - `parse(argc, argv)` no longer copies the token list into a temporary vector;

@@ -569,20 +569,24 @@ reset. On an Apple-silicon laptop (Release, Clang) the suite currently runs at:
 
 | Scenario | ns/parse | parses/sec |
 |---|---:|---:|
-| 8 short flags | ~158 | ~6.3 M |
-| 6 typed options (12 tokens) | ~255 | ~3.9 M |
-| mixed flags/options/vector/positional | ~244 | ~4.1 M |
-| subcommand + options (2 parses) | ~270 | ~3.7 M |
+| 8 short flags | ~130 | ~7.7 M |
+| 6 typed options (12 tokens) | ~225 | ~4.4 M |
+| mixed flags/options/vector/positional | ~225 | ~4.4 M |
+| subcommand + options | ~130 | ~7.7 M |
+| nested subcommand | ~116 | ~8.6 M |
 
-`bench_compare` runs the same schema shapes against CLI11 2.7.2 and cxxopts
-3.3.1. Across repeated runs on the same machine, cli.hpp is roughly 2.3–5.5×
-faster per parse than CLI11 and 24–53× faster than cxxopts (CLI11:
-~858/605/346/1160 ns; cxxopts: ~8352/6125/3401 ns, no subcommands).
+`bench_compare` runs equivalent schema shapes against CLI11 2.7.2 and cxxopts
+3.3.1. Across repeated runs on the same machine, cli.hpp is roughly 2.8–6.8×
+faster per parse than CLI11 and 26–56× faster than cxxopts on the shared
+scenarios. Subcommand workloads are reported separately because cxxopts does
+not support them.
 
 Numbers vary by machine; run the benchmark targets on your own hardware.
-Hot-path work is allocation-free for `parse(argc, argv)`, one-character short
-options use a direct 128-slot index instead of hashing, and formatting is
-confined to help/error paths.
+Token handling is allocation-free for `parse(argc, argv)`; string and vector
+values may allocate. One-character short options and collision-free long
+options use direct ASCII indexes, floating-point conversion uses
+`std::from_chars` where available, and formatting is confined to help/error
+paths.
 
 ---
 

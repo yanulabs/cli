@@ -196,6 +196,31 @@ TEST_CASE("duplicate option names are rejected transactionally") {
     CHECK(app["-n"].as<int>() == 4);
 }
 
+TEST_CASE("long-option candidates handle aliases, collisions and rollback") {
+    cli::App app("t");
+    auto color = app.add_flag("--color").alias("--colour");
+    auto count = app.add<int>("--count");
+    auto alpha = app.add_flag("--alpha").short_name("-a");
+
+    // The two-name compatibility registration inserts --atomic before the
+    // duplicate -a rejects it.  Rollback must remove the temporary long-option
+    // candidate as well as the short name.
+    CHECK_THROWS_AS((void)app.option<int>("--atomic", "-a", ""),
+                    std::invalid_argument);
+
+    app.allow_abbrev();
+    REQUIRE(app.parse({"--colour", "--count", "3", "--alpha"}));
+    CHECK(*color);
+    CHECK(*count == 3);
+    CHECK(*alpha);
+
+    REQUIRE(app.parse({"--col"}));
+    CHECK(*color);
+    auto ambiguous = app.parse({"--co"});
+    REQUIRE(!ambiguous);
+    CHECK(ambiguous.error().kind == cli::ParseError::Kind::AmbiguousOption);
+}
+
 TEST_CASE("command names and aliases are unique among siblings") {
     cli::App app("tool");
     auto& build = app.subcommand("build", "Compile");
