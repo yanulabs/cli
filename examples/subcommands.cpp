@@ -7,7 +7,7 @@
 
 int main(int argc, char** argv) {
     cli::App app{"cargo", "A minimal Cargo-like build tool", "0.1.0"};
-    app.author("Yanujz Labs")
+    app.author("Yanu Labs")
        .example("cargo build --target release -j4")
        .example("cargo run --bin myapp")
        .example("cargo test --filter my_test");

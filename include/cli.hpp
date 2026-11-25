@@ -1,5 +1,8 @@
 #pragma once
 
+// Copyright (c) 2024-2026 Yanu Labs
+// SPDX-License-Identifier: MIT
+
 // ════════════════════════════════════════════════════════════════════════════
 //  cli.hpp  ·  A modern C++23 command-line argument parser
 //  ─────────────────────────────────────────────────────────────────────────

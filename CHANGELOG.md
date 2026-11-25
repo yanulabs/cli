@@ -8,6 +8,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **OSS project metadata** — Yanu Labs copyright ownership, third-party license
+  texts/notices, contribution and security policies, code of conduct, and issue
+  and pull-request templates
 - **Variable-arity options** — `.nargs(N)`, `.nargs(lo, hi)`, and
   `.nargs_at_least(N)` let one vector-option occurrence consume several
   tokens; exact arities keep dash-prefixed values, ranged arities stop at the

@@ -1,0 +1,45 @@
+name: Feature request
+description: Propose a focused improvement to cli.hpp
+title: "[Feature]: "
+labels: [enhancement]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Please explain the problem first, then the smallest API or behavior
+        change that would solve it while preserving the single-header C++23 design.
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem or use case
+      description: What are you trying to build, and what is currently difficult?
+      placeholder: Describe the concrete use case.
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed solution
+      description: Show the desired API or behavior with a short example.
+      render: cpp
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: Existing workarounds, upstream behavior, or other designs.
+  - type: textarea
+    id: compatibility
+    attributes:
+      label: Compatibility impact
+      description: Note any breaking changes, new dependencies, or platform constraints.
+  - type: checkboxes
+    id: checklist
+    attributes:
+      label: Pre-submission checklist
+      options:
+        - label: I searched existing issues and pull requests for this proposal.
+          required: true
+        - label: I considered how this fits the zero-dependency, single-header design.
+          required: true

@@ -1,0 +1,52 @@
+# Third-Party Notices
+
+`cli.hpp` is developed by **Yanu Labs** and distributed under the MIT License.
+See [`LICENSE`](LICENSE) for the project license.
+
+This repository also includes or derives test and verification material from
+third-party projects. Their original copyrights and licenses are retained.
+
+## doctest
+
+- File: `tests/doctest.h`
+- Project: [doctest](https://github.com/doctest/doctest)
+- License: MIT
+- Copyright: © 2016-2023 Viktor Kirilov
+- License text: [`LICENSES/doctest-MIT.txt`](LICENSES/doctest-MIT.txt)
+
+doctest is used only by the test suite and is not part of the installed
+`cli.hpp` header.
+
+## CLI11
+
+- Material: differential capture patches and corpus data under
+  `tools/differential/capture/` and `tools/differential/corpus/`
+- Project: [CLI11](https://github.com/CLIUtils/CLI11)
+- Version: `v2.7.2`
+- License: BSD-3-Clause
+- Copyright: © 2017-2026 University of Cincinnati; developed by Henry
+  Schreiner under NSF Award 1414736
+- License text: [`LICENSES/CLI11-BSD-3-Clause.txt`](LICENSES/CLI11-BSD-3-Clause.txt)
+
+## argparse
+
+- Material: differential capture patches and corpus data under
+  `tools/differential/capture/` and `tools/differential/corpus/`
+- Project: [argparse](https://github.com/p-ranav/argparse)
+- Version: `v3.2`
+- License: MIT
+- Copyright: © 2018 Pranav Srinivas Kumar
+- License text: [`LICENSES/argparse-MIT.txt`](LICENSES/argparse-MIT.txt)
+
+## cxxopts
+
+- Material: differential capture patches and corpus data under
+  `tools/differential/capture/` and `tools/differential/corpus/`
+- Project: [cxxopts](https://github.com/jarro2783/cxxopts)
+- Version: `v3.3.1`
+- License: MIT
+- Copyright: © 2014 Jarryd Beck
+- License text: [`LICENSES/cxxopts-MIT.txt`](LICENSES/cxxopts-MIT.txt)
+
+The differential material is used for verification only. It is not linked into
+the library or installed with the `cli.hpp` header.

@@ -10,7 +10,7 @@ namespace fs = std::filesystem;
 int main(int argc, char** argv) {
     // 3-arg constructor: name, description, version — no .version() chaining needed
     cli::App app{"mytool", "A demo tool built with cli.hpp", "1.0.0"};
-    app.author("Yanujz Labs")
+    app.author("Yanu Labs")
        .example("mytool -v -j8 --output /tmp/out")
        .example("mytool --output ./build --tag foo --tag bar");
 

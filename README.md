@@ -2,8 +2,21 @@
 
 > Single-header · zero-dependency · cross-platform · fully type-safe
 
+[![CI](https://github.com/yanulabs/cli/actions/workflows/ci.yml/badge.svg)](https://github.com/yanulabs/cli/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![C++23](https://img.shields.io/badge/C%2B%2B-23-blueviolet.svg)]()
+[![Issues](https://img.shields.io/github/issues/yanulabs/cli.svg)](https://github.com/yanulabs/cli/issues)
+[![Pull Requests](https://img.shields.io/github/issues-pr/yanulabs/cli.svg)](https://github.com/yanulabs/cli/pulls)
+
+---
+
+## Community
+
+- [Contributing guide](CONTRIBUTING.md)
+- [Code of conduct](CODE_OF_CONDUCT.md)
+- [Security policy](SECURITY.md)
+- [Changelog](CHANGELOG.md)
+- [Third-party notices](NOTICE)
 
 ---
 
@@ -49,7 +62,7 @@
 | **Reusable App** | `parse()` resets automatically; `app.reset()` is available explicitly |
 | **Initializer parse** | `app.parse({"-v", "--jobs", "8"})` — no argc/argv needed |
 | **Vector parse** | `app.parse(std::vector<std::string>{...})` |
-| **Differential verification** | Replays the full upstream CLI11, argparse, and cxxopts test corpora, including parsed values for supported CLI11 options |
+| **Differential verification** | Replays the full upstream CLI11, argparse, and cxxopts test corpora, including parsed values for all three |
 
 ---
 
@@ -62,7 +75,7 @@ namespace fs = std::filesystem;
 
 int main(int argc, char** argv) {
     cli::App app("tool", "My blazing-fast tool");
-    app.version("1.0.0").author("Yanujz")
+    app.version("1.2.0").author("Yanu Labs")
        .example("tool build --target release -j8");
 
     auto verbose = app.add_flag("--verbose").short_name("-v").help("Verbose output");
@@ -622,4 +635,4 @@ example programs additionally use `std::print`.
 
 ## License
 
-[MIT](LICENSE) © 2024 Yanujz Labs
+[MIT](LICENSE) © 2024-2026 [Yanu Labs](https://github.com/yanulabs). See [NOTICE](NOTICE) for third-party attributions.
