@@ -11,6 +11,7 @@
 
 #ifdef _WIN32
 #  include <stdlib.h>
+#  include <windows.h>
 #endif
 
 // Builds an argc/argv pair from string literals.  The program name is added
@@ -58,7 +59,7 @@ public:
 private:
     static void set_raw(const char* name, const char* value) {
 #ifdef _WIN32
-        _putenv_s(name, value);
+        SetEnvironmentVariableA(name, value);
 #else
         setenv(name, value, 1);
 #endif
@@ -66,7 +67,7 @@ private:
 
     static void unset_raw(const char* name) {
 #ifdef _WIN32
-        _putenv_s(name, "");
+        SetEnvironmentVariableA(name, nullptr);
 #else
         unsetenv(name);
 #endif

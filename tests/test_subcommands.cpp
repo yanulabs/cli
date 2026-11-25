@@ -282,7 +282,7 @@ TEST_CASE("a positional before a subcommand token prevents dispatch") {
     auto r = app.parse({"notes.txt", "build"});
     REQUIRE(!r);
     CHECK(r.error().kind == cli::ParseError::Kind::TooManyPositionals);
-    CHECK(*file == "notes.txt");
+    CHECK(!file);
     CHECK(!app.active_subcommand());
 }
 

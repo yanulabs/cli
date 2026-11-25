@@ -70,6 +70,16 @@
 
 #ifdef _WIN32
 #  include <io.h>
+#  ifdef min
+#    undef min
+#  endif
+#  ifdef max
+#    undef max
+#  endif
+#  ifndef NOMINMAX
+#    define NOMINMAX
+#  endif
+#  include <windows.h>
 #else
 #  include <unistd.h>
 #endif
@@ -234,8 +244,51 @@ namespace detail {
 #endif
 }
 
+[[nodiscard]] inline bool environment_exists(const std::string& name) noexcept {
+#ifdef _WIN32
+    ::SetLastError(ERROR_SUCCESS);
+    return ::GetEnvironmentVariableA(name.c_str(), nullptr, 0) != 0
+        || ::GetLastError() != ERROR_ENVVAR_NOT_FOUND;
+#else
+    return std::getenv(name.c_str()) != nullptr;
+#endif
+}
+
+// Windows' CRT treats an empty environment value as absent.  The Win32 API
+// preserves `NAME=` as a real empty value, so use it there and keep the
+// allocation-free std::getenv path on POSIX.
+[[nodiscard]] inline std::optional<std::string> environment_value(
+    const std::string& name) {
+#ifdef _WIN32
+    for (int attempt = 0; attempt < 2; ++attempt) {
+        ::SetLastError(ERROR_SUCCESS);
+        const DWORD size = ::GetEnvironmentVariableA(name.c_str(), nullptr, 0);
+        if (size == 0) {
+            if (::GetLastError() == ERROR_ENVVAR_NOT_FOUND) return std::nullopt;
+            return std::string{};
+        }
+        std::string value(size, '\0');
+        ::SetLastError(ERROR_SUCCESS);
+        const DWORD copied = ::GetEnvironmentVariableA(
+            name.c_str(), value.data(), size);
+        if (copied == 0) {
+            if (::GetLastError() == ERROR_ENVVAR_NOT_FOUND) return std::nullopt;
+            return std::string{};
+        }
+        if (copied < size) {
+            value.resize(copied);
+            return value;
+        }
+    }
+    return std::nullopt;
+#else
+    if (const char* value = std::getenv(name.c_str())) return std::string(value);
+    return std::nullopt;
+#endif
+}
+
 inline bool color_enabled() noexcept {
-    static const bool v = is_tty(1) && (std::getenv("NO_COLOR") == nullptr);
+    static const bool v = is_tty(1) && !environment_exists("NO_COLOR");
     return v;
 }
 
@@ -4084,8 +4137,8 @@ private:
         for (auto& opt : options_) {
             if (opt->is_set_) continue;
             if (!opt->env_var.empty() && !opt->from_env_ && !opt->from_config_) {
-                if (const char* v = std::getenv(opt->env_var.c_str())) {
-                    if (auto r = opt->parse_env(v, this); !r) return r;
+                if (auto value = detail::environment_value(opt->env_var)) {
+                    if (auto r = opt->parse_env(*value, this); !r) return r;
                 }
             }
             if (!opt->from_env_ && config_section) {
@@ -4111,8 +4164,8 @@ private:
                 continue;
             }
             if (!pos->env_var.empty() && !pos->from_env_ && !pos->from_config_) {
-                if (const char* v = std::getenv(pos->env_var.c_str())) {
-                    if (auto r = pos->parse_env(v, this); !r) return r;
+                if (auto value = detail::environment_value(pos->env_var)) {
+                    if (auto r = pos->parse_env(*value, this); !r) return r;
                 }
             }
             if (!pos->from_env_ && !pos->from_config_ && config_section) {

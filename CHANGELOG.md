@@ -124,6 +124,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   text with `ConfigError`
 - Nested response-file includes resolve relative to the including file, and an
   empty required config path reports `ConfigError`
+- Windows environment lookup distinguishes missing variables from real empty
+  values, preserving string/vector fallbacks and numeric validation behavior
 - Positional defaults are checked against `nargs`, and arity mutated through a
   handle is revalidated before parsing so later positionals remain reachable
 - Direct subcommand parsing applies ancestor environment/config/default
