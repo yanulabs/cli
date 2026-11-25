@@ -58,6 +58,18 @@ TEST_CASE("completion headers neutralize control characters in app names") {
     CHECK(contains(zsh_out.str(), "_bad_name()"));
 }
 
+TEST_CASE("fish completion escapes backslashes in quoted words") {
+    cli::App app("tool");
+    (void)app.add_flag("--trail\\");
+    (void)app.add_flag("--back\\slash");
+
+    std::ostringstream out;
+    app.fish_completion(out);
+    const auto text = out.str();
+    CHECK(contains(text, R"(-l 'trail\\' -f)"));
+    CHECK(contains(text, R"(-l 'back\\slash' -f)"));
+}
+
 TEST_CASE("fish completion quotes unusual command names") {
     cli::App app("my tool");
     std::ostringstream out;
@@ -298,7 +310,8 @@ TEST_CASE("zsh completion emits value specs and choice actions") {
     CHECK(contains(text, "#compdef tool"));
     CHECK(contains(text, ":TEXT:(debug info)"));
     CHECK(contains(text, ":DIR:_default"));
-    CHECK(contains(text, "'(-o --output)'{-o,--output}"));
+    CHECK(contains(text, "'(-o --output)-o:DIR:_default"));
+    CHECK(contains(text, "'(-o --output)--output:DIR:_default"));
 }
 
 TEST_CASE("zsh completion marks vector options as repeatable") {
@@ -307,7 +320,7 @@ TEST_CASE("zsh completion marks vector options as repeatable") {
 
     std::ostringstream out;
     app.zsh_completion(out);
-    CHECK(contains(out.str(), "*'--tag[Tag]':TEXT:_default"));
+    CHECK(contains(out.str(), "'*--tag[Tag]:TEXT:_default'"));
 }
 
 TEST_CASE("zsh completion includes negated flags and excludes hidden options") {
@@ -414,6 +427,185 @@ TEST_CASE("shadowing one inherited spelling keeps other completion spellings") {
     sub.zsh_completion(zsh);
     CHECK(contains(zsh.str(), "'--verbose[Root verbose]'"));
     CHECK(contains(zsh.str(), "'-v[Sub short v]'"));
+}
+
+TEST_CASE("completions include option aliases") {
+    cli::App app("tool");
+    (void)app.add_flag("--color")
+        .short_name("-c")
+        .alias("--colour")
+        .alias("--col")
+        .alias("-C")
+        .help("Color")
+        .negatable();
+
+    std::ostringstream bash;
+    app.bash_completion(bash);
+    CHECK(contains(bash.str(), "--colour "));
+    CHECK(contains(bash.str(), "--col "));
+    CHECK(contains(bash.str(), "-C "));
+    CHECK(contains(bash.str(), "--no-color "));
+    CHECK(contains(bash.str(), "--no-colour "));
+    CHECK(contains(bash.str(), "--no-col "));
+
+    std::ostringstream fish;
+    app.fish_completion(fish);
+    CHECK(contains(fish.str(), "complete -c tool -s c -l color -f -d 'Color'"));
+    CHECK(contains(fish.str(), "complete -c tool -l colour -f -d 'Color'"));
+    CHECK(contains(fish.str(), "complete -c tool -l col -f -d 'Color'"));
+    CHECK(contains(fish.str(), "complete -c tool -s C -f -d 'Color'"));
+    CHECK(contains(fish.str(), "complete -c tool -l no-color -f"));
+    CHECK(contains(fish.str(), "complete -c tool -l no-colour -f"));
+    CHECK(contains(fish.str(), "complete -c tool -l no-col -f"));
+
+    std::ostringstream zsh;
+    app.zsh_completion(zsh);
+    CHECK(contains(zsh.str(),
+                   "'(-c --color --colour --col -C)-c[Color]'"));
+    CHECK(contains(zsh.str(),
+                   "'(-c --color --colour --col -C)--colour[Color]'"));
+    CHECK(contains(zsh.str(), "--no-colour[Disable --colour]"));
+}
+
+TEST_CASE("negated alias completions defer to exact option spellings") {
+    cli::App app("tool");
+    (void)app.add_flag("--color").alias("--colour").negatable();
+    (void)app.add_flag("--no-colour");
+
+    std::ostringstream bash;
+    app.bash_completion(bash);
+    CHECK(count_occurrences(bash.str(), "--no-colour ") == 1);
+    CHECK(contains(bash.str(), "--no-color "));
+
+    std::ostringstream fish;
+    app.fish_completion(fish);
+    CHECK(count_occurrences(fish.str(), "-l no-colour ") == 1);
+    CHECK(contains(fish.str(), "-l no-color "));
+
+    std::ostringstream zsh;
+    app.zsh_completion(zsh);
+    CHECK(count_occurrences(zsh.str(), "--no-colour") == 1);
+    CHECK(contains(zsh.str(), "--no-color[Disable --color]"));
+}
+
+TEST_CASE("root bash completion switches options by command path") {
+    cli::App app("tool");
+    (void)app.add_flag("--root-only");
+    (void)app.add_flag("--enable");
+    (void)app.add_flag("--verbose").short_name("-v").global();
+    (void)app.add<std::string>("--output").short_name("-o");
+    (void)app.add<std::vector<std::string>>("--pair").nargs(2);
+    auto& build = app.subcommand("build", "").alias("b");
+    (void)build.add<std::string>("--target");
+    auto& remote = app.subcommand("remote", "").alias("r");
+    auto& add = remote.subcommand("add", "").alias("a");
+    (void)add.add<std::string>("--url");
+    (void)app.subcommand("hidden", "").hidden().add_flag("--secret");
+
+    std::ostringstream out;
+    app.bash_completion(out);
+    const auto text = out.str();
+    CHECK(contains(text, "case \"$path|$word\" in"));
+    CHECK(contains(text, "_tool_option_info()"));
+    CHECK(contains(text, "if ((skip_max != 0))"));
+    CHECK(contains(text, "[[ ${COMP_WORDS[i+1]} == = ]]"));
+    CHECK(contains(text, "'|--pair') opt_kind=1; skip_min=2; skip_max=2"));
+    CHECK(contains(text, "'|-o') opt_kind=1; skip_min=1; skip_max=1"));
+    CHECK(contains(text, "'|--verbose') opt_kind=0; skip_min=0; skip_max=0"));
+    CHECK(contains(text, "'|--enable') opt_kind=0; skip_min=0; skip_max=0"));
+    CHECK(contains(text, "if ((opt_kind == 0))"));
+    CHECK(contains(text, "'|build') path=build"));
+    CHECK(contains(text, "'remote|add') path='remote add'"));
+    CHECK(contains(text, "build) opts=\""));
+    CHECK(contains(text, "--target"));
+    CHECK(contains(text, "--url"));
+    CHECK(!contains(text, "--secret"));
+}
+
+TEST_CASE("root fish completion scopes options to command paths") {
+    cli::App app("tool");
+    (void)app.add_flag("--root-only");
+    (void)app.add<std::vector<std::string>>("--pair").nargs(2);
+    auto& build = app.subcommand("build", "").alias("b");
+    (void)build.add<std::string>("--target");
+    auto& remote = app.subcommand("remote", "").alias("r");
+    auto& add = remote.subcommand("add", "").alias("a");
+    (void)add.add<std::string>("--url");
+
+    std::ostringstream out;
+    app.fish_completion(out);
+    const auto text = out.str();
+    CHECK(contains(text, "test (__tool_command_context) = -"));
+    CHECK(contains(text, "function __tool_option_info"));
+    CHECK(contains(text, "set -l tokens (commandline -opc)"));
+    CHECK(!contains(text, "$tokens[(math $i + 1)] = ="));
+    CHECK(contains(text, "case '|--pair'\n            printf '%s\\n' 1 2 2"));
+    CHECK(contains(text, "-l target -r -n 'test (__tool_command_context) = build'"));
+    CHECK(contains(text, R"(-l url -r -n 'test (__tool_command_context) = '"'"'remote add'"'"'')"));
+    CHECK(contains(text, "-l root-only -f -n 'test (__tool_command_context) = -'"));
+}
+
+TEST_CASE("root zsh completion dispatches per-command option specs") {
+    cli::App app("tool");
+    auto& build = app.subcommand("build", "").alias("b");
+    (void)build.add<std::string>("--target");
+    auto& remote = app.subcommand("remote", "").alias("r");
+    auto& add = remote.subcommand("add", "").alias("a");
+    (void)add.add<std::string>("--url");
+
+    std::ostringstream out;
+    app.zsh_completion(out);
+    const auto text = out.str();
+    CHECK(contains(text, "_tool_build_2()"));
+    CHECK(contains(text, "_arguments -C \"${args[@]}\""));
+    CHECK(contains(text, "_tool_remote_3()"));
+    CHECK(contains(text, "_tool_remote_add_4()"));
+    CHECK(contains(text, "'build'|'b') _tool_build_2"));
+    CHECK(contains(text, "'add'|'a') _tool_remote_add_4"));
+    CHECK(contains(text, "'--target:TEXT:_default'"));
+    CHECK(contains(text, "'--url:TEXT:_default'"));
+}
+
+TEST_CASE("zsh completion quotes punctuated option aliases") {
+    cli::App app("tool");
+    (void)app.add_flag("--base")
+        .alias("--comma,name")
+        .alias("--cash$HOME")
+        .alias("--brace{a,b}");
+    (void)app.add_flag("--quoted")
+        .alias("--single'quote")
+        .alias("--double\"quote")
+        .alias("--back\\slash")
+        .negatable();
+    (void)app.add_flag("--paren").alias("--paren(name)");
+
+    std::ostringstream out;
+    app.zsh_completion(out);
+    const auto text = out.str();
+    CHECK(contains(text, "'(--base --comma,name --cash$HOME --brace{a,b})--base'"));
+    CHECK(contains(text, "'(--base --comma,name --cash$HOME --brace{a,b})--comma,name'"));
+    CHECK(contains(text, "'(--base --comma,name --cash$HOME --brace{a,b})--cash$HOME'"));
+    CHECK(contains(text, "--single'\\''quote"));
+    CHECK(contains(text, "--double\"quote"));
+    CHECK(contains(text, "--back\\\\slash"));
+    CHECK(contains(text, "--no-back\\\\slash[Disable --back\\\\slash]"));
+    CHECK(contains(text, "'--paren(name)'"));
+    CHECK(!contains(text, "(--paren --paren(name))"));
+    CHECK(!contains(text, "--comma,name}"));
+}
+
+TEST_CASE("zsh completion disambiguates sanitized command names") {
+    cli::App app("tool");
+    (void)app.subcommand("foo-bar", "").add_flag("--hyphen");
+    (void)app.subcommand("foo_bar", "").add_flag("--underscore");
+
+    std::ostringstream out;
+    app.zsh_completion(out);
+    const auto text = out.str();
+    CHECK(contains(text, "_tool_foo_bar_2()"));
+    CHECK(contains(text, "_tool_foo_bar_3()"));
+    CHECK(contains(text, "'foo-bar') _tool_foo_bar_2"));
+    CHECK(contains(text, "'foo_bar') _tool_foo_bar_3"));
 }
 
 TEST_SUITE_END();

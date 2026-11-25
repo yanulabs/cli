@@ -21,6 +21,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `-h`/`--help`/`-V`/`--version` correctly suppresses the corresponding
   built-in rows; shadowing is name-by-name, so a local `-v` hides only the
   inherited `-v` while `--verbose` remains available
+- **Context-aware root completions** — Bash, Fish, and Zsh scripts switch to
+  each subcommand's option set, including nested commands, command aliases,
+  and option aliases; Bash/Fish command tracking skips option values using
+  the declared arity
 - **INI config files** — `config_file(path, required)` and `config_option()`
   load root and `[command.path]` sections, quoted values, arrays, and
   negatable flags; section headers may be quoted or use TOML `[[section]]`
@@ -77,7 +81,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `tool sub --version` works
 - **Default validation** — defaults are checked against `range()`,
   `choices()`, and custom validators
-- **Domain-scoped test suite** — 556 test cases across 19 doctest suites
+- **Domain-scoped test suite** — 582 test cases across 19 doctest suites
   (`api`, `completion`, `constraints`, `custom_types`, `environment`,
   `errors`, `extensions`, `flags`, `groups`, `help`, `lifecycle`, `lookup`,
   `options`, `positionals`, `robustness`, `subcommands`, `tokens`,
@@ -90,10 +94,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Upstream differential replay harness** (`CLI_BUILD_DIFFERENTIAL_TESTS=ON`)
   — replays every parse call captured from the full CLI11 v2.7.2,
   argparse v3.2, and cxxopts v3.3.1 test suites; compares accept/reject
-  outcomes, and for CLI11 also compares parsed option and positional values.
+  outcomes, and for all three suites also compares parsed option, positional,
+  and flag values.
   Untagged divergences or hard-blocked schemas fail the run; feature tags
   document the upstream semantics outside the supported subset.  Corpora,
-  capture patches, and rebuild instructions live under `tools/differential/`
+  capture patches, and rebuild instructions live under `tools/differential/`;
+  a dedicated CI job runs all three suites on every push and pull request
 - **CLI11-compatible `char` parsing** — a single-character literal binds
   directly, while longer input is converted as an integer (`77` → `'M'`,
   `0x44` → `'D'`)
@@ -113,6 +119,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `find_package` consumer build
 
 ### Fixed
+- Config arrays preserve element boundaries for delimited vectors, distinguish
+  `[]` from `[""]`, and reject malformed headers, quotes, arrays, and trailing
+  text with `ConfigError`
+- Nested response-file includes resolve relative to the including file, and an
+  empty required config path reports `ConfigError`
+- Windows environment lookup distinguishes missing variables from real empty
+  values, preserving string/vector fallbacks and numeric validation behavior
+- Positional defaults are checked against `nargs`, and arity mutated through a
+  handle is revalidated before parsing so later positionals remain reachable
+- Direct subcommand parsing applies ancestor environment/config/default
+  fallbacks but only enforces required and group constraints for inherited
+  globals; unreachable non-global ancestor requirements no longer fail, and
+  parent positionals are not finalized when a subcommand is active
+- The fuzz harness now escapes non-marker `@...` tokens before parsing, so
+  adversarial inputs cannot make response-file expansion open arbitrary paths
+- Subcommand benchmarks no longer dereference option handles after a second
+  parse resets their values; subcommand and nested-subcommand workloads are now
+  measured separately, and both benchmark drivers fail if any timed parse
+  produces an unexpected result
 - `App::reset()` now clears the loaded config path and data, so a later parse
   cannot reuse a previous parse's configuration
 - `config_option()` registers `--config` as a global option, so
@@ -190,6 +215,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (`[default: , two]`, `[|auto]`) instead of silently dropping them
 
 ### Changed
+- Package metadata now reports version 1.2.0, matching the latest changelog;
+  FetchContent tracks `main` until a real release tag or commit SHA is chosen
+- Failed parses now leave the invocation tree reset instead of exposing partial
+  values, defaults, extras, config data, or active-command state; exceptions from
+  validators/transforms roll back before propagating
+- The fuzz oracle compares parsed values, explicit-set flags, extras, active
+  command chains, repeated parses, and direct-child parsing against equivalent
+  root dispatch instead of checking only success/error kinds
+- Floating-point conversion detects `std::from_chars` support directly instead
+  of relying on a lagging feature-test macro, avoiding temporary string
+  allocation and locale-aware `strtod` on supporting standard libraries while
+  retaining the fallback for special values such as `inf` and `nan`
+- Long-option lookup uses a direct ASCII first-letter candidate index with full
+  name verification and hash-map fallback for collisions and non-ASCII names
 - Whole-value validators and transforms run before mutex/require group checks,
   so an invalid value is reported ahead of a structural group conflict
 - `parse(argc, argv)` no longer copies the token list into a temporary vector;

@@ -2,7 +2,7 @@ cmake_minimum_required(VERSION 3.25)
 
 project(
     cli
-    VERSION 1.0.0
+    VERSION 1.2.0
     DESCRIPTION "A modern C++23 single-header command-line argument parser"
     HOMEPAGE_URL "https://github.com/yanujz/cli"
     LANGUAGES CXX

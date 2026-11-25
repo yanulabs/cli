@@ -282,8 +282,22 @@ TEST_CASE("a positional before a subcommand token prevents dispatch") {
     auto r = app.parse({"notes.txt", "build"});
     REQUIRE(!r);
     CHECK(r.error().kind == cli::ParseError::Kind::TooManyPositionals);
-    CHECK(*file == "notes.txt");
+    CHECK(!file);
     CHECK(!app.active_subcommand());
+}
+
+TEST_CASE("parent positionals are not finalized when a subcommand is active") {
+    cli::App app("tool");
+    auto file = app.add_positional<std::string>("file").default_val("root.txt");
+    auto& build = app.subcommand("build", "");
+
+    REQUIRE(app.parse({"build"}));
+    CHECK(!file);
+    CHECK(app.active_subcommand() == &build);
+
+    REQUIRE(build.parse({}));
+    CHECK(!file);
+    CHECK(app.active_subcommand() == &build);
 }
 
 TEST_CASE("end-of-options prevents subcommand dispatch") {
@@ -762,6 +776,59 @@ TEST_CASE("direct subcommand parsing finalizes inherited globals") {
     REQUIRE(build.parse({"--token", "x"}));
     CHECK(*token == "x");
     CHECK(*jobs == 8);
+}
+
+TEST_CASE("direct subcommand parsing ignores non-global ancestor requirements") {
+    cli::App app("tool");
+    auto token = app.add<std::string>("--token").required();
+    auto mode  = app.add<std::string>("--mode").default_val("root");
+    auto& build = app.subcommand("build", "");
+
+    REQUIRE(build.parse({}));
+    CHECK(!token);
+    CHECK(*mode == "root");
+    CHECK(app.active_subcommand() == &build);
+
+    auto root_missing = app.parse({"build"});
+    REQUIRE(!root_missing);
+    CHECK(root_missing.error().kind == cli::ParseError::Kind::MissingRequired);
+    CHECK(contains(root_missing.error().message, "--token"));
+
+    auto child_unknown = build.parse({"--token", "x"});
+    REQUIRE(!child_unknown);
+    CHECK(child_unknown.error().kind == cli::ParseError::Kind::UnknownOption);
+}
+
+TEST_CASE("direct subcommand parsing enforces only global ancestor groups") {
+    cli::App app("tool");
+    auto verbose = app.add_flag("--verbose").global();
+    auto quiet   = app.add_flag("--quiet").global();
+    (void)verbose;
+    (void)quiet;
+    (void)app.add_flag("--json");
+    (void)app.add_flag("--yaml");
+    app.mutex_group({"--verbose", "--quiet"});
+    app.require_one_of({"--json", "--yaml"});
+    auto& build = app.subcommand("build", "");
+
+    REQUIRE(build.parse({}));
+    auto conflict = build.parse({"--verbose", "--quiet"});
+    REQUIRE(!conflict);
+    CHECK(conflict.error().kind == cli::ParseError::Kind::MutuallyExclusive);
+}
+
+TEST_CASE("a failed direct child parse clears inherited global state") {
+    cli::App app("tool");
+    auto verbose = app.add_flag("--verbose").global();
+    auto& build  = app.subcommand("build", "");
+    auto  target = build.add<std::string>("--target");
+
+    auto bad = build.parse({"--verbose", "--target", "release", "--unknown"});
+    REQUIRE(!bad);
+    CHECK(!verbose);
+    CHECK(!target);
+    CHECK(!app.active_subcommand());
+    CHECK(!build.active_subcommand());
 }
 
 TEST_CASE("parsing a nested subcommand directly finalizes every ancestor") {

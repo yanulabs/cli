@@ -2,6 +2,7 @@
 
 #include <array>
 #include <span>
+#include <stdexcept>
 
 TEST_SUITE_BEGIN("lifecycle");
 
@@ -136,10 +137,69 @@ TEST_CASE("a failed parse does not poison the next parse") {
 
     auto bad = app.parse({"--num", "9", "--unknown"});
     REQUIRE(!bad);
-    CHECK(num.value_or(-1) == 9);  // partial state is visible until reset
+    CHECK(!num);
+    CHECK(!num.is_set());
 
     REQUIRE(app.parse({}));
     CHECK(*num == 4);
+}
+
+TEST_CASE("a failed parse leaves all partial values reset") {
+    cli::App app("t");
+    auto verbose = app.add_flag("--verbose");
+    auto debug   = app.add_count("--debug");
+    auto tags    = app.add<std::vector<std::string>>("--tag");
+    auto num     = app.add<int>("--num").default_val(4);
+
+    auto bad = app.parse({"--verbose", "-dd", "--tag", "x", "--num", "9", "--unknown"});
+    REQUIRE(!bad);
+    CHECK(!verbose);
+    CHECK(!verbose.is_set());
+    CHECK(*debug == 0u);
+    CHECK(!debug.is_set());
+    CHECK(!tags);
+    CHECK(!num);
+    CHECK(!num.is_set());
+}
+
+TEST_CASE("finalization failures roll back defaults and parsed values") {
+    cli::App app("t");
+    auto num = app.add<int>("--num").default_val(4);
+    (void)app.add<std::string>("--required").required();
+
+    auto missing = app.parse({"--num", "9"});
+    REQUIRE(!missing);
+    CHECK(missing.error().kind == cli::ParseError::Kind::MissingRequired);
+    CHECK(!num);
+}
+
+TEST_CASE("a failed child parse clears root and child state") {
+    cli::App app("tool");
+    auto verbose = app.add_flag("--verbose").global();
+    auto& build  = app.subcommand("build", "");
+    auto  target = build.add<std::string>("--target");
+
+    auto bad = app.parse({"--verbose", "build", "--target", "release", "--unknown"});
+    REQUIRE(!bad);
+    CHECK(!verbose);
+    CHECK(!target);
+    CHECK(!app.active_subcommand());
+    CHECK(!build.active_subcommand());
+}
+
+TEST_CASE("validator failures and exceptions roll back parsed values") {
+    cli::App invalid("invalid");
+    auto value = invalid.add<int>("--num")
+        .validate([](int v) { return v > 0; }, "must be positive");
+    auto bad = invalid.parse({"--num", "-1"});
+    REQUIRE(!bad);
+    CHECK(!value);
+
+    cli::App throwing("throwing");
+    auto transformed = throwing.add<int>("--num")
+        .transform([](int) -> int { throw std::runtime_error("transform failed"); });
+    CHECK_THROWS_AS((void)throwing.parse({"--num", "3"}), std::runtime_error);
+    CHECK(!transformed);
 }
 
 TEST_CASE("an active subcommand is cleared by the next parse") {

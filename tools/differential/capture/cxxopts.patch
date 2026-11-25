@@ -1,66 +1,18 @@
 --- a/include/cxxopts.hpp
 +++ b/include/cxxopts.hpp
-@@ -43,6 +43,12 @@
- #include <vector>
+@@ -44,6 +44,136 @@
  #include <algorithm>
  #include <locale>
-+
+ 
 +#ifdef CXXOPTS_DIFF_CAPTURE
 +#include <fstream>
 +#include <cstdio>
++#include <iomanip>
++#include <limits>
++#include <type_traits>
 +#include <typeinfo>
-+#endif
- 
- #ifdef CXXOPTS_NO_EXCEPTIONS
- #include <iostream>
-@@ -411,6 +417,14 @@
- 
-   virtual bool
-   is_boolean() const = 0;
 +
-+#ifdef CXXOPTS_DIFF_CAPTURE
-+  virtual std::string
-+  diff_type_id() const
-+  {
-+    return {};
-+  }
-+#endif
- };
- 
- CXXOPTS_DIAGNOSTIC_POP
-@@ -1263,6 +1277,14 @@
-     return std::is_same<T, bool>::value;
-   }
- 
-+#ifdef CXXOPTS_DIFF_CAPTURE
-+  std::string
-+  diff_type_id() const override
-+  {
-+    return typeid(T).name();
-+  }
-+#endif
-+
-   const T&
-   get() const
-   {
-@@ -2062,6 +2084,10 @@
-   {
-     return m_program;
-   }
-+
-+#ifdef CXXOPTS_DIFF_CAPTURE
-+  std::string diff_schema() const;
-+#endif
- 
-   private:
- 
-@@ -2504,15 +2530,151 @@
- Options::parse_positional(std::initializer_list<std::string> options)
- {
-   parse_positional(std::vector<std::string>(options));
-+}
-+
-+#ifdef CXXOPTS_DIFF_CAPTURE
++namespace cxxopts {
 +namespace diff {
 +
 +inline std::string
@@ -93,9 +45,179 @@
 +  return out;
 +}
 +
++template <typename T>
++struct is_std_vector : std::false_type {};
++
++template <typename T, typename A>
++struct is_std_vector<std::vector<T, A>> : std::true_type {};
++
++template <typename T>
++inline std::string
++float_text(const T& value)
++{
++  std::ostringstream out;
++  out.imbue(std::locale::classic());
++  out << std::setprecision(std::numeric_limits<T>::max_digits10) << value;
++  return out.str();
++}
++
++inline std::string
++value_json(bool value)
++{
++  return value ? "{\"kind\":\"bool\",\"value\":true}"
++               : "{\"kind\":\"bool\",\"value\":false}";
++}
++
++inline std::string
++value_json(const std::string& value)
++{
++  return "{\"kind\":\"string\",\"value\":\"" + esc(value) + "\"}";
++}
++
++template <typename T>
++inline typename std::enable_if<std::is_floating_point<T>::value, std::string>::type
++value_json(const T& value)
++{
++  return "{\"kind\":\"float\",\"value\":\"" + float_text(value) + "\"}";
++}
++
++template <typename T>
++inline typename std::enable_if<
++  std::is_integral<T>::value && !std::is_same<T, bool>::value
++  && !std::is_same<T, char>::value && !std::is_same<T, signed char>::value
++  && !std::is_same<T, unsigned char>::value, std::string>::type
++value_json(const T& value)
++{
++  if (std::is_signed<T>::value)
++  {
++    return "{\"kind\":\"signed\",\"value\":\"" + std::to_string(value) + "\"}";
++  }
++  return "{\"kind\":\"unsigned\",\"value\":\"" + std::to_string(value) + "\"}";
++}
++
++template <typename T>
++inline typename std::enable_if<
++  std::is_same<T, char>::value || std::is_same<T, signed char>::value
++  || std::is_same<T, unsigned char>::value, std::string>::type
++value_json(const T& value)
++{
++  return "{\"kind\":\"char\",\"value\":"
++         + std::to_string(static_cast<long long>(value)) + "}";
++}
++
++template <typename T>
++inline typename std::enable_if<
++  !std::is_arithmetic<T>::value && !std::is_same<T, std::string>::value
++  && !is_std_vector<T>::value, std::string>::type
++value_json(const T&)
++{
++  return "{\"kind\":\"unsupported\",\"type_id\":\""
++         + esc(typeid(T).name()) + "\"}";
++}
++
++template <typename T, typename A>
++inline std::string
++value_json(const std::vector<T, A>& values)
++{
++  std::string out = "{\"kind\":\"vector\",\"values\":[";
++  bool first = true;
++  for (const auto& element : values)
++  {
++    if (!first) out += ',';
++    first = false;
++    out += value_json(element);
++  }
++  return out + "]}";
++}
++
++} // namespace diff
++} // namespace cxxopts
++#endif
++
+ #ifdef CXXOPTS_NO_EXCEPTIONS
+ #include <iostream>
+ #endif
+@@ -411,6 +541,20 @@
+ 
+   virtual bool
+   is_boolean() const = 0;
++
++#ifdef CXXOPTS_DIFF_CAPTURE
++  virtual std::string
++  diff_type_id() const
++  {
++    return {};
++  }
++
++  virtual std::string
++  diff_parsed_value() const
++  {
++    return {};
++  }
++#endif
+ };
+ 
+ CXXOPTS_DIAGNOSTIC_POP
+@@ -1263,6 +1407,20 @@
+     return std::is_same<T, bool>::value;
+   }
+ 
++#ifdef CXXOPTS_DIFF_CAPTURE
++  std::string
++  diff_type_id() const override
++  {
++    return typeid(T).name();
++  }
++
++  std::string
++  diff_parsed_value() const override
++  {
++    return diff::value_json(*m_store);
++  }
++#endif
++
+   const T&
+   get() const
+   {
+@@ -1530,6 +1688,14 @@
+     return m_count;
+   }
+ 
++#ifdef CXXOPTS_DIFF_CAPTURE
++  std::string
++  diff_parsed_value() const
++  {
++    return m_value == nullptr ? std::string{} : m_value->diff_parsed_value();
++  }
++#endif
++
+ #if defined(CXXOPTS_NULL_DEREF_IGNORE)
+ CXXOPTS_DIAGNOSTIC_POP
+ #endif
+@@ -2062,6 +2228,10 @@
+   {
+     return m_program;
+   }
++
++#ifdef CXXOPTS_DIFF_CAPTURE
++  std::string diff_schema() const;
++#endif
+ 
+   private:
+ 
+@@ -2504,15 +2674,170 @@
+ Options::parse_positional(std::initializer_list<std::string> options)
+ {
+   parse_positional(std::vector<std::string>(options));
++}
++
++#ifdef CXXOPTS_DIFF_CAPTURE
++namespace diff {
++
 +inline void
 +capture(const std::string& schema,
 +        const std::vector<std::string>& args,
++        const std::string& parsed_values,
 +        bool ok,
 +        const std::string& error)
 +{
@@ -113,7 +235,8 @@
 +    first = false;
 +    out << '"' << esc(arg) << '"';
 +  }
-+  out << "],\"outcome\":\"" << (ok ? "ok" : "error") << "\",\"error\":\""
++  out << "],\"parsed_values\":" << parsed_values
++      << ",\"outcome\":\"" << (ok ? "ok" : "error") << "\",\"error\":\""
 +      << esc(error) << "\"}\n";
  }
  
@@ -180,11 +303,20 @@
  {
 +#ifdef CXXOPTS_DIFF_CAPTURE
 +  std::vector<std::string> diff_args;
-+  for (int i = 1; i < argc; ++i)
++  std::string diff_schema_json;
++  bool diff_ready = true;
++  try
 +  {
-+    diff_args.emplace_back(argv[i] == nullptr ? "" : argv[i]);
++    for (int i = 1; i < argc; ++i)
++    {
++      diff_args.emplace_back(argv[i] == nullptr ? "" : argv[i]);
++    }
++    diff_schema_json = diff_schema();
 +  }
-+  const std::string diff_schema_json = diff_schema();
++  catch (...)
++  {
++    diff_ready = false;
++  }
 +#endif
    OptionParser parser(*m_options, m_positional, m_allow_unrecognised);
  
@@ -193,14 +325,52 @@
 +  {
 +    auto result = parser.parse(argc, argv);
 +#ifdef CXXOPTS_DIFF_CAPTURE
-+    diff::capture(diff_schema_json, diff_args, true, {});
++    if (diff_ready)
++    {
++      try
++      {
++        std::string values = "[";
++        bool first = true;
++        std::unordered_set<const OptionDetails*> seen;
++        for (const auto& entry : *m_options)
++        {
++          const auto& detail = *entry.second;
++          if (!seen.insert(entry.second.get()).second) continue;
++          const auto& longs = detail.long_names();
++          const std::string name = longs.empty() ? detail.short_name() : longs.front();
++          if (name.empty() || result.count(name) == 0) continue;
++          const auto count = result.count(name);
++          if (!first) values += ',';
++          first = false;
++          values += "{\"option\":\"" + diff::esc(name) + "\",\"count\":"
++                    + std::to_string(count) + ",\"value\":"
++                    + result[name].diff_parsed_value() + "}";
++        }
++        values += "]";
++        diff::capture(diff_schema_json, diff_args, values, true, {});
++      }
++      catch (...)
++      {
++        // Capture must never change the upstream parse outcome.
++      }
++    }
 +#endif
 +    return result;
 +  }
 +  catch (const std::exception& e)
 +  {
 +#ifdef CXXOPTS_DIFF_CAPTURE
-+    diff::capture(diff_schema_json, diff_args, false, e.what());
++    if (diff_ready)
++    {
++      try
++      {
++        diff::capture(diff_schema_json, diff_args, "[]", false, e.what());
++      }
++      catch (...)
++      {
++        // Capture must never change the upstream parse outcome.
++      }
++    }
 +#endif
 +    throw;
 +  }

@@ -3,9 +3,11 @@
 //
 // Build:  cmake -S . -B build -DCLI_BUILD_BENCHMARKS=ON -DCMAKE_BUILD_TYPE=Release
 // Run:    ./build/bench/bench_parse [iterations]
+// Every timed iteration validates its parsed values; mismatches exit nonzero.
 // ─────────────────────────────────────────────────────────────────────────────
 #include <cli.hpp>
 
+#include <algorithm>
 #include <chrono>
 #include <cstdlib>
 #include <format>
@@ -22,6 +24,7 @@ struct Result {
     std::string name;
     double      ns_per_parse = 0;
     double      tokens       = 0;
+    bool        correct      = true;
 };
 
 template<typename Fn>
@@ -32,13 +35,17 @@ template<typename Fn>
         sink += fn();
 
     const auto start = std::chrono::steady_clock::now();
-    for (size_t i = 0; i < iterations; ++i)
-        sink += fn();
+    bool correct = true;
+    for (size_t i = 0; i < iterations; ++i) {
+        const auto value = fn();
+        if (value == 0) correct = false;
+        sink += value;
+    }
     const auto stop = std::chrono::steady_clock::now();
 
     const auto ns = std::chrono::duration<double, std::nano>(stop - start).count();
     return { std::move(name), ns / static_cast<double>(iterations),
-             static_cast<double>(token_count) };
+             static_cast<double>(token_count), correct };
 }
 
 [[nodiscard]] Result bench_flags(size_t iterations) {
@@ -78,7 +85,8 @@ template<typename Fn>
     return measure("6 typed options", iterations, args.size(), [&] {
         auto r = app.parse(args);
         return static_cast<std::uint64_t>(r && *jobs == 16 && !output->empty()
-                                          && *ratio == 0.75 && *count == 42);
+                                          && *level == "info" && *ratio == 0.75
+                                          && *count == 42 && *name == "release");
     });
 }
 
@@ -101,7 +109,7 @@ template<typename Fn>
     });
 }
 
-[[nodiscard]] Result bench_subcommand(size_t iterations) {
+[[nodiscard]] std::vector<Result> bench_subcommands(size_t iterations) {
     cli::App app("bench", "desc", "1.0.0");
     (void)app.add_flag("--verbose").short_name("-v");
     auto& build  = app.subcommand("build", "Compile");
@@ -117,12 +125,21 @@ template<typename Fn>
     const std::vector<std::string_view> nested{
         "remote", "add", "--url", "https://example.com"
     };
-    return measure("subcommand + options", iterations, args.size() + nested.size(), [&] {
-        auto r = app.parse(args);
-        auto n = app.parse(nested);
-        return static_cast<std::uint64_t>(r && n && *target == "release"
-                                          && *jobs == 8 && *url == "https://example.com");
-    });
+
+    // Measure each invocation separately: parsing the nested command resets the
+    // whole tree and disengages the build handles from the previous parse.
+    return {
+        measure("subcommand + options", iterations, args.size(), [&] {
+            auto r = app.parse(args);
+            return static_cast<std::uint64_t>(
+                r && *target == "release" && *jobs == 8);
+        }),
+        measure("nested subcommand", iterations, nested.size(), [&] {
+            auto r = app.parse(nested);
+            return static_cast<std::uint64_t>(
+                r && *url == "https://example.com");
+        }),
+    };
 }
 
 } // namespace
@@ -138,7 +155,8 @@ int main(int argc, char** argv) {
     results.push_back(bench_flags(iterations));
     results.push_back(bench_options(iterations));
     results.push_back(bench_mixed(iterations));
-    results.push_back(bench_subcommand(iterations));
+    const auto subcommands = bench_subcommands(iterations);
+    results.insert(results.end(), subcommands.begin(), subcommands.end());
 
     std::cout << std::format("cli.hpp parse benchmark — {} iterations\n\n", iterations);
     std::cout << std::format("{:<26} {:>12} {:>14} {:>14}\n",
@@ -151,5 +169,9 @@ int main(int argc, char** argv) {
     }
     const auto checksum = static_cast<std::uint64_t>(sink);
     std::cout << std::format("\n(checksum {})\n", checksum);
+    if (std::ranges::any_of(results, [](const Result& r) { return !r.correct; })) {
+        std::cerr << "benchmark validation failed: a parse produced unexpected values\n";
+        return 2;
+    }
     return 0;
 }

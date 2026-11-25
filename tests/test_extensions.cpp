@@ -556,6 +556,67 @@ files = [a.txt, b.txt]
     CHECK((*files)[1] == "b.txt");
 }
 
+TEST_CASE("config arrays preserve delimiters inside vector elements") {
+    TempFile cfg("array-delimiters", R"(
+tag = [one, "two,three"]
+[pack]
+files = ["a,b", c]
+)");
+    cli::App app("tool");
+    app.config_file(cfg.path());
+    auto tags = app.add<std::vector<std::string>>("--tag").delimiter(',');
+
+    auto& pack  = app.subcommand("pack", "");
+    auto  files = pack.add_positional<std::vector<std::string>>("files")
+                      .delimiter(',');
+
+    REQUIRE(app.parse({"pack"}));
+    REQUIRE(tags->size() == 2);
+    CHECK((*tags)[0] == "one");
+    CHECK((*tags)[1] == "two,three");
+    REQUIRE(files->size() == 2);
+    CHECK((*files)[0] == "a,b");
+    CHECK((*files)[1] == "c");
+}
+
+TEST_CASE("scalar config values still honor vector delimiters") {
+    TempFile cfg("scalar-delimiter", "tag = one,two\n");
+    cli::App app("tool");
+    app.config_file(cfg.path());
+    auto tags = app.add<std::vector<std::string>>("--tag").delimiter(',');
+
+    REQUIRE(app.parse({}));
+    REQUIRE(tags->size() == 2);
+    CHECK((*tags)[0] == "one");
+    CHECK((*tags)[1] == "two");
+}
+
+TEST_CASE("config arrays distinguish empty arrays from empty strings") {
+    TempFile cfg("array-empty", R"(
+empty = []
+single = [""]
+[pack]
+files = []
+)");
+    cli::App app("tool");
+    app.config_file(cfg.path());
+    auto empty  = app.add<std::vector<std::string>>("--empty").delimiter(',');
+    auto single = app.add<std::vector<std::string>>("--single").delimiter(',');
+    auto& pack  = app.subcommand("pack", "");
+    auto  files = pack.add_positional<std::vector<std::string>>("files")
+                      .required(false);
+
+    REQUIRE(app.parse({"pack"}));
+    CHECK(static_cast<bool>(empty));
+    CHECK(empty->empty());
+    CHECK(app.has_option("--empty"));
+    REQUIRE(single->size() == 1);
+    CHECK((*single)[0].empty());
+    CHECK(static_cast<bool>(files));
+    CHECK(files->empty());
+    CHECK(!files.is_set());
+}
+
 TEST_CASE("config can negate a negatable flag") {
     TempFile cfg("negate", "no-color = true\n");
     cli::App app("tool");
@@ -640,15 +701,47 @@ TEST_CASE("clearing config_file stops applying the previous file") {
     CHECK(*jobs == 3u);
 }
 
-TEST_CASE("malformed config files produce a config error") {
-    TempFile cfg("malformed", "[unterminated\nkey = value\n");
-    cli::App app("tool");
-    app.config_file(cfg.path());
+TEST_CASE("malformed config syntax is rejected") {
+    const std::string_view malformed[] = {
+        "[unterminated\nkey = value\n",
+        "[section] trailing-junk\n",
+        "[[section]\n",
+        "[[section]] trailing-junk\n",
+        "key = \"unterminated\n",
+        "key = [a, \"unterminated]\n",
+        "\"key = value\n",
+        "key = \"value\"trailing\n",
+    };
+    for (auto text : malformed) {
+        TempFile cfg("malformed-syntax", text);
+        cli::App app("tool");
+        app.config_file(cfg.path());
+        auto r = app.parse({});
+        CAPTURE(text);
+        REQUIRE(!r);
+        CHECK(r.error().kind == cli::ParseError::Kind::ConfigError);
+    }
+}
 
+TEST_CASE("an empty required config path is an error") {
+    cli::App app("tool");
+    app.config_file("", true);
     auto r = app.parse({});
     REQUIRE(!r);
     CHECK(r.error().kind == cli::ParseError::Kind::ConfigError);
-    CHECK(contains(r.error().message, "unterminated section"));
+}
+
+TEST_CASE("config errors roll back values parsed before config loading") {
+    TempFile cfg("rollback-malformed", "[unterminated\n");
+    cli::App app("tool");
+    app.config_file(cfg.path());
+    auto num = app.add<int>("--num").default_val(1);
+
+    auto bad = app.parse({"--num", "9"});
+    REQUIRE(!bad);
+    CHECK(bad.error().kind == cli::ParseError::Kind::ConfigError);
+    CHECK(!num);
+    CHECK(!num.is_set());
 }
 
 TEST_CASE("config values participate in constraints") {
@@ -816,6 +909,19 @@ TEST_CASE("response files support comments and nested files") {
     REQUIRE(app.parse({"@" + outer.path()}));
     CHECK(*name == "ok");
     CHECK(*count == 7);
+}
+
+TEST_CASE("nested response paths are relative to the including file") {
+    TempFile inner("relative-inner", "--count 9\n");
+    const auto inner_name = std::filesystem::path(inner.path()).filename().string();
+    TempFile outer("relative-outer", std::format("@{}\n", inner_name));
+
+    cli::App app("tool");
+    app.response_files();
+    auto count = app.add<int>("--count");
+
+    REQUIRE(app.parse({"@" + outer.path()}));
+    CHECK(*count == 9);
 }
 
 TEST_CASE("double-at escapes a literal at-token") {

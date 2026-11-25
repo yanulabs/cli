@@ -70,6 +70,16 @@
 
 #ifdef _WIN32
 #  include <io.h>
+#  ifdef min
+#    undef min
+#  endif
+#  ifdef max
+#    undef max
+#  endif
+#  ifndef NOMINMAX
+#    define NOMINMAX
+#  endif
+#  include <windows.h>
 #else
 #  include <unistd.h>
 #endif
@@ -234,8 +244,51 @@ namespace detail {
 #endif
 }
 
+[[nodiscard]] inline bool environment_exists(const std::string& name) noexcept {
+#ifdef _WIN32
+    ::SetLastError(ERROR_SUCCESS);
+    return ::GetEnvironmentVariableA(name.c_str(), nullptr, 0) != 0
+        || ::GetLastError() != ERROR_ENVVAR_NOT_FOUND;
+#else
+    return std::getenv(name.c_str()) != nullptr;
+#endif
+}
+
+// Windows' CRT treats an empty environment value as absent.  The Win32 API
+// preserves `NAME=` as a real empty value, so use it there and keep the
+// allocation-free std::getenv path on POSIX.
+[[nodiscard]] inline std::optional<std::string> environment_value(
+    const std::string& name) {
+#ifdef _WIN32
+    for (int attempt = 0; attempt < 2; ++attempt) {
+        ::SetLastError(ERROR_SUCCESS);
+        const DWORD size = ::GetEnvironmentVariableA(name.c_str(), nullptr, 0);
+        if (size == 0) {
+            if (::GetLastError() == ERROR_ENVVAR_NOT_FOUND) return std::nullopt;
+            return std::string{};
+        }
+        std::string value(size, '\0');
+        ::SetLastError(ERROR_SUCCESS);
+        const DWORD copied = ::GetEnvironmentVariableA(
+            name.c_str(), value.data(), size);
+        if (copied == 0) {
+            if (::GetLastError() == ERROR_ENVVAR_NOT_FOUND) return std::nullopt;
+            return std::string{};
+        }
+        if (copied < size) {
+            value.resize(copied);
+            return value;
+        }
+    }
+    return std::nullopt;
+#else
+    if (const char* value = std::getenv(name.c_str())) return std::string(value);
+    return std::nullopt;
+#endif
+}
+
 inline bool color_enabled() noexcept {
-    static const bool v = is_tty(1) && (std::getenv("NO_COLOR") == nullptr);
+    static const bool v = is_tty(1) && !environment_exists("NO_COLOR");
     return v;
 }
 
@@ -421,6 +474,11 @@ template<typename T>
 }
 
 template<typename T>
+concept HasFloatingFromChars = requires(const char* first, const char* last, T& value) {
+    { std::from_chars(first, last, value) } -> std::same_as<std::from_chars_result>;
+};
+
+template<typename T>
 [[nodiscard]] auto from_string(std::string_view sv) -> std::expected<T, std::string> {
     if constexpr (std::is_same_v<T, std::string>) {
         return std::string(sv);
@@ -520,12 +578,16 @@ template<typename T>
         if (num.empty())
             return std::unexpected(std::format("'{}' is not a valid number", sv));
         T val{};
-#if defined(__cpp_lib_to_chars) && __cpp_lib_to_chars >= 201611L
-        auto [p, ec] = std::from_chars(num.data(), num.data() + num.size(), val);
-        if (ec != std::errc{} || p != num.data() + num.size())
-            return std::unexpected(std::format("'{}' is not a valid number", sv));
-        return val;
-#else
+        // Feature-test macros for floating-point from_chars have lagged behind
+        // library support (notably in libc++).  Detect the overload directly so
+        // the common path avoids allocating a string and locale-aware strtod.
+        // Keep the fallback for libraries without the overload and for special
+        // spellings such as inf/nan that from_chars does not accept.
+        if constexpr (HasFloatingFromChars<T>) {
+            auto [p, ec] = std::from_chars(num.data(), num.data() + num.size(), val);
+            if (ec == std::errc{} && p == num.data() + num.size())
+                return val;
+        }
         try {
             size_t idx = 0;
             std::string s(num);
@@ -541,7 +603,6 @@ template<typename T>
         } catch (...) {
             return std::unexpected(std::format("'{}' is not a valid number", sv));
         }
-#endif
     } else if constexpr (requires(std::string_view raw) {
                              { cli_parse(raw, std::type_identity<T>{}) }
                                  -> std::same_as<std::expected<T, std::string>>;
@@ -566,6 +627,7 @@ template<typename T>
 // ────────────────────────────────────────────────────────────────────────────
 
 struct OptionBase;
+struct OptionRegistry;
 
 // Transparent hash so the index can be queried with a string_view without
 // allocating a temporary std::string on the hot parse path.
@@ -676,50 +738,6 @@ template<typename F>
     return {};
 }
 
-struct OptionRegistry {
-    std::unordered_map<std::string, OptionBase*, StringHash, std::equal_to<>> by_name;
-    // One-character short options are by far the most common token shape.
-    // A direct ASCII index avoids hashing for every `-v` / `-j` lookup.
-    std::array<OptionBase*, 128> one_char{};
-
-    [[nodiscard]] OptionBase* find(std::string_view name) const noexcept {
-        if (name.size() == 2 && name[0] == '-') {
-            const auto c = static_cast<unsigned char>(name[1]);
-            if (c < one_char.size() && one_char[c] != nullptr)
-                return one_char[c];
-        }
-        const auto it = by_name.find(name);
-        return it == by_name.end() ? nullptr : it->second;
-    }
-
-    void ensure_available(std::string_view name) const {
-        if (find(name) != nullptr)
-            throw std::invalid_argument(
-                std::format("cli: duplicate option name '{}'", name));
-    }
-
-    void add(OptionBase* option, std::string_view name) {
-        const auto [it, inserted] = by_name.try_emplace(std::string(name), option);
-        (void)it;
-        if (!inserted)
-            throw std::invalid_argument(
-                std::format("cli: duplicate option name '{}'", name));
-        if (name.size() == 2 && name[0] == '-') {
-            const auto c = static_cast<unsigned char>(name[1]);
-            if (c < one_char.size()) one_char[c] = option;
-        }
-    }
-
-    void remove(OptionBase* option) {
-        for (auto& slot : one_char)
-            if (slot == option) slot = nullptr;
-        for (auto it = by_name.begin(); it != by_name.end();) {
-            if (it->second == option) it = by_name.erase(it);
-            else ++it;
-        }
-    }
-};
-
 // ────────────────────────────────────────────────────────────────────────────
 // §3  OptionBase — internal polymorphic option node
 // ────────────────────────────────────────────────────────────────────────────
@@ -751,6 +769,14 @@ struct OptionBase {
     virtual ~OptionBase() = default;
     virtual ParseResult parse(std::string_view val, std::string_view opt_name, const App* app) = 0;
     virtual ParseResult parse_env(std::string_view val, const App* app) = 0;
+    // Config arrays already carry element boundaries; parse each element
+    // without applying the command-line delimiter a second time.
+    virtual ParseResult parse_config_element(std::string_view val,
+                                             std::string_view opt_name,
+                                             const App* app) {
+        return parse(val, opt_name, app);
+    }
+    virtual void        set_empty_config() {}
     // Fast path for an occurrence with no explicit value (`-v`, `--flag`).
     // Count options override this to increment; bool flags avoid formatting
     // and re-parsing the literal "true" on every token.
@@ -787,6 +813,79 @@ struct OptionBase {
     [[nodiscard]] std::string_view display_name() const noexcept {
         auto ln = long_name();
         return ln.empty() ? short_name() : ln;
+    }
+};
+
+struct OptionRegistry {
+    std::unordered_map<std::string, OptionBase*, StringHash, std::equal_to<>> by_name;
+    // One-character short options are by far the most common token shape.
+    // A direct ASCII index avoids hashing for every `-v` / `-j` lookup.
+    std::array<OptionBase*, 128> one_char{};
+    // Most schemas also have distinct first letters for their long options.
+    // Keep a candidate per ASCII letter and fall back to hashing on collisions;
+    // the candidate's full name is always checked before it is accepted.
+    std::array<OptionBase*, 128> long_candidate{};
+
+    [[nodiscard]] OptionBase* find(std::string_view name) const noexcept {
+        if (name.size() == 2 && name[0] == '-') {
+            const auto c = static_cast<unsigned char>(name[1]);
+            if (c < one_char.size()) return one_char[c];
+        }
+        if (name.size() > 2 && name[0] == '-' && name[1] == '-') {
+            const auto c = static_cast<unsigned char>(name[2]);
+            if (c < long_candidate.size()) {
+                auto* candidate = long_candidate[c];
+                if (candidate != nullptr && candidate->matches(name)) return candidate;
+            }
+        }
+        const auto it = by_name.find(name);
+        return it == by_name.end() ? nullptr : it->second;
+    }
+
+    void ensure_available(std::string_view name) const {
+        if (find(name) != nullptr)
+            throw std::invalid_argument(
+                std::format("cli: duplicate option name '{}'", name));
+    }
+
+    void add(OptionBase* option, std::string_view name) {
+        const auto [it, inserted] = by_name.try_emplace(std::string(name), option);
+        (void)it;
+        if (!inserted)
+            throw std::invalid_argument(
+                std::format("cli: duplicate option name '{}'", name));
+        if (name.size() == 2 && name[0] == '-') {
+            const auto c = static_cast<unsigned char>(name[1]);
+            if (c < one_char.size()) one_char[c] = option;
+        } else if (name.size() > 2 && name[0] == '-' && name[1] == '-') {
+            const auto c = static_cast<unsigned char>(name[2]);
+            if (c < long_candidate.size()) {
+                auto*& candidate = long_candidate[c];
+                if (candidate == nullptr) candidate = option;
+                else if (candidate != option) candidate = nullptr;
+            }
+        }
+    }
+
+    void remove(OptionBase* option) {
+        for (auto& slot : one_char)
+            if (slot == option) slot = nullptr;
+        for (auto it = by_name.begin(); it != by_name.end();) {
+            if (it->second == option) it = by_name.erase(it);
+            else ++it;
+        }
+        // Removing a candidate can make a previously ambiguous letter unique
+        // again.  Rebuild from the surviving owned keys while this cold path is
+        // already touching the map.
+        long_candidate.fill(nullptr);
+        for (const auto& [name, surviving] : by_name) {
+            if (name.size() <= 2 || name[0] != '-' || name[1] != '-') continue;
+            const auto c = static_cast<unsigned char>(name[2]);
+            if (c >= long_candidate.size()) continue;
+            auto*& candidate = long_candidate[c];
+            if (candidate == nullptr) candidate = surviving;
+            else if (candidate != surviving) candidate = nullptr;
+        }
     }
 };
 
@@ -877,6 +976,23 @@ struct OptionImpl final : OptionBase {
         if (auto r = parse_one(sv, opt, app); !r) return r;
         is_set_ = true;
         return {};
+    }
+
+    ParseResult parse_config_element(std::string_view sv, std::string_view opt,
+                                     const App* app) override {
+        if constexpr (is_vec_v<T>) {
+            if (auto r = parse_one(sv, opt, app); !r) return r;
+            is_set_ = true;
+            return {};
+        }
+        return parse(sv, opt, app);
+    }
+
+    void set_empty_config() override {
+        if constexpr (is_vec_v<T>) {
+            value   = T{};
+            is_set_ = true;
+        }
     }
 
     ParseResult set_implicit(const App* app) override {
@@ -1077,6 +1193,11 @@ struct PositionalBase {
     virtual ~PositionalBase() = default;
     virtual ParseResult parse(std::string_view v, const App* app)     = 0;
     virtual ParseResult parse_env(std::string_view v, const App* app) = 0;
+    virtual ParseResult parse_config_element(std::string_view v, const App* app) {
+        return parse(v, app);
+    }
+    virtual void        set_empty_config() {}
+    virtual size_t      value_count() const noexcept = 0;
     virtual ParseResult validate_and_finalize(const App* app)         = 0;
     virtual bool        has_default() const noexcept                  = 0;
     virtual void        apply_default()                               = 0;
@@ -1141,6 +1262,23 @@ struct PositionalImpl final : PositionalBase {
         return {};
     }
 
+    ParseResult parse_config_element(std::string_view sv, const App* app) override {
+        if constexpr (is_vec_v<T>) {
+            if (auto r = parse_one(sv, label, app); !r) return r;
+            is_set_ = true;
+            return {};
+        }
+        return parse(sv, app);
+    }
+
+    void set_empty_config() override {
+        if constexpr (is_vec_v<T>) {
+            value        = T{};
+            parsed_count_ = 0;
+            is_set_      = true;
+        }
+    }
+
     ParseResult parse_env(std::string_view sv, const App* app) override {
         const auto& env_label = env_var;
         if constexpr (is_vec_v<T>) {
@@ -1180,6 +1318,10 @@ struct PositionalImpl final : PositionalBase {
     }
 
     bool has_default() const noexcept override { return default_.has_value(); }
+    size_t value_count() const noexcept override {
+        if constexpr (is_vec_v<T>) return value ? value->size() : 0;
+        else                       return value ? 1 : 0;
+    }
     void apply_default() override {
         if (default_) {
             value = *default_;
@@ -1244,8 +1386,14 @@ private:
 // §5.5  Config data — small INI/TOML-style reader
 // ────────────────────────────────────────────────────────────────────────────
 
+struct ConfigValue {
+    std::string              text;
+    bool                     is_array = false;
+    std::vector<std::string> elements;
+};
+
 struct ConfigData {
-    using Section = std::unordered_map<std::string, std::string, StringHash, std::equal_to<>>;
+    using Section = std::unordered_map<std::string, ConfigValue, StringHash, std::equal_to<>>;
     std::unordered_map<std::string, Section, StringHash, std::equal_to<>> sections;
 };
 
@@ -1257,15 +1405,46 @@ struct ConfigData {
     return s;
 }
 
-inline void strip_matching_quotes(std::string& s) {
-    if (s.size() >= 2 && ((s.front() == '"' && s.back() == '"')
-                          || (s.front() == '\'' && s.back() == '\'')))
-        s = s.substr(1, s.size() - 2);
+[[nodiscard]] inline bool config_quote_starts(std::string_view s, size_t i) noexcept {
+    return i == 0 || std::isspace(static_cast<unsigned char>(s[i - 1])) != 0
+           || s[i - 1] == '=' || s[i - 1] == '[' || s[i - 1] == ',';
+}
+
+[[nodiscard]] inline std::expected<std::string, std::string>
+unquote_config_text(std::string_view raw, std::string_view what) {
+    raw = trim_view(raw);
+    if (raw.empty()) return std::string{};
+    if (raw.front() != '"' && raw.front() != '\'') return std::string(raw);
+
+    const char quote = raw.front();
+    if (raw.size() < 2 || raw.back() != quote)
+        return std::unexpected(std::format("unterminated quoted {}", what));
+
+    std::string out;
+    out.reserve(raw.size() - 2);
+    for (size_t i = 1; i + 1 < raw.size(); ++i) {
+        const char c = raw[i];
+        if (quote == '"' && c == '\\' && i + 2 < raw.size()) {
+            const char next = raw[i + 1];
+            if (next == quote || next == '\\') out += next;
+            else {
+                out += '\\';
+                out += next;
+            }
+            ++i;
+        } else if (c == quote) {
+            return std::unexpected(std::format("trailing text after quoted {}", what));
+        } else {
+            out += c;
+        }
+    }
+    return out;
 }
 
 /// Remove an unquoted `#`/`;` comment that starts a new field (preceded by
 /// whitespace), preserving hashes inside paths such as `a#b`.
-[[nodiscard]] inline std::string_view strip_inline_comment(std::string_view s) noexcept {
+[[nodiscard]] inline std::expected<std::string_view, std::string>
+strip_inline_comment_checked(std::string_view s) {
     char quote = '\0';
     bool escaped = false;
     for (size_t i = 0; i < s.size(); ++i) {
@@ -1276,14 +1455,69 @@ inline void strip_matching_quotes(std::string& s) {
             else if (c == quote) quote = '\0';
             continue;
         }
-        if (c == '"' || c == '\'') {
+        if ((c == '"' || c == '\'') && config_quote_starts(s, i)) {
             quote = c;
         } else if ((c == '#' || c == ';')
-                   && (i == 0 || std::isspace(static_cast<unsigned char>(s[i - 1])))) {
+                   && (i == 0 || std::isspace(static_cast<unsigned char>(s[i - 1])) != 0)) {
             return s.substr(0, i);
         }
     }
+    if (quote != '\0') return std::unexpected("unterminated quote");
     return s;
+}
+
+[[nodiscard]] inline std::expected<std::vector<std::string>, std::string>
+parse_config_array(std::string_view raw) {
+    if (trim_view(raw).empty()) return std::vector<std::string>{};
+
+    std::vector<std::string_view> pieces;
+    size_t start = 0;
+    char quote = '\0';
+    bool escaped = false;
+    bool content = false;
+    for (size_t i = 0; i < raw.size(); ++i) {
+        const char c = raw[i];
+        if (escaped) { escaped = false; continue; }
+        if (quote != '\0') {
+            if (c == '\\' && quote == '"') escaped = true;
+            else if (c == quote) quote = '\0';
+            continue;
+        }
+        if ((c == '"' || c == '\'') && !content) {
+            quote = c;
+        } else if (c == ',') {
+            pieces.push_back(raw.substr(start, i - start));
+            start = i + 1;
+            content = false;
+        } else if (std::isspace(static_cast<unsigned char>(c)) == 0) {
+            content = true;
+        }
+    }
+    if (quote != '\0') return std::unexpected("unterminated quote in array");
+    pieces.push_back(raw.substr(start));
+
+    std::vector<std::string> values;
+    values.reserve(pieces.size());
+    for (const auto piece : pieces) {
+        auto value = unquote_config_text(piece, "array element");
+        if (!value) return std::unexpected(value.error());
+        values.push_back(std::move(*value));
+    }
+    return values;
+}
+
+[[nodiscard]] inline std::expected<ConfigValue, std::string>
+parse_config_value(std::string_view raw) {
+    if (!raw.empty() && raw.front() == '[') {
+        if (raw.size() < 2 || raw.back() != ']')
+            return std::unexpected("unterminated array value");
+        auto elements = parse_config_array(raw.substr(1, raw.size() - 2));
+        if (!elements) return std::unexpected(elements.error());
+        return ConfigValue{std::string(raw), true, std::move(*elements)};
+    }
+    auto text = unquote_config_text(raw, "value");
+    if (!text) return std::unexpected(text.error());
+    return ConfigValue{std::move(*text), false, {}};
 }
 
 [[nodiscard]] inline std::expected<ConfigData, std::string>
@@ -1304,60 +1538,106 @@ parse_config(std::string_view text) {
             line.remove_suffix(1);
         if (line.empty() || line.front() == '#' || line.front() == ';')
             continue;
+
+        auto fail = [line_no](std::string_view message) {
+            return std::unexpected(std::format("line {}: {}", line_no, message));
+        };
+
         if (line.front() == '[') {
-            // A comment may follow the closing bracket, and section names may
-            // be quoted (TOML/CLI11) or use TOML's [[table]] spelling.  Only
-            // strip a comment when the line does not already end in ']', so
-            // hashes inside `[section # name]` stay part of the name.  A bare
-            // "[" left after removing a comment is not a section at all.
-            if (!line.ends_with(']')) {
-                line = trim_view(strip_inline_comment(line));
-                if (line.empty() || line == "[") continue;
+            // CLI11 treats a bare '[' followed by a comment as a comment line.
+            auto header_comment = strip_inline_comment_checked(line);
+            if (header_comment && trim_view(*header_comment) == "[") continue;
+            if (!header_comment) return fail(header_comment.error());
+
+            const bool table = line.size() >= 2 && line[1] == '[';
+            const size_t open = table ? 2 : 1;
+            size_t close = std::string_view::npos;
+            char quote = '\0';
+            bool escaped = false;
+            for (size_t i = open; i < line.size(); ++i) {
+                const char c = line[i];
+                if (escaped) { escaped = false; continue; }
+                if (quote != '\0') {
+                    if (c == '\\' && quote == '"') escaped = true;
+                    else if (c == quote) quote = '\0';
+                    continue;
+                }
+                if ((c == '"' || c == '\'')
+                    && config_quote_starts(line.substr(open, i - open), i - open)) {
+                    quote = c;
+                } else if (!table && c == ']') {
+                    close = i;
+                    break;
+                } else if (table && c == ']' && i + 1 < line.size()
+                           && line[i + 1] == ']') {
+                    close = i;
+                    break;
+                }
             }
-            std::string_view name;
-            if (line.size() >= 4 && line.starts_with("[[") && line.ends_with("]]"))
-                name = line.substr(2, line.size() - 4);
-            else {
-                const auto close = line.find(']');
-                if (close == std::string_view::npos)
-                    return std::unexpected(
-                        std::format("line {}: unterminated section header", line_no));
-                name = line.substr(1, close - 1);
-            }
-            std::string section_name(trim_view(name));
-            strip_matching_quotes(section_name);
-            if (section_name.empty())
-                return std::unexpected(
-                    std::format("line {}: empty section name", line_no));
+            if (quote != '\0') return fail("unterminated quote in section header");
+            if (close == std::string_view::npos)
+                return fail("unterminated section header");
+
+            const size_t suffix = close + (table ? 2 : 1);
+            const auto trailing = trim_view(line.substr(suffix));
+            if (!trailing.empty() && trailing.front() != '#' && trailing.front() != ';')
+                return fail("trailing text after section header");
+
+            auto section_name = unquote_config_text(
+                line.substr(open, close - open), "section name");
+            if (!section_name) return fail(section_name.error());
+            if (section_name->empty()) return fail("empty section name");
             // CLI11 reserves [default] for the root command's own options.
-            section = ascii_iequals(section_name, "default")
+            section = ascii_iequals(*section_name, "default")
                 ? std::string{}
-                : std::move(section_name);
+                : std::move(*section_name);
             continue;
         }
-        const auto eq = line.find('=');
-        std::string key;
-        std::string value;
-        if (eq == std::string_view::npos) {
-            key   = std::string(trim_view(strip_inline_comment(line)));
-            value = "true";
-        } else {
-            key   = std::string(trim_view(line.substr(0, eq)));
-            auto raw_value = trim_view(line.substr(eq + 1));
-            value = std::string(trim_view(strip_inline_comment(raw_value)));
+
+        size_t eq = std::string_view::npos;
+        char quote = '\0';
+        bool escaped = false;
+        for (size_t i = 0; i < line.size(); ++i) {
+            const char c = line[i];
+            if (escaped) { escaped = false; continue; }
+            if (quote != '\0') {
+                if (c == '\\' && quote == '"') escaped = true;
+                else if (c == quote) quote = '\0';
+                continue;
+            }
+            if ((c == '"' || c == '\'') && config_quote_starts(line, i)) quote = c;
+            else if (c == '=') { eq = i; break; }
         }
-        strip_matching_quotes(key);
-        if (key.empty())
-            return std::unexpected(
-                std::format("line {}: missing key", line_no));
-        strip_matching_quotes(value);
+        if (quote != '\0') return fail("unterminated quote");
+
+        std::string key;
+        ConfigValue value;
+        if (eq == std::string_view::npos) {
+            auto uncommented = strip_inline_comment_checked(line);
+            if (!uncommented) return fail(uncommented.error());
+            auto parsed_key = unquote_config_text(*uncommented, "key");
+            if (!parsed_key) return fail(parsed_key.error());
+            key = std::move(*parsed_key);
+            value.text = "true";
+        } else {
+            auto parsed_key = unquote_config_text(line.substr(0, eq), "key");
+            if (!parsed_key) return fail(parsed_key.error());
+            key = std::move(*parsed_key);
+
+            auto uncommented = strip_inline_comment_checked(line.substr(eq + 1));
+            if (!uncommented) return fail(uncommented.error());
+            auto parsed_value = parse_config_value(trim_view(*uncommented));
+            if (!parsed_value) return fail(parsed_value.error());
+            value = std::move(*parsed_value);
+        }
+        if (key.empty()) return fail("missing key");
         data.sections[section][std::move(key)] = std::move(value);
     }
     return data;
 }
 
 /// Return the config value for the first matching option spelling.
-[[nodiscard]] inline const std::string*
+[[nodiscard]] inline const ConfigValue*
 config_value_for(const ConfigData::Section& section,
                  const std::vector<std::string>& names) {
     for (const auto& name : names) {
@@ -1370,34 +1650,6 @@ config_value_for(const ConfigData::Section& section,
             return &it->second;
     }
     return nullptr;
-}
-
-/// Split `[a, "b,c"]` (or a plain scalar) into individual config values.
-[[nodiscard]] inline std::vector<std::string> config_values(std::string_view raw) {
-    const bool list = raw.size() >= 2 && raw.front() == '[' && raw.back() == ']';
-    if (!list) return { std::string(raw) };
-    raw = raw.substr(1, raw.size() - 2);
-    std::vector<std::string> values;
-    std::string current;
-    char quote = '\0';
-    for (char c : raw) {
-        if (quote != '\0') {
-            if (c == quote) quote = '\0';
-            else current += c;
-        } else if (c == '"' || c == '\'') {
-            quote = c;
-        } else if (c == ',') {
-            auto v = trim_view(current);
-            values.emplace_back(v);
-            current.clear();
-        } else {
-            current += c;
-        }
-    }
-    auto last = trim_view(current);
-    if (!last.empty() || !values.empty())
-        values.emplace_back(last);
-    return values;
 }
 
 // ── Response-file tokenisation ──────────────────────────────────────────────
@@ -1490,7 +1742,8 @@ tokenize_response_file(std::string_view text) {
 
 inline std::expected<std::vector<std::string>, ParseError>
 expand_response_tokens(std::span<const std::string_view> args,
-                       const App* app, unsigned depth, size_t& budget) {
+                       const App* app, unsigned depth, size_t& budget,
+                       const std::filesystem::path& base_dir = {}) {
     std::vector<std::string> expanded;
     expanded.reserve(args.size());
     for (const auto token : args) {
@@ -1513,32 +1766,36 @@ expand_response_tokens(std::span<const std::string_view> args,
         if (depth >= 8)
             return std::unexpected(ParseError::response_file(
                 token.substr(1), "nesting exceeds 8 levels", app));
-        const std::string path(token.substr(1));
+        const std::filesystem::path requested(token.substr(1));
+        const auto path = requested.is_absolute()
+            ? requested
+            : (base_dir.empty() ? requested : base_dir / requested);
         std::ifstream in(path, std::ios::binary);
         if (!in)
             return std::unexpected(ParseError::response_file(
-                path, "cannot open file", app));
+                path.string(), "cannot open file", app));
         in.seekg(0, std::ios::end);
         const auto end = in.tellg();
         if (end < 0)
             return std::unexpected(ParseError::response_file(
-                path, "cannot determine size", app));
+                path.string(), "cannot determine size", app));
         constexpr std::streamoff max_size = 4 * 1024 * 1024;
         if (end > max_size)
             return std::unexpected(ParseError::response_file(
-                path, "file is larger than 4 MiB", app));
+                path.string(), "file is larger than 4 MiB", app));
         in.seekg(0, std::ios::beg);
         std::string text(static_cast<size_t>(end), '\0');
         if (end > 0 && !in.read(text.data(), end))
             return std::unexpected(ParseError::response_file(
-                path, "read failed", app));
+                path.string(), "read failed", app));
         auto tokens = tokenize_response_file(text);
         if (!tokens)
-            return std::unexpected(ParseError::response_file(path, tokens.error(), app));
+            return std::unexpected(ParseError::response_file(path.string(), tokens.error(), app));
         std::vector<std::string_view> views;
         views.reserve(tokens->size());
         for (const auto& t : *tokens) views.emplace_back(t);
-        auto nested = expand_response_tokens(views, app, depth + 1, budget);
+        auto nested = expand_response_tokens(
+            views, app, depth + 1, budget, path.parent_path());
         if (!nested) return nested;
         for (auto& t : *nested) expanded.push_back(std::move(t));
     }
@@ -2633,38 +2890,190 @@ public:
             }
             return escaped;
         };
+        auto command_path = [](const App& app) {
+            std::string path;
+            for (const App* node = &app; node->parent_ != nullptr; node = node->parent_) {
+                if (!path.empty()) path.insert(0, 1, ' ');
+                path.insert(0, node->name_);
+            }
+            return path;
+        };
+        auto options_for = [&](const App& app) {
+            std::string words;
+            for (const auto& visible : app.visible_options()) {
+                const auto* opt = visible.option;
+                if (opt->hidden_) continue;
+                for (const auto& n : visible.names) words += dq_escape(n) + " ";
+                for (const auto& negated : app.completion_negated_spellings(visible))
+                    words += dq_escape(negated) + " ";
+            }
+            if (!app.find_opt_inherited("-h"))      words += "-h ";
+            if (!app.find_opt_inherited("--help"))  words += "--help ";
+            if (!app.effective_version().empty()) {
+                if (!app.find_opt_inherited("-V"))        words += "-V ";
+                if (!app.find_opt_inherited("--version")) words += "--version ";
+            }
+            return words;
+        };
+        auto subcommands_for = [&](const App& app) {
+            std::string words;
+            for (const auto& s : app.subcommands_) {
+                if (s->hidden_) continue;
+                words += dq_escape(s->name_) + " ";
+                for (const auto& a : s->aliases_) words += dq_escape(a) + " ";
+            }
+            return words;
+        };
+
+        const bool completion_tree = parent_ == nullptr && !subcommands_.empty();
+        std::vector<const App*> nodes;
+        if (completion_tree) {
+            auto collect = [&](auto&& self, const App& node) -> void {
+                nodes.push_back(&node);
+                for (const auto& sub : node.subcommands_)
+                    if (!sub->hidden_) self(self, *sub);
+            };
+            collect(collect, *this);
+        }
 
         std::string comment = name_;
         for (auto& c : comment)
             if (std::iscntrl(static_cast<unsigned char>(c))) c = ' ';
 
         out << "# Bash completion for " << comment << "\n";
+        if (completion_tree) {
+            const auto info_fn = "_" + fn + "_option_info";
+            out << info_fn << "() {\n"
+                   "    local key=\"$1|$2\" used=\"$3\"\n"
+                   "    opt_kind=-1\n"
+                   "    skip_min=0\n"
+                   "    skip_max=0\n"
+                   "    case \"$key\" in\n";
+            auto shell_arity = [](std::size_t n) {
+                constexpr auto max = static_cast<std::size_t>(
+                    std::numeric_limits<long long>::max());
+                return n > max ? max : n;
+            };
+            for (const auto* node : nodes) {
+                const auto path = command_path(*node);
+                for (const auto& visible : node->visible_options()) {
+                    const auto& opt = *visible.option;
+                    const int kind = opt.is_flag_ ? 0 : 1;
+                    const auto min = opt.is_flag_ ? 0
+                        : opt.nargs_min_ == 0 ? 1 : shell_arity(opt.nargs_min_);
+                    const auto max = opt.is_flag_ ? 0
+                        : opt.nargs_max_ == 0 ? 1
+                        : opt.nargs_max_ == static_cast<std::size_t>(-1) ? -1L
+                        : static_cast<long long>(shell_arity(opt.nargs_max_));
+                    for (const auto& name : visible.names) {
+                        out << "        " << shell_word(path + "|" + std::string(name))
+                            << ") opt_kind=" << kind << "; skip_min=" << min
+                            << "; skip_max=" << max << " ;;\n";
+                    }
+                }
+            }
+            out << "    esac\n"
+                   "    if ((opt_kind == 1 && used)); then\n"
+                   "        if ((skip_min > 0)); then ((skip_min--)); fi\n"
+                   "        if ((skip_max > 0)); then ((skip_max--)); fi\n"
+                   "    fi\n"
+                   "}\n\n";
+        }
+
         out << "_" << fn << "() {\n"
                "    local cur prev opts subs\n"
                "    cur=\"${COMP_WORDS[COMP_CWORD]}\"\n"
                "    opts=\"";
-        for (const auto& visible : visible_options()) {
-            const auto* opt = visible.option;
-            if (opt->hidden_) continue;
-            for (const auto& n : visible.names) out << dq_escape(n) << " ";
-            if (negated_spelling_visible(visible))
-                out << dq_escape("--no-" + std::string(visible.long_name().substr(2)))
-                    << " ";
-        }
-        if (!find_opt_inherited("-h"))      out << "-h ";
-        if (!find_opt_inherited("--help"))  out << "--help ";
-        if (!effective_version().empty()) {
-            if (!find_opt_inherited("-V"))        out << "-V ";
-            if (!find_opt_inherited("--version")) out << "--version ";
-        }
+        out << options_for(*this);
         out << "\"\n    subs=\"";
-        for (const auto& s : subcommands_) {
-            if (s->hidden_) continue;
-            out << dq_escape(s->name_) << " ";
-            for (const auto& a : s->aliases_) out << dq_escape(a) << " ";
+        out << subcommands_for(*this);
+        out << "\"\n";
+
+        if (completion_tree) {
+            out << "    local path word name inline ch j i found opt_kind skip_min skip_max\n"
+                   "    local negative_number='^-([0-9]+(\\.[0-9]*)?|\\.[0-9]+)([eE][+-]?[0-9]+)?$|^-0[xX][0-9a-fA-F]+$|^-0[bB][01]+$'\n"
+                   "    path=\"\"\n"
+                   "    skip_min=0\n"
+                   "    skip_max=0\n"
+                   "    for ((i=1; i<COMP_CWORD; i++)); do\n"
+                   "        word=\"${COMP_WORDS[i]}\"\n"
+                   "        if ((skip_max != 0)); then\n"
+                   "            if ((skip_min == 0)) && [[ $word != - && $word == -* && ! $word =~ $negative_number ]]; then\n"
+                   "                skip_min=0\n"
+                   "                skip_max=0\n"
+                   "            else\n"
+                   "                if ((skip_min > 0)); then ((skip_min--)); fi\n"
+                   "                if ((skip_max > 0)); then ((skip_max--)); fi\n"
+                   "                continue\n"
+                   "            fi\n"
+                   "        fi\n"
+                   "        if [[ \"$word\" == \"--\" ]]; then break; fi\n"
+                   "        name=\"$word\"\n"
+                   "        inline=0\n"
+                   "        if [[ $name == -*=* ]]; then name=\"${name%%=*}\"; inline=1; fi\n"
+                   "        _" << fn << "_option_info \"$path\" \"$name\" \"$inline\"\n"
+                   "        if ((opt_kind >= 0)); then\n"
+                   "            if ((inline == 0)) && ((i+1 < COMP_CWORD)) && [[ ${COMP_WORDS[i+1]} == = ]]; then\n"
+                   "                ((i++))\n"
+                   "                if ((i+1 < COMP_CWORD)); then ((i++)); fi\n"
+                   "                _" << fn << "_option_info \"$path\" \"$name\" 1\n"
+                   "            fi\n"
+                   "            continue\n"
+                   "        fi\n"
+                   "        if [[ $word == -?* && $word != --* ]]; then\n"
+                   "            found=0\n"
+                   "            for ((j=1; j<${#word}; j++)); do\n"
+                   "                ch=\"-${word:j:1}\"\n"
+                   "                _" << fn << "_option_info \"$path\" \"$ch\" 0\n"
+                   "                if ((opt_kind < 0)); then break; fi\n"
+                   "                if ((opt_kind == 1)); then\n"
+                   "                    found=1\n"
+                   "                    inline=0\n"
+                   "                    if ((j+1 < ${#word})); then\n"
+                   "                        inline=1\n"
+                   "                    elif ((i+1 < COMP_CWORD)) && [[ ${COMP_WORDS[i+1]} == = ]]; then\n"
+                   "                        inline=1\n"
+                   "                        ((i++))\n"
+                   "                        if ((i+1 < COMP_CWORD)); then ((i++)); fi\n"
+                   "                    fi\n"
+                   "                    _" << fn << "_option_info \"$path\" \"$ch\" \"$inline\"\n"
+                   "                    break\n"
+                   "                fi\n"
+                   "            done\n"
+                   "            if ((found)); then continue; fi\n"
+                   "            if ((opt_kind == 0)) && ((i+1 < COMP_CWORD)) && [[ ${COMP_WORDS[i+1]} == = ]]; then\n"
+                   "                ((i++))\n"
+                   "                if ((i+1 < COMP_CWORD)); then ((i++)); fi\n"
+                   "                continue\n"
+                   "            fi\n"
+                   "        fi\n"
+                   "        case \"$path|$word\" in\n";
+            for (const auto* node : nodes) {
+                if (node->parent_ == nullptr) continue;
+                const auto parent_path = command_path(*node->parent_);
+                for (const auto& spelling : node->aliases_) {
+                    const auto pattern = parent_path.empty()
+                        ? "|" + spelling : parent_path + "|" + spelling;
+                    out << "            " << shell_word(pattern) << ") path="
+                        << shell_word(command_path(*node)) << " ;;\n";
+                }
+                const auto pattern = parent_path.empty()
+                    ? "|" + node->name_ : parent_path + "|" + node->name_;
+                out << "            " << shell_word(pattern) << ") path="
+                    << shell_word(command_path(*node)) << " ;;\n";
+            }
+            out << "        esac\n"
+                   "    done\n"
+                   "    case \"$path\" in\n";
+            for (const auto* node : nodes) {
+                out << "        " << shell_word(command_path(*node)) << ") opts=\""
+                    << options_for(*node) << "\"; subs=\"" << subcommands_for(*node)
+                    << "\" ;;\n";
+            }
+            out << "    esac\n";
         }
-        out << "\"\n"
-               "    COMPREPLY=($(compgen -W \"${opts} ${subs}\" -- \"${cur}\"))\n"
+
+        out << "    COMPREPLY=($(compgen -W \"${opts} ${subs}\" -- \"${cur}\"))\n"
                "}\n"
                "complete -F _" << fn << " " << shell_word(name_) << "\n";
     }
@@ -2673,8 +3082,11 @@ public:
         auto fish_esc = [](std::string_view s) {
             std::string r;
             r.reserve(s.size());
-            for (char c : s)
-                r += (c == '\'') ? "'\"'\"'" : std::string(1, c);
+            for (char c : s) {
+                if (c == '\\') r += "\\\\";
+                else if (c == '\'') r += "'\"'\"'";
+                else r += c;
+            }
             return r;
         };
         auto fish_word = [&](std::string_view s) {
@@ -2686,73 +3098,298 @@ public:
             if (safe) return std::string(s);
             return std::string("'") + fish_esc(s) + "'";
         };
-
-        for (const auto& visible : visible_options()) {
-            const auto* opt = visible.option;
-            if (opt->hidden_) continue;
-            const auto sn = visible.short_name();
-            const auto ln = visible.long_name();
-            if (sn.empty() && ln.empty()) continue;
-            out << "complete -c " << fish_word(name_);
-            if (!sn.empty()) {
-                // Fish distinguishes classic one-letter shorts (-v) from
-                // old-style single-dash long options (-verbose).
-                if (sn.size() == 2) out << " -s " << fish_word(sn.substr(1));
-                else                out << " -o " << fish_word(sn.substr(1));
+        auto append_condition = [&](std::string_view condition) {
+            if (!condition.empty()) out << " -n '" << fish_esc(condition) << "'";
+        };
+        auto sanitize = [](std::string s) {
+            for (auto& c : s)
+                if (!std::isalnum(static_cast<unsigned char>(c))) c = '_';
+            return s;
+        };
+        auto command_path = [](const App& app) {
+            std::string path;
+            for (const App* node = &app; node->parent_ != nullptr; node = node->parent_) {
+                if (!path.empty()) path.insert(0, 1, ' ');
+                path.insert(0, node->name_);
             }
-            if (!ln.empty()) out << " -l " << fish_word(ln.substr(2));
-            if (opt->is_flag_) out << " -f";
-            else               out << " -r";
-            if (!opt->choices_str().empty() && !opt->is_count_option()) {
-                std::string choices;
-                for (char c : opt->choices_str()) {
-                    if (c == '|') choices += ' ';
-                    else if (c != '"') choices += c;
+            return path;
+        };
+        const bool completion_tree = parent_ == nullptr && !subcommands_.empty();
+        const auto context_fn = "__" + sanitize(name_) + "_command_context";
+        const auto info_fn = "__" + sanitize(name_) + "_option_info";
+        auto command_condition = [&](const App& app) {
+            return "test (" + context_fn + ") = " + fish_word(command_path(app));
+        };
+        auto root_condition = [&]() {
+            return "test (" + context_fn + ") = -";
+        };
+        const std::string command_name = name_;
+
+        if (completion_tree) {
+            std::vector<const App*> nodes;
+            auto collect = [&](auto&& self, const App& node) -> void {
+                nodes.push_back(&node);
+                for (const auto& sub : node.subcommands_)
+                    if (!sub->hidden_) self(self, *sub);
+            };
+            collect(collect, *this);
+
+            out << "function " << info_fn << "\n"
+                   "    switch \"$argv[1]|$argv[2]\"\n";
+            auto shell_arity = [](std::size_t n) {
+                constexpr auto max = static_cast<std::size_t>(
+                    std::numeric_limits<long long>::max());
+                return n > max ? max : n;
+            };
+            for (const auto* node : nodes) {
+                const auto path = command_path(*node);
+                for (const auto& visible : node->visible_options()) {
+                    const auto& opt = *visible.option;
+                    const int kind = opt.is_flag_ ? 0 : 1;
+                    const auto min = opt.is_flag_ ? 0
+                        : opt.nargs_min_ == 0 ? 1 : shell_arity(opt.nargs_min_);
+                    const auto max = opt.is_flag_ ? 0
+                        : opt.nargs_max_ == 0 ? 1
+                        : opt.nargs_max_ == static_cast<std::size_t>(-1) ? -1L
+                        : static_cast<long long>(shell_arity(opt.nargs_max_));
+                    for (const auto& name : visible.names) {
+                        out << "        case " << fish_word(path + "|" + std::string(name))
+                            << "\n            printf '%s\\n' " << kind << ' ' << min << ' ' << max
+                            << "\n";
+                    }
                 }
-                out << " -a '" << fish_esc(choices) << "'";
             }
-            if (!opt->help_text.empty())
-                out << " -d '" << fish_esc(opt->help_text) << "'";
-            out << "\n";
+            out << "        case '*'\n"
+                   "            printf '%s\\n' -1 0 0\n"
+                   "    end\n"
+                   "end\n\n";
 
-            if (negated_spelling_visible(visible)) {
-                out << "complete -c " << fish_word(name_) << " -l "
-                    << fish_word("no-" + std::string(ln.substr(2))) << " -f";
-                out << " -d 'Disable --" << fish_esc(ln.substr(2)) << "'\n";
+            out << "function " << context_fn << "\n"
+                   "    set -l tokens (commandline -opc)\n"
+                   "    set -l path ''\n"
+                   "    set -l i 2\n"
+                   "    set -l skip_min 0\n"
+                   "    set -l skip_max 0\n"
+                   "    set -l negative_number '^-([0-9]+(\\.[0-9]*)?|\\.[0-9]+)([eE][+-]?[0-9]+)?$|^-0[xX][0-9a-fA-F]+$|^-0[bB][01]+$'\n"
+                   "    while test $i -le (count $tokens)\n"
+                   "        set -l word $tokens[$i]\n"
+                   "        if test $skip_max -ne 0\n"
+                   "            set -l boundary 0\n"
+                   "            if test $skip_min -eq 0; and test \"$word\" != -; and string match -qr '^-' -- $word\n"
+                   "                if not string match -qr \"$negative_number\" -- $word\n"
+                   "                    set boundary 1\n"
+                   "                end\n"
+                   "            end\n"
+                   "            if test $boundary -eq 1\n"
+                   "                set skip_min 0\n"
+                   "                set skip_max 0\n"
+                   "            else\n"
+                   "                if test $skip_min -gt 0\n"
+                   "                    set skip_min (math $skip_min - 1)\n"
+                   "                end\n"
+                   "                if test $skip_max -gt 0\n"
+                   "                    set skip_max (math $skip_max - 1)\n"
+                   "                end\n"
+                   "                set i (math $i + 1)\n"
+                   "                continue\n"
+                   "            end\n"
+                   "        end\n"
+                   "        if test \"$word\" = --\n"
+                   "            break\n"
+                   "        end\n"
+                   "        set -l name $word\n"
+                   "        set -l inline 0\n"
+                   "        if string match -qr '^-.*=' -- $word\n"
+                   "            set name (string replace -r '=.*$' '' -- $word)\n"
+                   "            set inline 1\n"
+                   "        end\n"
+                   "        set -l info (" << info_fn << " \"$path\" \"$name\")\n"
+                   "        set -l kind $info[1]\n"
+                   "        if test $kind -ge 0\n"
+                   "            set skip_min $info[2]\n"
+                   "            set skip_max $info[3]\n"
+                   "            if test $inline -eq 1\n"
+                   "                if test $skip_min -gt 0\n"
+                   "                    set skip_min (math $skip_min - 1)\n"
+                   "                end\n"
+                   "                if test $skip_max -gt 0\n"
+                   "                    set skip_max (math $skip_max - 1)\n"
+                   "                end\n"
+                   "            end\n"
+                   "            set i (math $i + 1)\n"
+                   "            continue\n"
+                   "        end\n"
+                   "        if string match -qr '^-[^-].+' -- $word\n"
+                   "            set -l j 2\n"
+                   "            set -l found 0\n"
+                   "            while test $j -le (string length -- \"$word\")\n"
+                   "                set -l char (string sub -s $j -l 1 -- \"$word\")\n"
+                   "                set -l ch \"-$char\"\n"
+                   "                set info (" << info_fn << " \"$path\" \"$ch\")\n"
+                   "                set kind $info[1]\n"
+                   "                if test $kind -lt 0\n"
+                   "                    break\n"
+                   "                end\n"
+                   "                if test $kind -eq 1\n"
+                   "                    set found 1\n"
+                   "                    set inline 0\n"
+                   "                    if test $j -lt (string length -- \"$word\")\n"
+                   "                        set inline 1\n"
+                   "                    end\n"
+                   "                    set info (" << info_fn << " \"$path\" \"$ch\")\n"
+                   "                    set skip_min $info[2]\n"
+                   "                    set skip_max $info[3]\n"
+                   "                    if test $inline -eq 1\n"
+                   "                        if test $skip_min -gt 0\n"
+                   "                            set skip_min (math $skip_min - 1)\n"
+                   "                        end\n"
+                   "                        if test $skip_max -gt 0\n"
+                   "                            set skip_max (math $skip_max - 1)\n"
+                   "                        end\n"
+                   "                    end\n"
+                   "                    break\n"
+                   "                end\n"
+                   "                set j (math $j + 1)\n"
+                   "            end\n"
+                   "            if test $found -eq 1\n"
+                   "                set i (math $i + 1)\n"
+                   "                continue\n"
+                   "            end\n"
+                   "        end\n"
+                   "        switch \"$path|$word\"\n";
+            for (const auto* node : nodes) {
+                if (node->parent_ == nullptr) continue;
+                const auto parent_path = command_path(*node->parent_);
+                for (const auto& spelling : node->aliases_) {
+                    const auto pattern = parent_path.empty()
+                        ? "|" + spelling : parent_path + "|" + spelling;
+                    out << "            case " << fish_word(pattern) << "\n"
+                           "                set path " << fish_word(command_path(*node)) << "\n";
+                }
+                const auto pattern = parent_path.empty()
+                    ? "|" + node->name_ : parent_path + "|" + node->name_;
+                out << "            case " << fish_word(pattern) << "\n"
+                       "                set path " << fish_word(command_path(*node)) << "\n";
             }
-        }
-        if (!find_opt_inherited("-h"))
-            out << "complete -c " << fish_word(name_) << " -s h -f -d 'Print help'\n";
-        if (!find_opt_inherited("--help"))
-            out << "complete -c " << fish_word(name_) << " -l help -f -d 'Print help'\n";
-        if (!effective_version().empty()) {
-            if (!find_opt_inherited("-V"))
-                out << "complete -c " << fish_word(name_) << " -s V -f -d 'Print version'\n";
-            if (!find_opt_inherited("--version"))
-                out << "complete -c " << fish_word(name_) << " -l version -f -d 'Print version'\n";
+            out << "        end\n"
+                   "        set i (math $i + 1)\n"
+                   "    end\n"
+                   "    if test -z \"$path\"\n"
+                   "        printf '%s' -\n"
+                   "    else\n"
+                   "        printf '%s' \"$path\"\n"
+                   "    end\n"
+                   "end\n\n";
         }
 
-        for (const auto& s : subcommands_) {
-            if (s->hidden_) continue;
-            out << "complete -c " << fish_word(name_) << " -f -a '"
-                << fish_esc(s->name_) << "'";
-            if (!s->desc_.empty()) out << " -d '" << fish_esc(s->desc_) << "'";
-            out << "\n";
-            for (const auto& a : s->aliases_) {
-                out << "complete -c " << fish_word(name_) << " -f -a '"
-                    << fish_esc(a) << "'";
-                if (!s->desc_.empty())
-                    out << " -d '" << fish_esc(s->desc_) << " (→ "
-                        << fish_esc(s->name_) << ")'";
+        auto emit_node = [&](auto&& self, const App& node,
+                             const std::string& condition) -> void {
+            auto emit_metadata = [&](const detail::OptionBase& opt) {
+                if (opt.is_flag_) out << " -f";
+                else               out << " -r";
+                if (!opt.choices_str().empty() && !opt.is_count_option()) {
+                    std::string choices;
+                    for (char c : opt.choices_str()) {
+                        if (c == '|') choices += ' ';
+                        else if (c != '"') choices += c;
+                    }
+                    out << " -a '" << fish_esc(choices) << "'";
+                }
+                if (!opt.help_text.empty())
+                    out << " -d '" << fish_esc(opt.help_text) << "'";
+                append_condition(condition);
+                out << "\n";
+            };
+            for (const auto& visible : node.visible_options()) {
+                const auto* opt = visible.option;
+                if (opt->hidden_) continue;
+                const auto sn = visible.short_name();
+                const auto ln = visible.long_name();
+                if (sn.empty() && ln.empty()) continue;
+                out << "complete -c " << fish_word(command_name);
+                if (!sn.empty()) {
+                    // Fish distinguishes classic one-letter shorts (-v) from
+                    // old-style single-dash long options (-verbose).
+                    if (sn.size() == 2) out << " -s " << fish_word(sn.substr(1));
+                    else                out << " -o " << fish_word(sn.substr(1));
+                }
+                if (!ln.empty()) out << " -l " << fish_word(ln.substr(2));
+                emit_metadata(*opt);
+
+                // Fish completion entries have one primary short/long pair;
+                // emit additional option aliases as equivalent entries.
+                for (const auto& alias : visible.names) {
+                    if (alias == sn || alias == ln) continue;
+                    out << "complete -c " << fish_word(command_name);
+                    if (alias.starts_with("--"))
+                        out << " -l " << fish_word(alias.substr(2));
+                    else if (alias.size() == 2)
+                        out << " -s " << fish_word(alias.substr(1));
+                    else
+                        out << " -o " << fish_word(alias.substr(1));
+                    emit_metadata(*opt);
+                }
+
+                for (const auto& negated : node.completion_negated_spellings(visible)) {
+                    out << "complete -c " << fish_word(command_name) << " -l "
+                        << fish_word(negated.substr(2)) << " -f";
+                    out << " -d 'Disable --" << fish_esc(negated.substr(5)) << "'";
+                    append_condition(condition);
+                    out << "\n";
+                }
+            }
+            if (!node.find_opt_inherited("-h")) {
+                out << "complete -c " << fish_word(command_name)
+                    << " -s h -f -d 'Print help'";
+                append_condition(condition);
                 out << "\n";
             }
-        }
+            if (!node.find_opt_inherited("--help")) {
+                out << "complete -c " << fish_word(command_name)
+                    << " -l help -f -d 'Print help'";
+                append_condition(condition);
+                out << "\n";
+            }
+            if (!node.effective_version().empty()) {
+                if (!node.find_opt_inherited("-V")) {
+                    out << "complete -c " << fish_word(command_name)
+                        << " -s V -f -d 'Print version'";
+                    append_condition(condition);
+                    out << "\n";
+                }
+                if (!node.find_opt_inherited("--version")) {
+                    out << "complete -c " << fish_word(command_name)
+                        << " -l version -f -d 'Print version'";
+                    append_condition(condition);
+                    out << "\n";
+                }
+            }
+
+            for (const auto& s : node.subcommands_) {
+                if (s->hidden_) continue;
+                out << "complete -c " << fish_word(command_name) << " -f -a '"
+                    << fish_esc(s->name_) << "'";
+                if (!s->desc_.empty()) out << " -d '" << fish_esc(s->desc_) << "'";
+                append_condition(condition);
+                out << "\n";
+                for (const auto& a : s->aliases_) {
+                    out << "complete -c " << fish_word(command_name) << " -f -a '"
+                        << fish_esc(a) << "'";
+                    if (!s->desc_.empty())
+                        out << " -d '" << fish_esc(s->desc_) << " (→ "
+                            << fish_esc(s->name_) << ")'";
+                    append_condition(condition);
+                    out << "\n";
+                }
+                if (completion_tree)
+                    self(self, *s, command_condition(*s));
+            }
+        };
+
+        emit_node(emit_node, *this, completion_tree ? root_condition() : std::string{});
     }
 
     void zsh_completion(std::ostream& out = std::cout) const {
-        auto fn = name_;
-        for (auto& c : fn) if (!std::isalnum(static_cast<unsigned char>(c))) c = '_';
-
         auto zsh_esc = [](std::string_view s) {
             std::string r;
             r.reserve(s.size());
@@ -2763,22 +3400,42 @@ public:
             }
             return r;
         };
+        auto zsh_opt_esc = [](std::string_view s) {
+            std::string r;
+            r.reserve(s.size());
+            for (char c : s) {
+                if (c == '\\') r += "\\\\";
+                else if (c == '\'') r += "'\\''";
+                else if (c == '[' || c == ']' || c == ':') { r += '\\'; r += c; }
+                else r += c;
+            }
+            return r;
+        };
+        auto sanitize = [](std::string s) {
+            for (auto& c : s)
+                if (!std::isalnum(static_cast<unsigned char>(c))) c = '_';
+            return s;
+        };
+        std::vector<const App*> nodes;
+        auto collect_nodes = [&](auto&& self, const App& node) -> void {
+            nodes.push_back(&node);
+            for (const auto& sub : node.subcommands_)
+                if (!sub->hidden_) self(self, *sub);
+        };
+        collect_nodes(collect_nodes, *this);
+        std::unordered_map<const App*, std::size_t> ordinals;
+        for (std::size_t i = 0; i < nodes.size(); ++i) ordinals.emplace(nodes[i], i + 1);
 
-        std::string compdef_name = name_;
-        for (auto& c : compdef_name)
-            if (std::iscntrl(static_cast<unsigned char>(c))) c = '_';
-
-        out << "#compdef " << compdef_name << "\n\n";
-        out << "_" << fn << "() {\n";
-
-        if (!subcommands_.empty()) {
-            out << "    local context state state_descr line\n";
-            out << "    typeset -A opt_args\n\n";
-        }
-
-        out << "    local -a args\n";
-        out << "    args=(\n";
-
+        auto function_name = [&](const App& app) {
+            std::string fn = "_" + sanitize(name_);
+            std::vector<std::string> parts;
+            for (const App* node = &app; node != this; node = node->parent_)
+                parts.push_back(node->name_);
+            for (auto it = parts.rbegin(); it != parts.rend(); ++it)
+                fn += "_" + sanitize(*it);
+            if (&app != this) fn += "_" + std::to_string(ordinals.at(&app));
+            return fn;
+        };
         auto choice_action = [&zsh_esc](const detail::OptionBase& opt) {
             if (opt.is_flag_ || opt.is_count_option()) return std::string{};
             const auto choices = opt.choices_str();
@@ -2791,81 +3448,115 @@ public:
             action += ')';
             return zsh_esc(action);
         };
+        auto emit_spec = [&](const App& app, const detail::VisibleOption& visible) {
+            const auto& opt = *visible.option;
+            if (visible.names.empty()) return;
 
-        auto emit_spec = [&](const detail::VisibleOption& visible) {
-            const auto& opt    = *visible.option;
-            const auto  sn     = visible.short_name();
-            const auto  ln     = visible.long_name();
-            if (sn.empty() && ln.empty()) return;
-            const auto sn_esc = zsh_esc(sn);
-            const auto ln_esc = zsh_esc(ln);
-
-            std::string spec;
-            if (opt.is_multi()) spec += '*';
-            if (!sn.empty() && !ln.empty()) {
-                spec += "'(" + sn_esc + " " + ln_esc + ")'{"
-                        + sn_esc + "," + ln_esc + "}";
-                spec += "'";
-            } else {
-                spec += "'" + (ln.empty() ? sn_esc : ln_esc);
+            std::string exclusions;
+            if (visible.names.size() > 1
+                && std::ranges::none_of(visible.names, [](std::string_view name) {
+                       return name.find('(') != std::string_view::npos
+                           || name.find(')') != std::string_view::npos;
+                   })) {
+                exclusions = "(";
+                for (std::size_t i = 0; i < visible.names.size(); ++i) {
+                    if (i != 0) exclusions += ' ';
+                    exclusions += zsh_opt_esc(visible.names[i]);
+                }
+                exclusions += ")";
             }
+            std::string suffix;
             if (!opt.help_text.empty())
-                spec += "[" + zsh_esc(opt.help_text) + "]";
-            spec += "'";
+                suffix += "[" + zsh_esc(opt.help_text) + "]";
             if (!opt.is_flag_) {
                 const auto meta = opt.meta.empty() ? std::string("value") : zsh_esc(opt.meta);
                 auto action = choice_action(opt);
                 if (action.empty()) action = "_default";
-                spec += ":" + meta + ":" + action;
+                suffix += ":" + meta + ":" + action;
             }
-            out << "        " << spec << "\n";
+            for (const auto& name : visible.names) {
+                out << "        '";
+                if (opt.is_multi()) out << "*";
+                out << exclusions << zsh_opt_esc(name) << suffix << "'\n";
+            }
 
-            if (negated_spelling_visible(visible)) {
-                out << "        '--no-" << zsh_esc(ln.substr(2)) << "[Disable --"
-                    << zsh_esc(ln.substr(2)) << "]'\n";
+            for (const auto& negated : app.completion_negated_spellings(visible)) {
+                const auto positive = std::string_view(negated).substr(5);
+                out << "        '--no-" << zsh_opt_esc(positive)
+                    << "[Disable --" << zsh_opt_esc(positive) << "]'\n";
             }
         };
 
-        for (const auto& visible : visible_options()) {
-            if (visible.option->hidden_) continue;
-            emit_spec(visible);
-        }
-        if (!find_opt_inherited("-h") && !find_opt_inherited("--help")) {
-            out << "        '(-h --help)'{-h,--help}'[Print help]'\n";
-        } else {
-            if (!find_opt_inherited("-h"))     out << "        '-h[Print help]'\n";
-            if (!find_opt_inherited("--help")) out << "        '--help[Print help]'\n";
-        }
-        if (!effective_version().empty()) {
-            if (!find_opt_inherited("-V") && !find_opt_inherited("--version")) {
-                out << "        '(-V --version)'{-V,--version}'[Print version]'\n";
-            } else {
-                if (!find_opt_inherited("-V"))        out << "        '-V[Print version]'\n";
-                if (!find_opt_inherited("--version")) out << "        '--version[Print version]'\n";
+        auto emit_function = [&](auto&& self, const App& app,
+                                 const std::string& fn) -> void {
+            out << fn << "() {\n";
+            if (!app.subcommands_.empty()) {
+                out << "    local context state state_descr line\n";
+                out << "    typeset -A opt_args\n\n";
             }
-        }
-        out << "    )\n\n";
-
-        if (!subcommands_.empty()) {
-            out << "    local -a subcmds\n";
-            out << "    subcmds=(\n";
-            for (const auto& s : subcommands_) {
-                if (s->hidden_) continue;
-                out << "        '" << zsh_esc(s->name_) << ":" << zsh_esc(s->desc_) << "'\n";
-                for (const auto& a : s->aliases_)
-                    out << "        '" << zsh_esc(a) << ":" << zsh_esc(s->desc_) << " (alias)'\n";
+            out << "    local -a args\n";
+            out << "    args=(\n";
+            for (const auto& visible : app.visible_options()) {
+                if (!visible.option->hidden_) emit_spec(app, visible);
+            }
+            if (!app.find_opt_inherited("-h") && !app.find_opt_inherited("--help")) {
+                out << "        '(-h --help)'{-h,--help}'[Print help]'\n";
+            } else {
+                if (!app.find_opt_inherited("-h"))     out << "        '-h[Print help]'\n";
+                if (!app.find_opt_inherited("--help")) out << "        '--help[Print help]'\n";
+            }
+            if (!app.effective_version().empty()) {
+                if (!app.find_opt_inherited("-V") && !app.find_opt_inherited("--version")) {
+                    out << "        '(-V --version)'{-V,--version}'[Print version]'\n";
+                } else {
+                    if (!app.find_opt_inherited("-V"))        out << "        '-V[Print version]'\n";
+                    if (!app.find_opt_inherited("--version")) out << "        '--version[Print version]'\n";
+                }
             }
             out << "    )\n\n";
-            out << "    _arguments -C $args[@] ':command:->command'\n";
-            out << "    case $state in\n";
-            out << "        command) _describe 'commands' subcmds ;;\n";
-            out << "    esac\n";
-        } else {
-            out << "    _arguments $args[@]\n";
-        }
 
-        out << "}\n\n";
-        out << "_" << fn << "\n";
+            if (!app.subcommands_.empty()) {
+                out << "    local -a subcmds\n";
+                out << "    subcmds=(\n";
+                for (const auto& s : app.subcommands_) {
+                    if (s->hidden_) continue;
+                    out << "        '" << zsh_esc(s->name_) << ":" << zsh_esc(s->desc_) << "'\n";
+                    for (const auto& a : s->aliases_)
+                        out << "        '" << zsh_esc(a) << ":" << zsh_esc(s->desc_) << " (alias)'\n";
+                }
+                out << "    )\n\n";
+                out << "    _arguments -C \"${args[@]}\" ':command:->command' '*::arg:->args'\n";
+                out << "    case $state in\n";
+                out << "        command) _describe 'commands' subcmds ;;\n";
+                out << "        args)\n";
+                out << "            case $line[1] in\n";
+                for (const auto& s : app.subcommands_) {
+                    if (s->hidden_) continue;
+                    out << "                '" << zsh_esc(s->name_) << "'";
+                    for (const auto& alias : s->aliases_)
+                        out << "|'" << zsh_esc(alias) << "'";
+                    out << ") " << function_name(*s) << " ;;\n";
+                }
+                out << "            esac\n";
+                out << "            ;;\n";
+                out << "    esac\n";
+            } else {
+                out << "    _arguments \"${args[@]}\"\n";
+            }
+            out << "}\n\n";
+
+            for (const auto& sub : app.subcommands_)
+                if (!sub->hidden_) self(self, *sub, function_name(*sub));
+        };
+
+        std::string compdef_name = name_;
+        for (auto& c : compdef_name)
+            if (std::iscntrl(static_cast<unsigned char>(c))) c = '_';
+
+        out << "#compdef " << compdef_name << "\n\n";
+        const auto root_fn = function_name(*this);
+        emit_function(emit_function, *this, root_fn);
+        out << root_fn << "\n";
     }
 
 private:
@@ -2884,6 +3575,14 @@ private:
             registry_.remove(p);
             options_.pop_back();
             throw;
+        }
+    }
+
+    void validate_positional_order() const {
+        for (size_t i = 0; i + 1 < positionals_.size(); ++i) {
+            if (positionals_[i]->variable_arity())
+                throw std::invalid_argument(
+                    "cli: a variable-arity positional must be the last positional");
         }
     }
 
@@ -2933,6 +3632,9 @@ private:
             required = true;
         }
         if (path.empty()) {
+            if (required)
+                return std::unexpected(ParseError::config(
+                    path, "config path is empty", root));
             root->config_loaded_ = true;
             root->config_loaded_path_.clear();
             root->config_data_ = {};
@@ -2982,11 +3684,17 @@ private:
         detail::OptionBase* opt, const detail::ConfigData::Section& section) {
         if (opt->is_set_ || opt->from_env_ || opt->from_config_) return {};
         if (const auto* raw = detail::config_value_for(section, opt->names)) {
-            auto values = opt->is_multi() ? detail::config_values(*raw)
-                                          : std::vector<std::string>{ *raw };
-            if (values.empty()) return {};
-            for (const auto& v : values) {
-                if (auto r = opt->parse(v, opt->display_name(), this); !r) return r;
+            if (opt->is_multi() && raw->is_array) {
+                if (raw->elements.empty()) {
+                    opt->set_empty_config();
+                } else {
+                    for (const auto& v : raw->elements) {
+                        if (auto r = opt->parse_config_element(
+                                v, opt->display_name(), this); !r) return r;
+                    }
+                }
+            } else if (auto r = opt->parse(raw->text, opt->display_name(), this); !r) {
+                return r;
             }
             opt->is_set_     = false;
             opt->from_config_ = true;
@@ -3014,11 +3722,17 @@ private:
         if (pos->is_set_ || pos->from_env_ || pos->from_config_) return {};
         const auto it = section.find(pos->name);
         if (it == section.end()) return {};
-        auto values = pos->variadic_ ? detail::config_values(it->second)
-                                     : std::vector<std::string>{ it->second };
-        if (values.empty()) return {};
-        for (const auto& v : values) {
-            if (auto r = pos->parse(v, this); !r) return r;
+        const auto& raw = it->second;
+        if (pos->variadic_ && raw.is_array) {
+            if (raw.elements.empty()) {
+                pos->set_empty_config();
+            } else {
+                for (const auto& v : raw.elements) {
+                    if (auto r = pos->parse_config_element(v, this); !r) return r;
+                }
+            }
+        } else if (auto r = pos->parse(raw.text, this); !r) {
+            return r;
         }
         pos->is_set_      = false;
         pos->from_config_ = true;
@@ -3073,29 +3787,46 @@ private:
     template<typename Token>
     [[nodiscard]] ParseResult run_parse(std::span<const Token> tokens,
                                         bool invocation_root) {
-        // response_files() is configured on the root command, but parsing a
-        // subcommand directly should still honor it.
-        const App* policy = this;
-        while (policy->parent_ != nullptr) policy = policy->parent_;
-        if (!policy->response_files_ || tokens.empty())
-            return do_parse(tokens, invocation_root);
-        std::vector<std::string_view> views;
-        views.reserve(tokens.size());
-        for (const auto& token : tokens)
-            views.emplace_back(token_text(token));
-        auto expanded = detail::expand_response_tokens(views, this);
-        if (!expanded) return std::unexpected(std::move(expanded.error()));
-        std::vector<std::string_view> expanded_views;
-        expanded_views.reserve(expanded->size());
-        for (const auto& token : *expanded)
-            expanded_views.emplace_back(token);
-        return do_parse(std::span<const std::string_view>(expanded_views),
+        try {
+            ParseResult result;
+            // response_files() is configured on the root command, but parsing a
+            // subcommand directly should still honor it.
+            const App* policy = this;
+            while (policy->parent_ != nullptr) policy = policy->parent_;
+            if (!policy->response_files_ || tokens.empty()) {
+                result = do_parse(tokens, invocation_root);
+            } else {
+                std::vector<std::string_view> views;
+                views.reserve(tokens.size());
+                for (const auto& token : tokens)
+                    views.emplace_back(token_text(token));
+                auto expanded = detail::expand_response_tokens(views, this);
+                if (!expanded) {
+                    result = std::unexpected(std::move(expanded.error()));
+                } else {
+                    std::vector<std::string_view> expanded_views;
+                    expanded_views.reserve(expanded->size());
+                    for (const auto& token : *expanded)
+                        expanded_views.emplace_back(token);
+                    result = do_parse(
+                        std::span<const std::string_view>(expanded_views),
                         invocation_root);
+                }
+            }
+            // A failed invocation must not expose partially parsed values,
+            // defaults, extras, config data, or active-command state.
+            if (!result) root_app()->reset();
+            return result;
+        } catch (...) {
+            root_app()->reset();
+            throw;
+        }
     }
 
     template<typename Token>
     [[nodiscard]] ParseResult do_parse(std::span<const Token> args,
                                        bool invocation_root) {
+        validate_positional_order();
         validate_group_references();
         bool   end_opts       = false;
         bool   saw_positional = false;
@@ -3356,11 +4087,11 @@ private:
         return finish(/*subcommand_active=*/false, invocation_root);
     }
 
-    /// Finalize this command, then any ancestors when this command was the
-    /// entry point of a direct `sub.parse(...)` call.  Those ancestors still
-    /// own inherited globals, so their defaults, validators, transforms and
-    /// required checks must run exactly as they would for
-    /// `root.parse({"sub", ...})`.
+    /// Finalize this command, then value fallbacks on ancestors when this
+    /// command was the entry point of a direct `sub.parse(...)` call.  Ordinary
+    /// ancestor options cannot be supplied from that entry point, so only
+    /// inherited globals participate in required and group checks; ancestor
+    /// positionals are not part of the direct invocation.
     [[nodiscard]] ParseResult finish(bool subcommand_active, bool invocation_root) {
         if (auto r = finalize(subcommand_active); !r) return r;
         if (!invocation_root) return {};
@@ -3374,18 +4105,21 @@ private:
                 ancestor->remaining_args_.insert(ancestor->remaining_args_.end(),
                                                  descendant->remaining_args_.begin(),
                                                  descendant->remaining_args_.end());
-            if (auto r = ancestor->finalize(/*subcommand_active=*/true); !r)
+            ancestor->validate_group_references();
+            if (auto r = ancestor->finalize(
+                    /*subcommand_active=*/true, /*direct_ancestor=*/true); !r)
                 return r;
             descendant = ancestor;
         }
         return {};
     }
 
-    [[nodiscard]] ParseResult finalize(bool subcommand_active) {
+    [[nodiscard]] ParseResult finalize(bool subcommand_active,
+                                       bool direct_ancestor = false) {
         // Load config lazily: by this point any --config CLI value has been
         // parsed, and child finalization can reach the root data.
         App* root = root_app();
-        if (!root->config_file_.empty()
+        if (!root->config_file_.empty() || root->config_required_
             || (root->config_option_ != nullptr && root->config_option_->value)) {
             if (auto r = root->ensure_config_loaded(); !r) return r;
         }
@@ -3403,8 +4137,8 @@ private:
         for (auto& opt : options_) {
             if (opt->is_set_) continue;
             if (!opt->env_var.empty() && !opt->from_env_ && !opt->from_config_) {
-                if (const char* v = std::getenv(opt->env_var.c_str())) {
-                    if (auto r = opt->parse_env(v, this); !r) return r;
+                if (auto value = detail::environment_value(opt->env_var)) {
+                    if (auto r = opt->parse_env(*value, this); !r) return r;
                 }
             }
             if (!opt->from_env_ && config_section) {
@@ -3413,12 +4147,13 @@ private:
             }
             if (!opt->from_env_ && !opt->from_config_ && opt->has_default_)
                 opt->apply_default();
-            if (opt->required_ && !opt->from_env_ && !opt->from_config_
-                && !opt->has_default_)
+            if (opt->required_ && (!direct_ancestor || opt->global_)
+                && !opt->from_env_ && !opt->from_config_ && !opt->has_default_)
                 return std::unexpected(ParseError::missing_required(opt->display_name(), this));
         }
 
         for (auto& pos : positionals_) {
+            if (subcommand_active) continue;
             if (pos->is_set_) {
                 if (pos->parsed_count_ < pos->nargs_min_)
                     return std::unexpected(ParseError::not_enough_values(
@@ -3429,25 +4164,29 @@ private:
                 continue;
             }
             if (!pos->env_var.empty() && !pos->from_env_ && !pos->from_config_) {
-                if (const char* v = std::getenv(pos->env_var.c_str())) {
-                    if (auto r = pos->parse_env(v, this); !r) return r;
+                if (auto value = detail::environment_value(pos->env_var)) {
+                    if (auto r = pos->parse_env(*value, this); !r) return r;
                 }
             }
             if (!pos->from_env_ && !pos->from_config_ && config_section) {
                 if (auto r = apply_config_positional(pos.get(), *config_section); !r)
                     return r;
             }
-            if (!pos->from_env_ && !pos->from_config_ && pos->has_default_)
-                pos->apply_default();
-            // An explicitly supplied positional may still be short of a
-            // configured arity, even when it is not required overall.
-            if (pos->from_env_ || pos->from_config_) {
-                if (pos->parsed_count_ < pos->nargs_min_)
+            const bool from_default = !pos->from_env_ && !pos->from_config_
+                                      && pos->has_default_;
+            if (from_default) pos->apply_default();
+            // Explicit CLI, environment and config values count parsed
+            // elements; defaults count the values stored in the default.
+            if (pos->from_env_ || pos->from_config_ || from_default) {
+                const size_t count = pos->from_env_ || pos->from_config_
+                    ? pos->parsed_count_
+                    : pos->value_count();
+                if (count < pos->nargs_min_)
                     return std::unexpected(ParseError::not_enough_values(
-                        pos->name, pos->nargs_min_, pos->parsed_count_, this));
-                if (pos->parsed_count_ > pos->nargs_max_)
+                        pos->name, pos->nargs_min_, count, this));
+                if (count > pos->nargs_max_)
                     return std::unexpected(ParseError::too_many_values(
-                        pos->name, pos->nargs_max_, pos->parsed_count_, this));
+                        pos->name, pos->nargs_max_, count, this));
             }
         }
         if (!subcommand_active) {
@@ -3469,13 +4208,17 @@ private:
         for (auto& opt : options_)
             if (opt->needs_finalize_)
                 if (auto r = opt->validate_and_finalize(this); !r) return r;
-        for (auto& pos : positionals_)
-            if (pos->needs_finalize_)
-                if (auto r = pos->validate_and_finalize(this); !r) return r;
+        if (!subcommand_active)
+            for (auto& pos : positionals_)
+                if (pos->needs_finalize_)
+                    if (auto r = pos->validate_and_finalize(this); !r) return r;
 
         // 3. Mutex group constraints.  Values supplied through the environment
         //    or a config file count as explicit choices; defaults do not.
         for (const auto& group : mutex_resolved_) {
+            if (direct_ancestor && std::ranges::any_of(
+                    group, [](const auto* opt) { return !opt->global_; }))
+                continue;
             std::string first_set;
             for (auto* opt : group) {
                 if (opt->is_set_ || opt->from_env_ || opt->from_config_) {
@@ -3489,6 +4232,9 @@ private:
 
         // 4. Require-together constraints
         for (const auto& group : require_resolved_) {
+            if (direct_ancestor && std::ranges::any_of(
+                    group, [](const auto* opt) { return !opt->global_; }))
+                continue;
             std::string_view any_set;
             for (auto* opt : group) {
                 if (opt->is_set_ || opt->from_env_ || opt->from_config_) {
@@ -3507,6 +4253,9 @@ private:
 
         // 5. Require-at-least-one groups
         for (const auto& group : require_one_resolved_) {
+            if (direct_ancestor && std::ranges::any_of(
+                    group, [](const auto* opt) { return !opt->global_; }))
+                continue;
             bool any_set = false;
             std::string names;
             for (auto* opt : group) {
@@ -3705,6 +4454,22 @@ private:
         negated.reserve(ln.size() + 3);
         negated.append("--no-").append(ln.substr(2));
         return find_opt_inherited(negated) == nullptr;
+    }
+
+    /// Every negated long spelling the parser accepts for this visible flag.
+    /// Aliases participate independently, while an exact registered spelling
+    /// always wins over generated negation.
+    [[nodiscard]] std::vector<std::string> completion_negated_spellings(
+        const detail::VisibleOption& visible) const {
+        std::vector<std::string> out;
+        if (!visible.option->negatable_) return out;
+        for (const auto& name : visible.names) {
+            if (!name.starts_with("--")) continue;
+            std::string negated = "--no-";
+            negated.append(name.substr(2));
+            if (find_opt_inherited(negated) == nullptr) out.push_back(std::move(negated));
+        }
+        return out;
     }
 
     void render_option_list(std::string& out) const {

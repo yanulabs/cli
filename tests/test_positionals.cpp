@@ -204,6 +204,15 @@ TEST_CASE("only variable-arity positionals must be registered last") {
         std::invalid_argument);
 }
 
+TEST_CASE("mutating a positional to variable arity is rejected before parsing") {
+    cli::App app("t");
+    auto rest  = app.add_positional<std::vector<std::string>>("rest").nargs(2);
+    (void)app.add_positional<std::string>("label");
+    rest.nargs_at_least(1);
+
+    CHECK_THROWS_AS((void)app.parse({"a", "b", "label"}), std::invalid_argument);
+}
+
 TEST_CASE("later parses do not inherit a positional arity count") {
     cli::App app("t");
     auto nums  = app.add_positional<std::vector<int>>("nums").nargs(2);
@@ -302,6 +311,33 @@ TEST_CASE("a vector positional default is applied when absent") {
     CHECK((*values)[0] == "a");
     CHECK((*values)[1] == "b");
     CHECK(!values.is_set());
+}
+
+TEST_CASE("positional defaults must satisfy nargs") {
+    cli::App short_app("short");
+    (void)short_app.add_positional<std::vector<std::string>>("values")
+              .nargs(2)
+              .default_val(std::vector<std::string>{"only-one"});
+    auto short_result = short_app.parse({});
+    REQUIRE(!short_result);
+    CHECK(short_result.error().kind == cli::ParseError::Kind::MissingValue);
+    CHECK(contains(short_result.error().message, "at least 2"));
+
+    cli::App long_app("long");
+    (void)long_app.add_positional<std::vector<std::string>>("values")
+              .nargs(1, 2)
+              .default_val(std::vector<std::string>{"one", "two", "three"});
+    auto long_result = long_app.parse({});
+    REQUIRE(!long_result);
+    CHECK(long_result.error().kind == cli::ParseError::Kind::UnexpectedValue);
+    CHECK(contains(long_result.error().message, "at most 2"));
+
+    cli::App valid_app("valid");
+    auto values = valid_app.add_positional<std::vector<std::string>>("values")
+                      .nargs(2)
+                      .default_val(std::vector<std::string>{"one", "two"});
+    REQUIRE(valid_app.parse({}));
+    REQUIRE(values->size() == 2);
 }
 
 TEST_CASE("a provided vector positional replaces its default") {

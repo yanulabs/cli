@@ -36,7 +36,7 @@
 | **Subcommands** | Recursive, each with their own option set; inherited version |
 | **Rich help** | ANSI-colored, auto-aligned, section-structured; `help_text()` returns a string |
 | **Suggestions** | Levenshtein "did you mean?" on unknown options (incl. `--no-X` variants) |
-| **Completions** | Bash, Fish (with subcommand aliases), and Zsh generators |
+| **Completions** | Bash, Fish, and Zsh generators with nested subcommand context and aliases |
 | **Count options** | `add_count("--verbose")` counts `-v -v -v` occurrences; `[count]` shown in help |
 | **Required flags/counts** | `.required()` works on options, flags, counts, and positionals |
 | **Transforms** | `.transform(fn)` applies a post-parse value transformation |
@@ -101,7 +101,7 @@ include(FetchContent)
 FetchContent_Declare(
     cli
     GIT_REPOSITORY https://github.com/yanujz/cli.git
-    GIT_TAG        v1.0.0
+    GIT_TAG        main  # replace with a release tag or commit SHA
 )
 FetchContent_MakeAvailable(cli)
 
@@ -174,6 +174,11 @@ void          app.bash_completion(ostream&);
 void          app.fish_completion(ostream&);
 void          app.zsh_completion(ostream&);
 ```
+
+Every parse starts by resetting the invocation tree. If parsing fails—either by
+returning `ParseError` or throwing from a validator/transform—the tree is left
+reset: no partially parsed values, defaults, extras, config data, or active
+subcommand remain observable.
 
 ### `Option<T>` builder chain
 
@@ -287,9 +292,11 @@ Globals are inherited by every descendant, participate in abbreviation and
 typo suggestions, and appear in child help/completion. Shadowing is
 name-by-name: a child option named `-v` hides only the inherited `-v`, while
 the global `--verbose` spelling remains functional and documented. Parsing a
-subcommand directly (`build.parse(...)`) uses the same inherited globals and
-root config/response-file policy, and finalizes ancestors just as
-`app.parse({"build", ...})` does.
+subcommand directly (`build.parse(...)`) applies ancestor environment, config,
+and default fallbacks, but only inherited globals participate in required and
+group checks; non-global ancestor options and positionals cannot be supplied
+from that entry point and do not make the direct parse fail. Parent positionals
+are likewise not finalized when a subcommand is selected through the root.
 
 ### Negatable flags
 
@@ -342,7 +349,9 @@ auto all = app.add_positional<std::vector<std::string>>("all").nargs_at_least(1)
 
 Fixed arities may be followed by other positionals. Ranged and at-least
 arities are variable, so they must be registered last; doing otherwise throws
-`std::invalid_argument` at registration time.
+`std::invalid_argument` at registration time. Arity is revalidated before each
+parse, so changing a handle from fixed to variable arity after registration is
+also rejected. Positional defaults must satisfy the configured arity.
 
 ### Config files
 
@@ -362,11 +371,13 @@ target = release
 
 Precedence is **command line > environment > config > default**. Sections map
 to command paths (`[remote.add]` for nested commands), values may be quoted,
-and array syntax `[a, b, "c,d"]` populates vector options and positionals.
-Section headers may be quoted (`["build"]`) or use TOML's double-bracket
-spelling (`[[build]]`); `[default]` configures the root command, and a UTF-8
-BOM at the start of the file is ignored. Missing optional files are ignored;
-`config_file(path, true)` makes them mandatory. Malformed files return
+and array syntax `[a, b, "c,d"]` populates vector options and positionals
+without re-splitting quoted delimiters. `[]` supplies an explicit empty vector,
+while `[""]` supplies one empty element. Section headers may be quoted
+(`["build"]`) or use TOML's double-bracket spelling (`[[build]]`); `[default]`
+configures the root command, and a UTF-8 BOM at the start of the file is
+ignored. Missing optional files are ignored; `config_file(path, true)` makes
+them mandatory. Malformed headers, quotes, arrays, and trailing text return
 `ParseError::Kind::ConfigError`.
 
 ### Response files
@@ -378,8 +389,8 @@ app.response_files();
 
 Files are tokenised with shell-like quoting, support `#` comments and nested
 `@file` references (up to 8 levels), and produce
-`ParseError::Kind::ResponseFileError` on failure. `@@name` escapes a literal
-`@name` token.
+`ParseError::Kind::ResponseFileError` on failure. Nested paths are resolved
+relative to the including file. `@@name` escapes a literal `@name` token.
 
 ### Extra arguments for wrapper tools
 
@@ -484,6 +495,9 @@ app.print_help(std::cerr);           // write to any ostream
 
 ```cpp
 app.zsh_completion(std::cout);  // writes #compdef-style function
+// Root-generated Bash/Fish/Zsh scripts switch option sets after subcommands,
+// including nested commands and aliases. Bash/Fish context scanners skip
+// option values according to the declared option arity.
 // Usage: eval "$(mytool --shell zsh)"
 ```
 
@@ -520,7 +534,7 @@ cmake -S . -B build-fuzz -DCLI_BUILD_EXAMPLES=OFF -DCLI_BUILD_FUZZERS=ON
 cmake --build build-fuzz --target fuzz_parse
 ./build-fuzz/tests/fuzz_parse tests/fuzz_corpus -max_len=4096 -runs=200000
 
-# Upstream differential replays (opt-in; needs Python 3 and GCC/Clang)
+# Upstream differential replays (opt-in locally; required in CI)
 cmake -S . -B build-diff -DCLI_BUILD_DIFFERENTIAL_TESTS=ON
 cmake --build build-diff -j
 ctest --test-dir build-diff -R differential_upstream --output-on-failure
@@ -532,16 +546,17 @@ ctest --test-dir build-diff -R differential_upstream --output-on-failure
 CLI11 v2.7.2, argparse v3.2, and cxxopts v3.3.1 test suites — 1,575, 565, and
 46 records respectively. Each replay reconstructs the upstream schema and feeds
 the identical argument vector to `cli.hpp`. Accept/reject parity is checked for
-all three suites; for CLI11, successful cases with no unsupported-feature tag
-also compare every parsed option, positional, and flag value (215 of 269
-successful untagged cases and 296 fields on the checked-in corpora, with no
-skipped field lacking a builtin mapping).
+all three suites; all three also compare parsed option, positional, and flag
+values for successful untagged cases. Coverage is 215/269 cases and 296 fields
+for CLI11, 118/136 cases and 129 fields for argparse, and 11/14 cases and 20
+fields for cxxopts, with no captured field skipped for lack of a builtin mapping.
 
 The driver fails on any untagged divergence, parsed-value mismatch, or schema
 that cannot be replayed. Tagged divergences name semantics outside the supported
 subset (config files, custom converters, help rendering, exotic containers, and
 so on); they are expected and are not counted as parser mismatches. The checked
-corpora currently produce zero untagged divergences and zero hard blocks.
+corpora currently produce zero untagged divergences and zero hard blocks.  A
+dedicated CI job replays all three suites on every push and pull request.
 
 ```bash
 python3 tools/differential/run.py --cxx clang++
@@ -560,7 +575,9 @@ Tests are split by domain (`flags`, `options`, `positionals`, `values`,
 suite, so failures are attributable to one area and the whole suite can still
 be run at once. The fuzz target is opt-in and requires Clang with a libFuzzer runtime
 (Linux CI uses Clang 19); `CLI_FUZZER_SANITIZERS` controls the sanitizer set
-(default `address,undefined`).
+(default `address,undefined`).  Its oracle compares parsed values, explicit-set
+flags, extras, active command chains, repeated parses, and direct-child parsing
+against equivalent root dispatch.
 
 ### Performance
 
@@ -569,20 +586,24 @@ reset. On an Apple-silicon laptop (Release, Clang) the suite currently runs at:
 
 | Scenario | ns/parse | parses/sec |
 |---|---:|---:|
-| 8 short flags | ~158 | ~6.3 M |
-| 6 typed options (12 tokens) | ~255 | ~3.9 M |
-| mixed flags/options/vector/positional | ~244 | ~4.1 M |
-| subcommand + options (2 parses) | ~270 | ~3.7 M |
+| 8 short flags | ~130 | ~7.7 M |
+| 6 typed options (12 tokens) | ~228 | ~4.4 M |
+| mixed flags/options/vector/positional | ~227 | ~4.4 M |
+| subcommand + options | ~130 | ~7.7 M |
+| nested subcommand | ~116 | ~8.6 M |
 
-`bench_compare` runs the same schema shapes against CLI11 2.7.2 and cxxopts
-3.3.1. Across repeated runs on the same machine, cli.hpp is roughly 2.3–5.5×
-faster per parse than CLI11 and 24–53× faster than cxxopts (CLI11:
-~858/605/346/1160 ns; cxxopts: ~8352/6125/3401 ns, no subcommands).
+`bench_compare` runs equivalent schema shapes against CLI11 2.7.2 and cxxopts
+3.3.1. Across repeated runs on the same machine, cli.hpp is roughly 2.8–6.8×
+faster per parse than CLI11 and 26–56× faster than cxxopts on the shared
+scenarios. Subcommand workloads are reported separately because cxxopts does
+not support them.
 
 Numbers vary by machine; run the benchmark targets on your own hardware.
-Hot-path work is allocation-free for `parse(argc, argv)`, one-character short
-options use a direct 128-slot index instead of hashing, and formatting is
-confined to help/error paths.
+Token handling is allocation-free for `parse(argc, argv)`; string and vector
+values may allocate. One-character short options and collision-free long
+options use direct ASCII indexes, floating-point conversion uses
+`std::from_chars` where available, and formatting is confined to help/error
+paths.
 
 ---
 
