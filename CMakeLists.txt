@@ -1,5 +1,8 @@
 cmake_minimum_required(VERSION 3.25)
 
+# Copyright (c) 2024-2026 Yanu Labs
+# SPDX-License-Identifier: MIT
+
 project(
     cli
     VERSION 1.2.0
@@ -75,6 +78,15 @@ if(CLI_INSTALL)
     install(
         FILES       include/cli.hpp
         DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}
+    )
+
+    install(
+        FILES       LICENSE NOTICE
+        DESTINATION ${CMAKE_INSTALL_DATAROOTDIR}/licenses/cli
+    )
+    install(
+        DIRECTORY  LICENSES
+        DESTINATION ${CMAKE_INSTALL_DATAROOTDIR}/licenses/cli
     )
 
     configure_package_config_file(

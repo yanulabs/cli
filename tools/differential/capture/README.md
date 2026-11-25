@@ -120,10 +120,12 @@ The patches are derivative works of the upstream projects and retain their
 licenses:
 
 - CLI11: BSD-3-Clause, Copyright (c) 2017-2026 University of Cincinnati,
-  developed by Henry Schreiner and contributors.
-- argparse: MIT, Copyright (c) 2019-2022 Pranav Srinivas Kumar and
-  contributors.
-- cxxopts: MIT, Copyright (c) 2014-2022 Jarryd Beck.
+  developed by Henry Schreiner under NSF Award 1414736. See
+  [`LICENSES/CLI11-BSD-3-Clause.txt`](../../../LICENSES/CLI11-BSD-3-Clause.txt).
+- argparse: MIT, Copyright (c) 2018 Pranav Srinivas Kumar. See
+  [`LICENSES/argparse-MIT.txt`](../../../LICENSES/argparse-MIT.txt).
+- cxxopts: MIT, Copyright (c) 2014 Jarryd Beck. See
+  [`LICENSES/cxxopts-MIT.txt`](../../../LICENSES/cxxopts-MIT.txt).
 
 The corpora contain parser schemas and test arguments derived from the
 upstream test suites under those licenses.

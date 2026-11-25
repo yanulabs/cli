@@ -5,9 +5,12 @@ All notable changes to this project will be documented in this file.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [1.2.0] — 2026-11-25
 
 ### Added
+- **OSS project metadata** — Yanu Labs copyright ownership, third-party license
+  texts/notices, contribution and security policies, code of conduct, and issue
+  and pull-request templates
 - **Variable-arity options** — `.nargs(N)`, `.nargs(lo, hi)`, and
   `.nargs_at_least(N)` let one vector-option occurrence consume several
   tokens; exact arities keep dash-prefixed values, ranged arities stop at the
@@ -117,6 +120,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **CI matrix** — GCC/Clang/macOS/Windows builds, ASan+UBSan, strict
   warnings with `-fno-rtti`, a 200k-run fuzz smoke test, and an installed
   `find_package` consumer build
+- **`parse({...})` initializer-list overload** — parse without `argc`/`argv`;
+  ideal for testing
+- **Negative number positionals** — tokens like `-1`, `-3.14`, and `-42` are
+  treated as positional values when no matching short option is registered
+- **`Lookup::as_count()`** — dedicated accessor for Count option values;
+  `as<unsigned>()` also works transparently for Count options
+- **`App::reset()`** — clears all parsed state so an `App` can be safely reused
+  across multiple `parse()` calls
+- **`[count]` annotation in help** — Count options show `[count]` in the choices
+  column to signal they are repeatable
+- **Named help section spacing** — blank lines separate option groups in the
+  `OPTIONS` block
+- **Negatable suggestions** — `suggest()` includes `--no-X` candidates
+- **Nested `parse_or_exit()` callback dispatch** — fires the deepest active
+  subcommand callback
 
 ### Fixed
 - Config arrays preserve element boundaries for delimited vectors, distinguish
@@ -213,10 +231,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Option and positional handles expose mutable `T&` / `T*` access after parsing
 - Vector defaults and choice lists join empty elements with their separators
   (`[default: , two]`, `[|auto]`) instead of silently dropping them
+- `Lookup::as<unsigned>()` for Count options returns the accumulated count
+- `Lookup::as_or<T>()` for Count options returns the fallback when absent
 
 ### Changed
-- Package metadata now reports version 1.2.0, matching the latest changelog;
-  FetchContent tracks `main` until a real release tag or commit SHA is chosen
+- Package metadata reports version 1.2.0, and the README FetchContent example
+  pins the `v1.2.0` release tag
 - Failed parses now leave the invocation tree reset instead of exposing partial
   values, defaults, extras, config data, or active-command state; exceptions from
   validators/transforms roll back before propagating
@@ -251,30 +271,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `parse_or_exit()` use `std::cout`/`std::format`, broadening standard-library
   compatibility
 
-## [1.2.0]
-
-### Added
-- **`parse({...})` initializer-list overload** — parse without `argc`/`argv`; ideal for testing
-- **Negative number positionals** — tokens like `-1`, `-3.14`, `-42` are now correctly treated as positional values when no matching short option is registered
-- **`Lookup::as_count()`** — dedicated accessor for Count option values; `as<unsigned>()` also works transparently for Count options
-- **`App::reset()`** — clears all parsed state so an App can be safely reused across multiple `parse()` calls
-- **`[count]` annotation in help** — Count options show `[count]` in the choices column to signal they are repeatable
-- **Blank lines between named help sections** — visually separates option groups in the OPTIONS block
-- **Fish completion: subcommand completions** — `fish_completion()` now emits completions for all subcommands and their aliases
-- **Fish completion: single-quote escaping** — help text with apostrophes no longer breaks generated fish scripts
-- **Negatable suggestion** — `suggest()` now includes `--no-X` candidates so typos like `--no-colr` suggest `--no-color`
-- **`parse_or_exit()` nested subcommand dispatch** — fires the callback of the deepest active subcommand rather than stopping at the first level
-- **`OptionBase::reset()` / `PositionalBase::reset()` virtual methods** — enables clean reuse via `App::reset()`
-
-### Fixed
-- `Lookup::as<unsigned>()` for Count options now correctly returns the accumulated count instead of `0`
-- `Lookup::as_or<T>()` for Count options now returns the fallback when the option is absent
-- Fish completion no longer emits `[count]` as a choice list for Count options
-
-### Changed
-- `[OPTIONS]` is always shown in the USAGE line (previously behind a dead `|| true` guard)
-- README Quick Start updated to v2 API (`add_flag`, `add<T>`, etc.)
-- All nodiscard warnings in test suite resolved with explicit `(void)` casts
+- `[OPTIONS]` is always shown in the `USAGE` line
+- README Quick Start uses the v2 API (`add_flag`, `add<T>`, etc.)
+- Test-suite nodiscard warnings are resolved with explicit `(void)` casts
 
 ## [1.1.0]
 
