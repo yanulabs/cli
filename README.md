@@ -114,7 +114,7 @@ include(FetchContent)
 FetchContent_Declare(
     cli
     GIT_REPOSITORY https://github.com/yanujz/cli.git
-    GIT_TAG        main  # replace with a release tag or commit SHA
+    GIT_TAG        v1.2.0
 )
 FetchContent_MakeAvailable(cli)
 
